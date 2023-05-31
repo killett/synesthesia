@@ -1,22 +1,17 @@
 import csv
 import os
+import xarray as xr
+import numpy as np
 
 def load_cie_functions():
-    cie = {}
+    file = os.path.join('.', 'sealevel_spectra', 'ciexyz31_1_trimmed_420nm_690nm.csv')
 
-    # Override the usual map output
-    cie['options'] = {'output_choice': 2}
-
-    cie['xy'] = {
-        'titles': ["CIE 1931 color matching functions"],
-        'x_units': ["nm"],
-        'y_units': ["power"],
-        'x_values': [[] for _ in range(3)],
-        'y_values': [[] for _ in range(3)],
-        'legends': [['x', 'y', 'z']]
+    data = {
+        'x': [],
+        'y': [],
+        'z': []
     }
-
-    file = os.path.join(".", "sealevel_spectra", "ciexyz31_1_trimmed_420nm_690nm.csv")
+    wavelengths = []
 
     # Open input file for reading
     try:
@@ -24,19 +19,51 @@ def load_cie_functions():
             reader = csv.reader(in_fp)
             for row in reader:
                 temp_long = float(row[0])  # Read wavelengths, record for all 3 functions
-                for i in range(3):
-                    cie['xy']['x_values'][i].append(temp_long)
+                wavelengths.append(temp_long)
 
                 # Read x, y, z
                 for i, val in enumerate(row[1:], start=0):
-                    cie['xy']['y_values'][i].append(float(val))
+                    data[list(data.keys())[i]].append(float(val))
 
     except IOError:
         print(f"The CIE file, {file}, failed to open.")
 
-    return cie
+    da = xr.Dataset(
+        {var: ('wavelength', data[var]) for var in data},
+        coords={'wavelength': wavelengths}
+    )
+
+    da.attrs['title'] = 'CIE 1931 color matching functions'
+    da.coords['wavelength'].attrs['units'] = 'nm'
+
+    return da
+
+def gaussian(x, mu, sig):
+    return np.exp(-np.power(x - mu, 2.) / (2 * np.power(sig, 2.)))
+
+def synthetic_plot(cie,mu,sig):
+
+    wavelengths = cie.coords['wavelength'].values
+    power = gaussian(wavelengths, mu, sig)
+    
+    # convert DataArray to Dataset
+    spectrum = xr.DataArray(power, coords=[('wavelength', wavelengths)], name='power').to_dataset()
+
+    return spectrum
+
+def spectrum2xyz(spectrum, cie):
+    xyz = {}
+    for l in ['x', 'y', 'z']:
+        # Multiply each spectrum value by the corresponding cie value
+        temp_values = spectrum['power'].values * cie[l].values
+        # Integrate over wavelengths to get a single tristimulus value
+        xyz[l] = temp_values.sum()
+    return xyz
 
 if __name__ == "__main__":
     cie = load_cie_functions()
-    print(f"{cie = }")
-
+    print(f"{cie = }")    
+    spectrum = synthetic_plot(cie, 530, 30)
+    print(f"{spectrum = }")
+    xyz = spectrum2xyz(spectrum,cie)
+    print(f"{xyz = }")
