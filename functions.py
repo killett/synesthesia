@@ -196,6 +196,13 @@ if __name__ == "__main__":
         x_range = np.max(x) - np.min(x)
         x_norm = (x - x_min) / x_range - 0.5
 
+
+        random_size = 10.0  # Size
+
+        # Generate N random x values between 0 and random_size
+        x = np.random.uniform(0, random_size, N)
+
+        print(x)
         xf_norm = np.linspace(-0.5, 0.5, M)
 
         # Define Fourier modes
@@ -234,52 +241,7 @@ if __name__ == "__main__":
         date_str = datetime.datetime.now().strftime('%Y%m%d-%H%M%S')
         filename = os.path.join(outputfolder,f"{date_str}_fft_test_f.png")
         # Save the figure with the desired options
-        fig.savefig(filename, dpi=dpi_choice, format='png', transparent=False, bbox_inches='tight')
-
-    if 0:
-        # number of sample points
-        N = 400
-
-        # Simulated non-uniform data
-        x = np.linspace(0.0,0.5-0.02, N) + np.random.random((N)) * 0.001
-        #print(x)
-
-        #print( 'random' )
-        #print( np.random.random((N)) * 0.001 )
-
-        y = np.sin(50.0 * 2.0 * np.pi * x) + 0.5 * np.sin(80.0 * 2.0 * np.pi * x)
-        yf = np.abs(nfft.nfft(x, y))
-
-        fig, axs = plt.subplots(1)
-        fig_f, axs_f = plt.subplots(1)
-
-        axs.plot(x, y, '.', color='red')
-
-        xf = np.fft.fftfreq(N,1./N)
-
-        axs_f.plot(xf[:int(N/2)], yf[:int(N/2)], color='red')
-        # Create filename with current date
-        date_str = datetime.datetime.now().strftime('%Y%m%d-%H%M%S')
-        filename = os.path.join(outputfolder,f"{date_str}_fft_test_f.png")
-        # Save the figure with the desired options
-        plt.savefig(filename, dpi=dpi_choice, format='png', transparent=False, bbox_inches='tight')
-
-    if 0:
-        x = -0.5 + np.random.rand(1000)
-        f = np.sin(10 * 2 * np.pi * x)
-
-        #k = -20 + np.arange(40)
-        f_k = nfft.nfft(x, f)
-
-        plt.plot(f_k.real, label='real')
-        plt.plot(f_k.imag, label='imag')
-        plt.legend()
-
-        # Create filename with current date
-        date_str = datetime.datetime.now().strftime('%Y%m%d-%H%M%S')
-        filename = os.path.join(outputfolder,f"{date_str}_fft_test1.png")
-        # Save the figure with the desired options
-        plt.savefig(filename, dpi=dpi_choice, format='png', transparent=False, bbox_inches='tight')
+        fig_f.savefig(filename, dpi=dpi_choice, format='png', transparent=False, bbox_inches='tight')
 
     if 0:
         timeseries = synthetic_timeseries(signal='annual', signal_amplitude=1, noise='white', noise_level=0.1, 
