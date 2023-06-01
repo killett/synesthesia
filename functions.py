@@ -190,53 +190,43 @@ def plot_color(rgb, filename):
 
 if __name__ == "__main__":
 
-    if 0:
-        N = len(x)
+    if 1:
+        # number of sample points
+        N = 400
+        random_size = 10.0
+
+        # Generate N random x values between 0 and random_size
+        x = np.sort(np.random.uniform(0, random_size, N))
+
         x_min = np.min(x)
         x_range = np.max(x) - np.min(x)
         x_norm = (x - x_min) / x_range - 0.5
 
-
-        random_size = 10.0  # Size
-
-        # Generate N random x values between 0 and random_size
-        x = np.random.uniform(0, random_size, N)
-
-        print(x)
-        xf_norm = np.linspace(-0.5, 0.5, M)
-
         # Define Fourier modes
-
         k = np.arange(-N/2, N/2)
         # Convert Fourier modes to frequencies
-        # Here, T is the total time span of your data
-        T = np.max(x) - np.min(x)
-        frequencies = k / T
+        xf = k / x_range
+        
+        print(f"{xf = }")
 
-    if 1:
-        # number of sample points
-        N = 400
+        #Define based on original x:
+        y = 10*np.sin(2 * 2.0 * np.pi * x)
 
-        # Simulated non-uniform data
-        x = np.linspace(0.0,0.5-0.02, N) + np.random.random((N)) * 0.001
-        #print(x)
-
-        y = np.sin(50.0 * 2.0 * np.pi * x) + 0.5 * np.sin(80.0 * 2.0 * np.pi * x)
-        yf = np.abs(nfft.nfft(x, y))
+        yf = np.abs(nfft.nfft(x_norm, y))
 
         fig, axs = plt.subplots(1)
         fig_f, axs_f = plt.subplots(1)
 
-        axs.plot(x, y, '.', color='red')
+        axs.plot(x, y, color='red')
+        axs_f.set_title("Time series")
         # Create filename with current date
         date_str = datetime.datetime.now().strftime('%Y%m%d-%H%M%S')
         filename = os.path.join(outputfolder,f"{date_str}_fft_test_x.png")
         # Save the figure with the desired options
         fig.savefig(filename, dpi=dpi_choice, format='png', transparent=False, bbox_inches='tight')
 
-        xf = np.fft.fftfreq(N,1./N)
-
-        axs_f.plot(xf[:int(N/2)], yf[:int(N/2)], color='blue')
+        axs_f.plot(xf, yf, color='blue')
+        axs_f.set_title("FFT")
         # Create filename with current date
         date_str = datetime.datetime.now().strftime('%Y%m%d-%H%M%S')
         filename = os.path.join(outputfolder,f"{date_str}_fft_test_f.png")
