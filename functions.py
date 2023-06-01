@@ -192,7 +192,7 @@ if __name__ == "__main__":
 
     if 1:
         # number of sample points
-        N = 400
+        N = 4000
         random_size = 10.0
 
         # Generate N random x values between 0 and random_size
@@ -203,16 +203,47 @@ if __name__ == "__main__":
         x_norm = (x - x_min) / x_range - 0.5
 
         # Define Fourier modes
-        k = np.arange(-N/2, N/2)
+        k = -(N // 2) + np.arange(N)
         # Convert Fourier modes to frequencies
         xf = k / x_range
         
         print(f"{xf = }")
 
         #Define based on original x:
-        y = 10*np.sin(2 * 2.0 * np.pi * x)
+        y = 10*np.sin(10 * 2.0 * np.pi * x)
 
         yf = np.abs(nfft.nfft(x_norm, y))
+        f_k = nfft.nfft(x_norm, y)
+
+        plt.plot(xf, f_k.real, label='real', color = 'green')
+        plt.plot(xf, f_k.imag, label='imag', color = 'orange')
+        plt.legend()
+        # Create filename with current date
+        date_str = datetime.datetime.now().strftime('%Y%m%d-%H%M%S')
+        filename = os.path.join(outputfolder,f"{date_str}_fft_test_complex.png")
+        # Save the figure with the desired options
+        plt.savefig(filename, dpi=dpi_choice, format='png', transparent=False, bbox_inches='tight')
+
+        #Compute power spectrum, which is the square of the absolute value of the Fourier Transform
+        power_spectrum = np.abs(f_k)**2
+
+        #Only take the positive frequencies. Since the output is symmetric, this will not lose any information.
+        power_spectrum = power_spectrum[N//2:]
+        xf_half = xf[N//2:]
+
+        #Plotting the Power Spectrum
+        plt.figure(figsize=(10,5))
+        plt.plot(xf_half, power_spectrum)
+        plt.title('Power spectrum')
+        plt.xlabel('Frequency')
+        plt.ylabel('Power')
+        plt.grid(True)
+        # Create filename with current date
+        date_str = datetime.datetime.now().strftime('%Y%m%d-%H%M%S')
+        filename = os.path.join(outputfolder,f"{date_str}_fft_test_power.png")
+        # Save the figure with the desired options
+        plt.savefig(filename, dpi=dpi_choice, format='png', transparent=False, bbox_inches='tight')
+
 
         fig, axs = plt.subplots(1)
         fig_f, axs_f = plt.subplots(1)
