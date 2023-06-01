@@ -153,13 +153,39 @@ def synthetic_timeseries(signal='annual', signal_amplitude=1, noise='white', noi
 
     return ds
 
-def perform_nfft(ds):
+def nfft_power(ds):
     # Convert datetime index to numeric (we use 'day' as the unit)
-    time_numeric = (ds.time - ds.time[0]).values.astype(float) / (24*3600*1e9)
+    x = (ds.time - ds.time[0]).values.astype(float) / (24*3600*1e9)
+    print(f"{x = }")
 
-    fft = nfft.nfft(time_numeric,ds.measurements)
+    # number of sample points
+    N = len(x)
+
+    x_min = np.min(x)
+    x_range = np.max(x) - np.min(x)
+    x_norm = (x - x_min) / x_range - 0.5
+
+    # Define Fourier modes
+    k = -(N // 2) + np.arange(N)
+    # Convert Fourier modes to frequencies
+    xf = k / x_range
     
-    return np.abs(fft)
+    f_k = nfft.nfft(x,ds.measurements)
+
+    #Compute power spectrum, which is the square of the absolute value of the Fourier Transform
+    power_spectrum = np.abs(f_k)**2
+
+    #Only take the positive frequencies. Since the output is symmetric, this will not lose any information.
+    power_spectrum = power_spectrum[N//2:]
+    xf_half = xf[N//2:]
+
+    # Create xarray DataArray with coordinates
+    power_spectrum_da = xr.DataArray(power_spectrum, coords=[('frequency', xf_half)], name='power_spectrum')
+
+    # Convert this DataArray to a Dataset
+    ds = power_spectrum_da.to_dataset()
+
+    return ds
 
 def plot_timeseries(ds,filename):
     # Create figure and axes
@@ -168,11 +194,9 @@ def plot_timeseries(ds,filename):
     # Plot measurements
     ds.measurements.plot(ax=ax)
 
-    # Rotate x-axis labels
+    plt.title('Time series')
     plt.xticks(rotation=30)
 
-    # Show the plot
-    #plt.show()
     # Save the figure with the desired options
     plt.savefig(filename, dpi=dpi_choice, format='png', transparent=False, bbox_inches='tight')
 
@@ -192,11 +216,15 @@ if __name__ == "__main__":
 
     if 1:
         # number of sample points
-        N = 4000
-        random_size = 10.0
+        N = 1000
+        timeseries_length = 10.0
 
-        # Generate N random x values between 0 and random_size
-        x = np.sort(np.random.uniform(0, random_size, N))
+        # Generate N random x values between 0 and timeseries_length
+        #x = np.sort(np.random.uniform(0, timeseries_length, N))
+        #COMPLETELY UNIFORM POINTS!
+        x =  np.linspace(0, timeseries_length, N)
+        #NEARLY uniform points!
+        x =  np.sort(np.linspace(0, timeseries_length, N) + 2*np.random.random(N))
 
         x_min = np.min(x)
         x_range = np.max(x) - np.min(x)
@@ -207,14 +235,24 @@ if __name__ == "__main__":
         # Convert Fourier modes to frequencies
         xf = k / x_range
         
-        print(f"{xf = }")
+        #print(f"{xf = }")
 
         #Define based on original x:
-        y = 10*np.sin(10 * 2.0 * np.pi * x)
+        y = 10*np.sin(1.0 * 2.0 * np.pi * x)
+
+        plt.figure(figsize=(10,5))
+        plt.plot(x, y, color='red')
+        plt.title("Time series")
+        # Create filename with current date
+        date_str = datetime.datetime.now().strftime('%Y%m%d-%H%M%S')
+        filename = os.path.join(outputfolder,f"{date_str}_timeseries.png")
+        # Save the figure with the desired options
+        plt.savefig(filename, dpi=dpi_choice, format='png', transparent=False, bbox_inches='tight')
 
         yf = np.abs(nfft.nfft(x_norm, y))
         f_k = nfft.nfft(x_norm, y)
 
+        plt.figure(figsize=(10,5))
         plt.plot(xf, f_k.real, label='real', color = 'green')
         plt.plot(xf, f_k.imag, label='imag', color = 'orange')
         plt.legend()
@@ -244,26 +282,6 @@ if __name__ == "__main__":
         # Save the figure with the desired options
         plt.savefig(filename, dpi=dpi_choice, format='png', transparent=False, bbox_inches='tight')
 
-
-        fig, axs = plt.subplots(1)
-        fig_f, axs_f = plt.subplots(1)
-
-        axs.plot(x, y, color='red')
-        axs_f.set_title("Time series")
-        # Create filename with current date
-        date_str = datetime.datetime.now().strftime('%Y%m%d-%H%M%S')
-        filename = os.path.join(outputfolder,f"{date_str}_fft_test_x.png")
-        # Save the figure with the desired options
-        fig.savefig(filename, dpi=dpi_choice, format='png', transparent=False, bbox_inches='tight')
-
-        axs_f.plot(xf, yf, color='blue')
-        axs_f.set_title("FFT")
-        # Create filename with current date
-        date_str = datetime.datetime.now().strftime('%Y%m%d-%H%M%S')
-        filename = os.path.join(outputfolder,f"{date_str}_fft_test_f.png")
-        # Save the figure with the desired options
-        fig_f.savefig(filename, dpi=dpi_choice, format='png', transparent=False, bbox_inches='tight')
-
     if 0:
         timeseries = synthetic_timeseries(signal='annual', signal_amplitude=1, noise='white', noise_level=0.1, 
                              temporal_resolution='monthly', time_start=datetime.datetime(2001, 1, 1), 
@@ -272,12 +290,21 @@ if __name__ == "__main__":
         # Create filename with current date
         date_str = datetime.datetime.now().strftime('%Y%m%d-%H%M%S')
         filename = os.path.join(outputfolder,f"{date_str}_timeseries.png")
-        #plot_timeseries(timeseries,filename)
-        # Perform non-uniform FFT
-        fft_results = perform_nfft(timeseries)
+        plot_timeseries(timeseries,filename)
+        # Perform non-uniform FFT to get power spectrum.
+        power_spectrum = nfft_power(timeseries)
 
-        # Print results
-        print(fft_results)
+        plt.figure(figsize=(10,5))
+        power_spectrum['power_spectrum'].plot.line('o-') # 'o-' will create a line plot with markers at data points
+        plt.title('Power spectrum')
+        plt.xlabel('Frequency')
+        plt.ylabel('Power')
+        plt.grid(True)
+        # Create filename with current date
+        date_str = datetime.datetime.now().strftime('%Y%m%d-%H%M%S')
+        filename = os.path.join(outputfolder,f"{date_str}_fft_test_power.png")
+        # Save the figure with the desired options
+        plt.savefig(filename, dpi=dpi_choice, format='png', transparent=False, bbox_inches='tight')
 
         cie = load_cie_functions()
         print(f"{cie = }")    
