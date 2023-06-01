@@ -224,7 +224,7 @@ if __name__ == "__main__":
         #COMPLETELY UNIFORM POINTS!
         x =  np.linspace(0, timeseries_length, N)
         #NEARLY uniform points!
-        x =  np.sort(np.linspace(0, timeseries_length, N) + 2*np.random.random(N))
+        x =  np.sort(np.linspace(0, timeseries_length, N) + 0.5*np.random.random(N))
 
         x_min = np.min(x)
         x_range = np.max(x) - np.min(x)
@@ -242,6 +242,7 @@ if __name__ == "__main__":
 
         plt.figure(figsize=(10,5))
         plt.plot(x, y, color='red')
+        plt.scatter(x, y, marker='s', color='r', s=10)
         plt.title("Time series")
         # Create filename with current date
         date_str = datetime.datetime.now().strftime('%Y%m%d-%H%M%S')
