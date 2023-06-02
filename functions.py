@@ -141,14 +141,12 @@ def synthetic_timeseries(signal='annual', signal_amplitude=1, noise='white', noi
         print(f"!!!WARNING!!! {noise = }")
 
     # Combine signal and noise
-    measurements = signal_values + noise_values
+    measurements = signal_values# + noise_values
 
     # Create xarray dataset
     ds = xr.Dataset(
         {'measurements': ('time', measurements)},
-        coords={
-            'time': dates
-        }
+        coords={'time': dates}
     )
 
     return ds
@@ -160,9 +158,11 @@ def nfft_power(ds):
 
     # number of sample points
     N = len(x)
+    if N % 2: print(f"!!! WARNING!!! LENGTH NEEDS TO BE EVEN FOR NFFT, BUT: {len(x) = }")
 
     x_min = np.min(x)
     x_range = np.max(x) - np.min(x)
+    print(f"{x_range = }")
     x_norm = (x - x_min) / x_range - 0.5
 
     # Define Fourier modes
@@ -170,7 +170,8 @@ def nfft_power(ds):
     # Convert Fourier modes to frequencies
     xf = k / x_range
     
-    f_k = nfft.nfft(x,ds.measurements)
+    #Perform NFFT.
+    f_k = nfft.nfft(x_norm,ds.measurements)
 
     #Compute power spectrum, which is the square of the absolute value of the Fourier Transform
     power_spectrum = np.abs(f_k)**2
@@ -216,19 +217,22 @@ if __name__ == "__main__":
 
     if 1:
         # number of sample points
-        N = 1000
-        timeseries_length = 10.0
+        N = 6940#1000
+        timeseries_length = float(N)#10.0
+        signal_period = 365.25
 
         # Generate N random x values between 0 and timeseries_length
         #x = np.sort(np.random.uniform(0, timeseries_length, N))
         #COMPLETELY UNIFORM POINTS!
         x =  np.linspace(0, timeseries_length, N)
         #NEARLY uniform points!
-        x =  np.sort(np.linspace(0, timeseries_length, N) + 0.5*np.random.random(N))
+        #x =  np.sort(np.linspace(0, timeseries_length, N) + 0.5*np.random.random(N))
 
         x_min = np.min(x)
         x_range = np.max(x) - np.min(x)
         x_norm = (x - x_min) / x_range - 0.5
+        N = len(x)
+        if N % 2: print(f"!!! WARNING!!! LENGTH NEEDS TO BE EVEN FOR NFFT, BUT: {len(x) = }")
 
         # Define Fourier modes
         k = -(N // 2) + np.arange(N)
@@ -238,7 +242,7 @@ if __name__ == "__main__":
         #print(f"{xf = }")
 
         #Define based on original x:
-        y = 10*np.sin(1.0 * 2.0 * np.pi * x)
+        y = 100*np.sin(1.0/signal_period * 2.0 * np.pi * x)
 
         plt.figure(figsize=(10,5))
         plt.plot(x, y, color='red')
@@ -284,9 +288,14 @@ if __name__ == "__main__":
         plt.savefig(filename, dpi=dpi_choice, format='png', transparent=False, bbox_inches='tight')
 
     if 0:
-        timeseries = synthetic_timeseries(signal='annual', signal_amplitude=1, noise='white', noise_level=0.1, 
-                             temporal_resolution='monthly', time_start=datetime.datetime(2001, 1, 1), 
+        timeseries = synthetic_timeseries(signal='annual', signal_amplitude=100, noise='white', noise_level=0.0, 
+                             temporal_resolution='daily', time_start=datetime.datetime(2001, 1, 1), 
                              time_stop=datetime.datetime(2020, 1, 1))
+
+        print(timeseries.keys())
+        N = len(timeseries['time'])
+        print(f"{N = }")
+        if N % 2: print(f"!!! WARNING!!! LENGTH NEEDS TO BE EVEN FOR NFFT, BUT: {len(timeseries['time']) = }")
 
         # Create filename with current date
         date_str = datetime.datetime.now().strftime('%Y%m%d-%H%M%S')
@@ -307,6 +316,7 @@ if __name__ == "__main__":
         # Save the figure with the desired options
         plt.savefig(filename, dpi=dpi_choice, format='png', transparent=False, bbox_inches='tight')
 
+    if 0:
         cie = load_cie_functions()
         print(f"{cie = }")    
         spectrum = synthetic_plot(cie, 530, 30)
