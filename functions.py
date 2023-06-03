@@ -242,42 +242,42 @@ def map_power_spectrum(cie, power_spectrum, min_period):
 
     return new_power_spectrum
 
-def plot_timeseries(ds):
+def plot_timeseries(ds,title):
     plt.figure(figsize=myfigsize)
     plt.plot(ds['time'], ds['measurements'], color='lime') # using a bright color for visibility
     plt.scatter(ds['time'], ds['measurements'], marker='s', color='cyan', s=10)
-    plt.title("Time series", color='white')
+    plt.title(title, color='white')
     # Create filename with current date
     date_str = datetime.datetime.now().strftime('%Y%m%d-%H%M%S')
-    filename = os.path.join(outputfolder,f"{date_str}_timeseries.png")
+    filename = os.path.join(outputfolder,f"{date_str}_{title.replace(' ','_')}.png")
     # Save the figure with the desired options
     plt.savefig(filename, dpi=dpi_choice, format='png', transparent=False, bbox_inches='tight', facecolor='black')
 
-def plot_power_spectrum(power_spectrum):
+def plot_fft_spectrum(power_spectrum,title):
     plt.figure(figsize=myfigsize)
-    plt.plot(power_spectrum.period, power_spectrum['power'], color = 'lime', linewidth=2.0)
-    plt.scatter(power_spectrum.period, power_spectrum['power'], marker='s', color='cyan', s=10)
-    plt.title('Power spectrum')
-    plt.xlabel('Period')
+    plt.plot(power_spectrum.period, power_spectrum.power, color = 'lime', linewidth=2.0)
+    plt.scatter(power_spectrum.period, power_spectrum.power, marker='s', color='cyan', s=10)
+    plt.title(title)
+    plt.xlabel('Period (days)')
     plt.ylabel('Power')
     #plt.grid(True, color='gray')  # set grid color to gray for visibility
     # Create filename with current date
     date_str = datetime.datetime.now().strftime('%Y%m%d-%H%M%S')
-    filename = os.path.join(outputfolder, f"{date_str}_fft_test_power.png")
+    filename = os.path.join(outputfolder, f"{date_str}_{title.replace(' ','_')}.png")
     # Save the figure with the desired options
     plt.savefig(filename, dpi=dpi_choice, format='png', transparent=False, bbox_inches='tight', facecolor='black')
 
-def plot_light_spectrum(power_spectrum):
+def plot_light_spectrum(power_spectrum,title):
     plt.figure(figsize=myfigsize)
-    plt.plot(power_spectrum.wavelength, power_spectrum['power'], color = 'lime', linewidth=2.0)
-    plt.scatter(power_spectrum.wavelength, power_spectrum['power'], marker='s', color='cyan', s=10)
-    plt.title('Power spectrum')
+    plt.plot(power_spectrum.wavelength, power_spectrum.power, color = 'lime', linewidth=2.0)
+    plt.scatter(power_spectrum.wavelength, power_spectrum.power, marker='s', color='cyan', s=10)
+    plt.title(title)
     plt.xlabel('Wavelength (nm)')
     plt.ylabel('Power')
     #plt.grid(True, color='gray')  # set grid color to gray for visibility
     # Create filename with current date
     date_str = datetime.datetime.now().strftime('%Y%m%d-%H%M%S')
-    filename = os.path.join(outputfolder, f"{date_str}_light_spectrum.png")
+    filename = os.path.join(outputfolder, f"{date_str}_{title.replace(' ','_')}.png")
     # Save the figure with the desired options
     plt.savefig(filename, dpi=dpi_choice, format='png', transparent=False, bbox_inches='tight', facecolor='black')
 
@@ -299,7 +299,7 @@ if __name__ == "__main__":
     plt.rcParams['axes.linewidth'] = 2  # Change the global linewidth
     myfigsize=(10,5)
     
-    min_period = 200
+    min_period = 300
 
     timeseries = synthetic_timeseries(signal='annual', signal_amplitude=1.0, noise='white', noise_level=0.0, 
                          temporal_resolution='monthly', time_start=datetime.datetime(2001, 1, 1), 
@@ -308,7 +308,7 @@ if __name__ == "__main__":
     N = len(timeseries['time'])
     if N % 2: print(f"!!! WARNING!!! LENGTH NEEDS TO BE EVEN FOR NFFT, BUT: {len(timeseries['time']) = }")
 
-    plot_timeseries(timeseries)
+    plot_timeseries(timeseries,title="Time series")
     
     print("!!!! DETREND BY REMOVING CONSTANT, TREND, ACCEL, AND POSSIBLY ANNUAL?")
 
@@ -318,9 +318,9 @@ if __name__ == "__main__":
     power_spectrum = convert_spectrum_from_frequency_to_period(power_spectrum)
     
     signal_period = 365.25
-    power_spectrum = power_spectrum.where((power_spectrum.period > signal_period * 0.5) & (power_spectrum.period < signal_period * 2), drop=True)
+    power_spectrum = power_spectrum.where((power_spectrum.period > signal_period * 0.2) & (power_spectrum.period < signal_period * 3), drop=True)
 
-    plot_power_spectrum(power_spectrum)
+    plot_fft_spectrum(power_spectrum,title="FFT Power spectrum")
 
     cie = load_cie_functions()
 
@@ -330,7 +330,8 @@ if __name__ == "__main__":
     
     time.sleep(2)
     
-    plot_light_spectrum(mapped_spectrum)
+    try:  plot_light_spectrum(mapped_spectrum,title="Light spectrum")
+    except: plot_fft_spectrum(mapped_spectrum,title="Light spectrum")
 
     if 0:
         print(f"{cie = }")    
