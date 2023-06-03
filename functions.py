@@ -49,7 +49,7 @@ def load_cie_functions():
 def gaussian(x, mu, sig):
     return np.exp(-np.power(x - mu, 2.) / (2 * np.power(sig, 2.)))
 
-def synthetic_plot(cie,mu,sig):
+def synthetic_spectrum(cie,mu,sig):
 
     wavelengths = cie.coords['wavelength'].values
     power = gaussian(wavelengths, mu, sig)
@@ -118,7 +118,7 @@ def gamma_correct_rgb(rgb):
 
 def synthetic_timeseries(signal='annual', signal_amplitude=1, noise='white', noise_level=0.1, 
                          temporal_resolution='monthly', time_start=datetime.datetime(2001, 1, 1), 
-                         time_stop=datetime.datetime(2020, 1, 1)):
+                         time_stop=datetime.datetime(2005, 1, 1)):
     # Generate time series
     if temporal_resolution == 'monthly':
         dates = pd.date_range(start=time_start, end=time_stop, freq='M') + pd.Timedelta(days=15)
@@ -141,7 +141,7 @@ def synthetic_timeseries(signal='annual', signal_amplitude=1, noise='white', noi
         print(f"!!!WARNING!!! {noise = }")
 
     # Combine signal and noise
-    measurements = signal_values# + noise_values
+    measurements = signal_values + noise_values
 
     # Create xarray dataset
     ds = xr.Dataset(
@@ -153,17 +153,22 @@ def synthetic_timeseries(signal='annual', signal_amplitude=1, noise='white', noi
 
 def nfft_power(ds):
     # Convert datetime index to numeric (we use 'day' as the unit)
+    print("!!!WARNING!!! Next line assumes these units are originally in ns and you want the units to be days!!!")
     x = (ds.time - ds.time[0]).values.astype(float) / (24*3600*1e9)
-    print(f"{x = }")
 
-    # number of sample points
-    N = len(x)
-    if N % 2: print(f"!!! WARNING!!! LENGTH NEEDS TO BE EVEN FOR NFFT, BUT: {len(x) = }")
-
-    x_min = np.min(x)
-    x_range = np.max(x) - np.min(x)
-    print(f"{x_range = }")
-    x_norm = (x - x_min) / x_range - 0.5
+    #If timeseries has an odd number of points,
+    #remove the last data point, then calculate min, range.
+    N = 1
+    while N % 2:
+        N = len(x)
+        x_min = np.min(x)
+        x_range = np.max(x) - np.min(x)
+        x_norm = (x - x_min) / x_range - 0.5
+        print(f"{N = }, {x_min = }, {x_range = }")
+        if N % 2:
+            print(f"!!! WARNING!!! LENGTH NEEDS TO BE EVEN FOR NFFT, BUT: {len(x) = }")
+            print(f"!!! DELETING LAST DATA POINT!")
+            x = np.delete(x, -1)
 
     # Define Fourier modes
     k = -(N // 2) + np.arange(N)
@@ -181,10 +186,36 @@ def nfft_power(ds):
     xf_half = xf[N//2:]
 
     # Create xarray DataArray with coordinates
-    power_spectrum_da = xr.DataArray(power_spectrum, coords=[('frequency', xf_half)], name='power_spectrum')
+    power_spectrum_da = xr.DataArray(power_spectrum, coords=[('frequency', xf_half)], name='power')
 
     # Convert this DataArray to a Dataset
     ds = power_spectrum_da.to_dataset()
+    ds['frequency'].attrs['units'] = '1/days'
+    
+    return ds
+
+def convert_spectrum_from_frequency_to_period(ds):
+    freq_units = ds['frequency'].attrs.get('units', None)
+
+    # Map of frequency units to period units
+    units_map = {'1/days': 'days', 'Hz': 'seconds', '1/years': 'years'}
+
+    # Calculate period as reciprocal of frequency.
+    epsilon = 1e-9
+    period = 1.0 / (ds['frequency'] + epsilon)
+    
+    # Replace the 'frequency' coordinate with 'period'
+    ds = ds.rename({'frequency': 'period'})
+    ds['period'] = period
+
+    # Handle units attribute
+    if freq_units in units_map:
+        ds['period'].attrs['units'] = units_map[freq_units]
+    else:
+        print(f"!!!WARNING!!! DID NOT RECOGNIZE {freq_units = }")
+
+    # Reorder the dataset so that period is increasing
+    ds = ds.sortby('period')
 
     return ds
 
@@ -214,96 +245,28 @@ def plot_color(rgb, filename):
     plt.savefig(filename, dpi=dpi_choice, format='png', transparent=False, bbox_inches='tight')
 
 if __name__ == "__main__":
+    plt.style.use('dark_background')
+    plt.rcParams['font.size'] = 14  # Change the global font size
+    plt.rcParams['axes.linewidth'] = 2  # Change the global linewidth
 
-    if 1:
-        # number of sample points
-        N = 6940#1000
-        timeseries_length = float(N)#10.0
-        signal_period = 365.25
+    timeseries = synthetic_timeseries(signal='annual', signal_amplitude=10, noise='white', noise_level=0.0, 
+                         temporal_resolution='monthly', time_start=datetime.datetime(2001, 1, 1), 
+                         time_stop=datetime.datetime(2055, 1, 1))
 
-        # Generate N random x values between 0 and timeseries_length
-        #x = np.sort(np.random.uniform(0, timeseries_length, N))
-        #COMPLETELY UNIFORM POINTS!
-        x =  np.linspace(0, timeseries_length, N)
-        #NEARLY uniform points!
-        #x =  np.sort(np.linspace(0, timeseries_length, N) + 0.5*np.random.random(N))
+    N = len(timeseries['time'])
+    if N % 2: print(f"!!! WARNING!!! LENGTH NEEDS TO BE EVEN FOR NFFT, BUT: {len(timeseries['time']) = }")
 
-        x_min = np.min(x)
-        x_range = np.max(x) - np.min(x)
-        x_norm = (x - x_min) / x_range - 0.5
-        N = len(x)
-        if N % 2: print(f"!!! WARNING!!! LENGTH NEEDS TO BE EVEN FOR NFFT, BUT: {len(x) = }")
+    # Create filename with current date
+    date_str = datetime.datetime.now().strftime('%Y%m%d-%H%M%S')
+    filename = os.path.join(outputfolder,f"{date_str}_timeseries.png")
+    plot_timeseries(timeseries,filename)
+    
+    print("!!!! DETREND BY REMOVING CONSTANT, TREND, ACCEL, AND POSSIBLY ANNUAL?")
 
-        # Define Fourier modes
-        k = -(N // 2) + np.arange(N)
-        # Convert Fourier modes to frequencies
-        xf = k / x_range
-        
-        #print(f"{xf = }")
-
-        #Define based on original x:
-        y = 100*np.sin(1.0/signal_period * 2.0 * np.pi * x)
-
-        plt.figure(figsize=(10,5))
-        plt.plot(x, y, color='red')
-        plt.scatter(x, y, marker='s', color='r', s=10)
-        plt.title("Time series")
-        # Create filename with current date
-        date_str = datetime.datetime.now().strftime('%Y%m%d-%H%M%S')
-        filename = os.path.join(outputfolder,f"{date_str}_timeseries.png")
-        # Save the figure with the desired options
-        plt.savefig(filename, dpi=dpi_choice, format='png', transparent=False, bbox_inches='tight')
-
-        yf = np.abs(nfft.nfft(x_norm, y))
-        f_k = nfft.nfft(x_norm, y)
-
-        plt.figure(figsize=(10,5))
-        plt.plot(xf, f_k.real, label='real', color = 'green')
-        plt.plot(xf, f_k.imag, label='imag', color = 'orange')
-        plt.legend()
-        # Create filename with current date
-        date_str = datetime.datetime.now().strftime('%Y%m%d-%H%M%S')
-        filename = os.path.join(outputfolder,f"{date_str}_fft_test_complex.png")
-        # Save the figure with the desired options
-        plt.savefig(filename, dpi=dpi_choice, format='png', transparent=False, bbox_inches='tight')
-
-        #Compute power spectrum, which is the square of the absolute value of the Fourier Transform
-        power_spectrum = np.abs(f_k)**2
-
-        #Only take the positive frequencies. Since the output is symmetric, this will not lose any information.
-        power_spectrum = power_spectrum[N//2:]
-        xf_half = xf[N//2:]
-
-        #Plotting the Power Spectrum
-        plt.figure(figsize=(10,5))
-        plt.plot(xf_half, power_spectrum)
-        plt.title('Power spectrum')
-        plt.xlabel('Frequency')
-        plt.ylabel('Power')
-        plt.grid(True)
-        # Create filename with current date
-        date_str = datetime.datetime.now().strftime('%Y%m%d-%H%M%S')
-        filename = os.path.join(outputfolder,f"{date_str}_fft_test_power.png")
-        # Save the figure with the desired options
-        plt.savefig(filename, dpi=dpi_choice, format='png', transparent=False, bbox_inches='tight')
+    # Perform non-uniform FFT to get power spectrum.
+    power_spectrum = nfft_power(timeseries)
 
     if 0:
-        timeseries = synthetic_timeseries(signal='annual', signal_amplitude=100, noise='white', noise_level=0.0, 
-                             temporal_resolution='daily', time_start=datetime.datetime(2001, 1, 1), 
-                             time_stop=datetime.datetime(2020, 1, 1))
-
-        print(timeseries.keys())
-        N = len(timeseries['time'])
-        print(f"{N = }")
-        if N % 2: print(f"!!! WARNING!!! LENGTH NEEDS TO BE EVEN FOR NFFT, BUT: {len(timeseries['time']) = }")
-
-        # Create filename with current date
-        date_str = datetime.datetime.now().strftime('%Y%m%d-%H%M%S')
-        filename = os.path.join(outputfolder,f"{date_str}_timeseries.png")
-        plot_timeseries(timeseries,filename)
-        # Perform non-uniform FFT to get power spectrum.
-        power_spectrum = nfft_power(timeseries)
-
         plt.figure(figsize=(10,5))
         power_spectrum['power_spectrum'].plot.line('o-') # 'o-' will create a line plot with markers at data points
         plt.title('Power spectrum')
@@ -312,16 +275,38 @@ if __name__ == "__main__":
         plt.grid(True)
         # Create filename with current date
         date_str = datetime.datetime.now().strftime('%Y%m%d-%H%M%S')
-        filename = os.path.join(outputfolder,f"{date_str}_fft_test_power.png")
+        filename = os.path.join(outputfolder,f"{date_str}_fft_test_power_vs_frequency.png")
         # Save the figure with the desired options
         plt.savefig(filename, dpi=dpi_choice, format='png', transparent=False, bbox_inches='tight')
+
+    power_spectrum = convert_spectrum_from_frequency_to_period(power_spectrum)
+
+    plt.figure(figsize=(10,5))
+    power_spectrum['power'].plot.line('o-') # 'o-' will create a line plot with markers at data points
+    
+    print(f"{power_spectrum.period.values = }")
+
+    signal_period = 365.25
+    power_spectrum = power_spectrum.where((power_spectrum.period > signal_period * 0.5) & (power_spectrum.period < signal_period * 2), drop=True)
+
+    plt.figure(figsize=(10,5))
+    plt.plot(power_spectrum.period, power_spectrum['power'], color = 'lime', linewidth=2.0)  # set linewidth to increase thickness
+    plt.title('Power spectrum')
+    plt.xlabel('Period')
+    plt.ylabel('Power')
+    plt.grid(True, color='gray')  # set grid color to gray for visibility
+    # Create filename with current date
+    date_str = datetime.datetime.now().strftime('%Y%m%d-%H%M%S')
+    filename = os.path.join(outputfolder, f"{date_str}_fft_test_power.png")
+    # Save the figure with the desired options
+    plt.savefig(filename, dpi=dpi_choice, format='png', transparent=False, bbox_inches='tight', facecolor='black')
 
     if 0:
         cie = load_cie_functions()
         print(f"{cie = }")    
-        spectrum = synthetic_plot(cie, 530, 30)
+        spectrum = synthetic_spectrum(cie, 530, 30)
         print(f"{spectrum = }")
-        xyz = spectrum2xyz(spectrum,cie, 1.0)
+        xyz = spectrum2xyz(spectrum, cie, 1.0)
         print(f"{xyz = }")
         thepower = 1.0
         print(f"Before raising y to power {thepower}: {xyz = }")
