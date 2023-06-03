@@ -6,6 +6,7 @@ import pandas as pd
 import nfft # pip install nfft From: https://github.com/jakevdp/nfft
 import matplotlib.pyplot as plt
 import datetime
+import time
 
 outputfolder = os.path.join('.', 'output')
 
@@ -182,8 +183,8 @@ def nfft_power(ds):
     power_spectrum = np.abs(f_k)**2
 
     #Only take the positive frequencies. Since the output is symmetric, this will not lose any information.
-    power_spectrum = power_spectrum[N//2:]
-    xf_half = xf[N//2:]
+    power_spectrum = power_spectrum[N//2+1:]
+    xf_half = xf[N//2+1:]
 
     # Create xarray DataArray with coordinates
     power_spectrum_da = xr.DataArray(power_spectrum, coords=[('frequency', xf_half)], name='power')
@@ -201,36 +202,153 @@ def convert_spectrum_from_frequency_to_period(ds):
     units_map = {'1/days': 'days', 'Hz': 'seconds', '1/years': 'years'}
 
     # Calculate period as reciprocal of frequency.
-    epsilon = 1e-9
-    period = 1.0 / (ds['frequency'] + epsilon)
-    
-    # Replace the 'frequency' coordinate with 'period'
-    ds = ds.rename({'frequency': 'period'})
-    ds['period'] = period
+    period = 1.0 / ds['frequency']
 
     # Handle units attribute
     if freq_units in units_map:
-        ds['period'].attrs['units'] = units_map[freq_units]
+        period.attrs['units'] = units_map[freq_units]
     else:
         print(f"!!!WARNING!!! DID NOT RECOGNIZE {freq_units = }")
 
+    # Create a new Dataset with the same variables but with an additional 'period' data variable
+    new_ds = ds.assign_coords(period=('frequency', period.data))  # use .data to get the underlying numpy array
+
+    # Drop the 'frequency' dimension and coordinate
+    new_ds = new_ds.swap_dims({'frequency': 'period'}).drop('frequency')
+
     # Reorder the dataset so that period is increasing
-    ds = ds.sortby('period')
+    new_ds = new_ds.sortby('period')
 
-    return ds
+    return new_ds
 
-def plot_timeseries(ds,filename):
-    # Create figure and axes
-    fig, ax = plt.subplots()
+def old_map_power_spectrum(cie, power_spectrum, min_period):
+    # Calculate the wavelength ratio
+    wavelength_ratio = cie['wavelength'].max() / cie['wavelength'].min()
+    
+    # Calculate the max_period
+    max_period = min_period * wavelength_ratio
+    
+    # Normalize the 'period' coordinate in power_spectrum to range from min_period to max_period
+    power_spectrum['period'] = (power_spectrum['period'] - power_spectrum['period'].min()) / (power_spectrum['period'].max() - power_spectrum['period'].min()) * (max_period - min_period) + min_period
 
-    # Plot measurements
-    ds.measurements.plot(ax=ax)
+    # Map 'power' from power_spectrum onto a new wavelength scale before interpolation
+    mapped_power_values = np.interp(np.linspace(min_period, max_period, len(cie['wavelength'])), power_spectrum['period'], power_spectrum['power'])
 
-    plt.title('Time series')
-    plt.xticks(rotation=30)
+    # Interpolate the power values onto the new wavelength scale
+    interpolated_power_values = np.interp(cie['wavelength'].values, np.linspace(min_period, max_period, len(power_spectrum['power'])), power_spectrum['power'])
 
+    # Create a new Dataset that shares the 'wavelength' coordinate with cie, with 'power' as its data variable
+    new_power_spectrum = xr.Dataset(
+        {'power': (('wavelength',), interpolated_power_values)},
+        coords={'wavelength': cie['wavelength']}
+    )
+
+    # Plotting the 'power' values before and after interpolation
+    plt.figure(figsize=myfigsize)
+    # Plot the mapped 'power' values before interpolation
+    plt.plot(cie['wavelength'], mapped_power_values, color='lime', linewidth=2.0, label='Before Interpolation')
+    plt.scatter(cie['wavelength'], mapped_power_values, marker='s', color='cyan', s=10)
+    # Plot the 'power' values after interpolation
+    plt.plot(cie['wavelength'], new_power_spectrum['power'], color='red', linewidth=2.0, label='After Interpolation')
+    plt.scatter(cie['wavelength'], new_power_spectrum['power'], marker='o', color='orange', s=10)
+
+    plt.title('Power spectrum')
+    plt.xlabel('Wavelength (nm)')
+    plt.ylabel('Power')
+    plt.grid(True, color='gray')  # set grid color to gray for visibility
+    plt.legend()
+
+    # Create filename with current date
+    date_str = datetime.datetime.now().strftime('%Y%m%d-%H%M%S')
+    filename = os.path.join(outputfolder, f"{date_str}_interpolating_spectrum.png")
     # Save the figure with the desired options
-    plt.savefig(filename, dpi=dpi_choice, format='png', transparent=False, bbox_inches='tight')
+    plt.savefig(filename, dpi=dpi_choice, format='png', transparent=False, bbox_inches='tight', facecolor='black')
+
+    return new_power_spectrum
+
+def map_power_spectrum(cie, power_spectrum, min_period):
+    # calculate the wavelength ratio
+    wavelength_ratio = cie['wavelength'].max() / cie['wavelength'].min()
+    
+    # calculate the max_period
+    max_period = min_period * wavelength_ratio
+
+    # Normalize the period in power_spectrum to be within the range min_period to max_period
+    period_norm = (power_spectrum['period'] - power_spectrum['period'].min()) / (power_spectrum['period'].max() - power_spectrum['period'].min())
+    period_scaled = period_norm * (max_period - min_period) + min_period
+    
+    # Now scale this normalized period to match the wavelength range in cie
+    period_to_wavelength = period_scaled * (cie['wavelength'].max() - cie['wavelength'].min()) + cie['wavelength'].min()
+    
+    # Plot the power_spectrum['power'] values mapped onto cie wavelengths BEFORE interpolation
+    plt.figure(figsize=myfigsize)
+    plt.plot(period_to_wavelength, power_spectrum['power'], color='lime', linewidth=2.0, label='Before Interpolation')
+    plt.scatter(period_to_wavelength, power_spectrum['power'], marker='s', color='cyan', s=10)
+    
+    # Interpolate the power_spectrum['power'] onto the cie wavelengths
+    power_interpolated = xr.DataArray(
+        np.interp(cie['wavelength'], period_to_wavelength, power_spectrum['power']),
+        dims=['wavelength'],
+        coords={'wavelength': cie['wavelength']}
+    )
+    new_power_spectrum = xr.Dataset({'power': power_interpolated})
+
+    # Plot the 'power' values after they have been interpolated to the cie wavelengths
+    plt.plot(new_power_spectrum['wavelength'], new_power_spectrum['power'], color='red', linewidth=2.0, label='After Interpolation')
+    plt.scatter(new_power_spectrum['wavelength'], new_power_spectrum['power'], marker='o', color='orange', s=10)
+    
+    plt.title('Power spectrum')
+    plt.xlabel('Wavelength (nm)')
+    plt.ylabel('Power')
+    plt.grid(True, color='gray')  # set grid color to gray for visibility
+    plt.legend()
+
+    # Create filename with current date
+    date_str = datetime.datetime.now().strftime('%Y%m%d-%H%M%S')
+    filename = os.path.join(outputfolder, f"{date_str}_light_spectrum.png")
+    # Save the figure with the desired options
+    plt.savefig(filename, dpi=dpi_choice, format='png', transparent=False, bbox_inches='tight', facecolor='black')
+
+    return new_power_spectrum
+
+def plot_timeseries(ds):
+    plt.figure(figsize=myfigsize)
+    plt.plot(ds['time'], ds['measurements'], color='lime') # using a bright color for visibility
+    plt.scatter(ds['time'], ds['measurements'], marker='s', color='cyan', s=10)
+    plt.title("Time series", color='white')
+    # Create filename with current date
+    date_str = datetime.datetime.now().strftime('%Y%m%d-%H%M%S')
+    filename = os.path.join(outputfolder,f"{date_str}_timeseries.png")
+    # Save the figure with the desired options
+    plt.savefig(filename, dpi=dpi_choice, format='png', transparent=False, bbox_inches='tight', facecolor='black')
+
+def plot_power_spectrum(power_spectrum):
+    plt.figure(figsize=myfigsize)
+    plt.plot(power_spectrum.period, power_spectrum['power'], color = 'lime', linewidth=2.0)
+    plt.scatter(power_spectrum.period, power_spectrum['power'], marker='s', color='cyan', s=10)
+    plt.title('Power spectrum')
+    plt.xlabel('Period')
+    plt.ylabel('Power')
+    plt.grid(True, color='gray')  # set grid color to gray for visibility
+    # Create filename with current date
+    date_str = datetime.datetime.now().strftime('%Y%m%d-%H%M%S')
+    filename = os.path.join(outputfolder, f"{date_str}_fft_test_power.png")
+    # Save the figure with the desired options
+    plt.savefig(filename, dpi=dpi_choice, format='png', transparent=False, bbox_inches='tight', facecolor='black')
+
+def plot_light_spectrum(power_spectrum):
+    plt.figure(figsize=myfigsize)
+    plt.plot(power_spectrum.wavelength, power_spectrum['power'], color = 'lime', linewidth=2.0)
+    plt.scatter(power_spectrum.wavelength, power_spectrum['power'], marker='s', color='cyan', s=10)
+    plt.title('Power spectrum')
+    plt.xlabel('Wavelength (nm)')
+    plt.ylabel('Power')
+    plt.grid(True, color='gray')  # set grid color to gray for visibility
+    # Create filename with current date
+    date_str = datetime.datetime.now().strftime('%Y%m%d-%H%M%S')
+    filename = os.path.join(outputfolder, f"{date_str}_light_spectrum.png")
+    # Save the figure with the desired options
+    plt.savefig(filename, dpi=dpi_choice, format='png', transparent=False, bbox_inches='tight', facecolor='black')
 
 def plot_color(rgb, filename):
     fig, ax = plt.subplots(1, 1, figsize=(2, 2), dpi=dpi_choice)
@@ -248,61 +366,40 @@ if __name__ == "__main__":
     plt.style.use('dark_background')
     plt.rcParams['font.size'] = 14  # Change the global font size
     plt.rcParams['axes.linewidth'] = 2  # Change the global linewidth
+    myfigsize=(10,5)
+    
+    min_period = 200
 
-    timeseries = synthetic_timeseries(signal='annual', signal_amplitude=10, noise='white', noise_level=0.0, 
+    timeseries = synthetic_timeseries(signal='annual', signal_amplitude=1.0, noise='white', noise_level=0.5, 
                          temporal_resolution='monthly', time_start=datetime.datetime(2001, 1, 1), 
-                         time_stop=datetime.datetime(2055, 1, 1))
+                         time_stop=datetime.datetime(2020, 1, 1))
 
     N = len(timeseries['time'])
     if N % 2: print(f"!!! WARNING!!! LENGTH NEEDS TO BE EVEN FOR NFFT, BUT: {len(timeseries['time']) = }")
 
-    # Create filename with current date
-    date_str = datetime.datetime.now().strftime('%Y%m%d-%H%M%S')
-    filename = os.path.join(outputfolder,f"{date_str}_timeseries.png")
-    plot_timeseries(timeseries,filename)
+    plot_timeseries(timeseries)
     
     print("!!!! DETREND BY REMOVING CONSTANT, TREND, ACCEL, AND POSSIBLY ANNUAL?")
 
     # Perform non-uniform FFT to get power spectrum.
     power_spectrum = nfft_power(timeseries)
 
-    if 0:
-        plt.figure(figsize=(10,5))
-        power_spectrum['power_spectrum'].plot.line('o-') # 'o-' will create a line plot with markers at data points
-        plt.title('Power spectrum')
-        plt.xlabel('Frequency')
-        plt.ylabel('Power')
-        plt.grid(True)
-        # Create filename with current date
-        date_str = datetime.datetime.now().strftime('%Y%m%d-%H%M%S')
-        filename = os.path.join(outputfolder,f"{date_str}_fft_test_power_vs_frequency.png")
-        # Save the figure with the desired options
-        plt.savefig(filename, dpi=dpi_choice, format='png', transparent=False, bbox_inches='tight')
-
     power_spectrum = convert_spectrum_from_frequency_to_period(power_spectrum)
-
-    plt.figure(figsize=(10,5))
-    power_spectrum['power'].plot.line('o-') # 'o-' will create a line plot with markers at data points
     
-    print(f"{power_spectrum.period.values = }")
-
     signal_period = 365.25
     power_spectrum = power_spectrum.where((power_spectrum.period > signal_period * 0.5) & (power_spectrum.period < signal_period * 2), drop=True)
 
-    plt.figure(figsize=(10,5))
-    plt.plot(power_spectrum.period, power_spectrum['power'], color = 'lime', linewidth=2.0)  # set linewidth to increase thickness
-    plt.title('Power spectrum')
-    plt.xlabel('Period')
-    plt.ylabel('Power')
-    plt.grid(True, color='gray')  # set grid color to gray for visibility
-    # Create filename with current date
-    date_str = datetime.datetime.now().strftime('%Y%m%d-%H%M%S')
-    filename = os.path.join(outputfolder, f"{date_str}_fft_test_power.png")
-    # Save the figure with the desired options
-    plt.savefig(filename, dpi=dpi_choice, format='png', transparent=False, bbox_inches='tight', facecolor='black')
+    plot_power_spectrum(power_spectrum)
+
+    cie = load_cie_functions()
+
+    mapped_spectrum = map_power_spectrum(cie, power_spectrum, min_period)
+    
+    print(f"{mapped_spectrum = }")
+    
+    plot_light_spectrum(mapped_spectrum)
 
     if 0:
-        cie = load_cie_functions()
         print(f"{cie = }")    
         spectrum = synthetic_spectrum(cie, 530, 30)
         print(f"{spectrum = }")
