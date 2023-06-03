@@ -221,7 +221,7 @@ def convert_spectrum_from_frequency_to_period(ds):
 
     return new_ds
 
-def old_map_power_spectrum(cie, power_spectrum, min_period):
+def map_power_spectrum(cie, power_spectrum, min_period):
     # Calculate the wavelength ratio
     wavelength_ratio = cie['wavelength'].max() / cie['wavelength'].min()
     
@@ -231,83 +231,14 @@ def old_map_power_spectrum(cie, power_spectrum, min_period):
     # Normalize the 'period' coordinate in power_spectrum to range from min_period to max_period
     power_spectrum['period'] = (power_spectrum['period'] - power_spectrum['period'].min()) / (power_spectrum['period'].max() - power_spectrum['period'].min()) * (max_period - min_period) + min_period
 
-    # Map 'power' from power_spectrum onto a new wavelength scale before interpolation
+    # Map 'power' from power_spectrum onto a new wavelength scale and interpolate
     mapped_power_values = np.interp(np.linspace(min_period, max_period, len(cie['wavelength'])), power_spectrum['period'], power_spectrum['power'])
-
-    # Interpolate the power values onto the new wavelength scale
-    interpolated_power_values = np.interp(cie['wavelength'].values, np.linspace(min_period, max_period, len(power_spectrum['power'])), power_spectrum['power'])
 
     # Create a new Dataset that shares the 'wavelength' coordinate with cie, with 'power' as its data variable
     new_power_spectrum = xr.Dataset(
-        {'power': (('wavelength',), interpolated_power_values)},
+        {'power': (('wavelength',), mapped_power_values)},
         coords={'wavelength': cie['wavelength']}
     )
-
-    # Plotting the 'power' values before and after interpolation
-    plt.figure(figsize=myfigsize)
-    # Plot the mapped 'power' values before interpolation
-    plt.plot(cie['wavelength'], mapped_power_values, color='lime', linewidth=2.0, label='Before Interpolation')
-    plt.scatter(cie['wavelength'], mapped_power_values, marker='s', color='cyan', s=10)
-    # Plot the 'power' values after interpolation
-    plt.plot(cie['wavelength'], new_power_spectrum['power'], color='red', linewidth=2.0, label='After Interpolation')
-    plt.scatter(cie['wavelength'], new_power_spectrum['power'], marker='o', color='orange', s=10)
-
-    plt.title('Power spectrum')
-    plt.xlabel('Wavelength (nm)')
-    plt.ylabel('Power')
-    plt.grid(True, color='gray')  # set grid color to gray for visibility
-    plt.legend()
-
-    # Create filename with current date
-    date_str = datetime.datetime.now().strftime('%Y%m%d-%H%M%S')
-    filename = os.path.join(outputfolder, f"{date_str}_interpolating_spectrum.png")
-    # Save the figure with the desired options
-    plt.savefig(filename, dpi=dpi_choice, format='png', transparent=False, bbox_inches='tight', facecolor='black')
-
-    return new_power_spectrum
-
-def map_power_spectrum(cie, power_spectrum, min_period):
-    # calculate the wavelength ratio
-    wavelength_ratio = cie['wavelength'].max() / cie['wavelength'].min()
-    
-    # calculate the max_period
-    max_period = min_period * wavelength_ratio
-
-    # Normalize the period in power_spectrum to be within the range min_period to max_period
-    period_norm = (power_spectrum['period'] - power_spectrum['period'].min()) / (power_spectrum['period'].max() - power_spectrum['period'].min())
-    period_scaled = period_norm * (max_period - min_period) + min_period
-    
-    # Now scale this normalized period to match the wavelength range in cie
-    period_to_wavelength = period_scaled * (cie['wavelength'].max() - cie['wavelength'].min()) + cie['wavelength'].min()
-    
-    # Plot the power_spectrum['power'] values mapped onto cie wavelengths BEFORE interpolation
-    plt.figure(figsize=myfigsize)
-    plt.plot(period_to_wavelength, power_spectrum['power'], color='lime', linewidth=2.0, label='Before Interpolation')
-    plt.scatter(period_to_wavelength, power_spectrum['power'], marker='s', color='cyan', s=10)
-    
-    # Interpolate the power_spectrum['power'] onto the cie wavelengths
-    power_interpolated = xr.DataArray(
-        np.interp(cie['wavelength'], period_to_wavelength, power_spectrum['power']),
-        dims=['wavelength'],
-        coords={'wavelength': cie['wavelength']}
-    )
-    new_power_spectrum = xr.Dataset({'power': power_interpolated})
-
-    # Plot the 'power' values after they have been interpolated to the cie wavelengths
-    plt.plot(new_power_spectrum['wavelength'], new_power_spectrum['power'], color='red', linewidth=2.0, label='After Interpolation')
-    plt.scatter(new_power_spectrum['wavelength'], new_power_spectrum['power'], marker='o', color='orange', s=10)
-    
-    plt.title('Power spectrum')
-    plt.xlabel('Wavelength (nm)')
-    plt.ylabel('Power')
-    plt.grid(True, color='gray')  # set grid color to gray for visibility
-    plt.legend()
-
-    # Create filename with current date
-    date_str = datetime.datetime.now().strftime('%Y%m%d-%H%M%S')
-    filename = os.path.join(outputfolder, f"{date_str}_light_spectrum.png")
-    # Save the figure with the desired options
-    plt.savefig(filename, dpi=dpi_choice, format='png', transparent=False, bbox_inches='tight', facecolor='black')
 
     return new_power_spectrum
 
@@ -329,7 +260,7 @@ def plot_power_spectrum(power_spectrum):
     plt.title('Power spectrum')
     plt.xlabel('Period')
     plt.ylabel('Power')
-    plt.grid(True, color='gray')  # set grid color to gray for visibility
+    #plt.grid(True, color='gray')  # set grid color to gray for visibility
     # Create filename with current date
     date_str = datetime.datetime.now().strftime('%Y%m%d-%H%M%S')
     filename = os.path.join(outputfolder, f"{date_str}_fft_test_power.png")
@@ -343,7 +274,7 @@ def plot_light_spectrum(power_spectrum):
     plt.title('Power spectrum')
     plt.xlabel('Wavelength (nm)')
     plt.ylabel('Power')
-    plt.grid(True, color='gray')  # set grid color to gray for visibility
+    #plt.grid(True, color='gray')  # set grid color to gray for visibility
     # Create filename with current date
     date_str = datetime.datetime.now().strftime('%Y%m%d-%H%M%S')
     filename = os.path.join(outputfolder, f"{date_str}_light_spectrum.png")
@@ -370,7 +301,7 @@ if __name__ == "__main__":
     
     min_period = 200
 
-    timeseries = synthetic_timeseries(signal='annual', signal_amplitude=1.0, noise='white', noise_level=0.5, 
+    timeseries = synthetic_timeseries(signal='annual', signal_amplitude=1.0, noise='white', noise_level=0.0, 
                          temporal_resolution='monthly', time_start=datetime.datetime(2001, 1, 1), 
                          time_stop=datetime.datetime(2020, 1, 1))
 
@@ -396,6 +327,8 @@ if __name__ == "__main__":
     mapped_spectrum = map_power_spectrum(cie, power_spectrum, min_period)
     
     print(f"{mapped_spectrum = }")
+    
+    time.sleep(2)
     
     plot_light_spectrum(mapped_spectrum)
 
