@@ -228,8 +228,15 @@ def map_power_spectrum(cie, power_spectrum, min_period):
     # Calculate the max_period
     max_period = min_period * wavelength_ratio
     
-    # Normalize the 'period' coordinate in power_spectrum to range from min_period to max_period
-    power_spectrum['period'] = (power_spectrum['period'] - power_spectrum['period'].min()) / (power_spectrum['period'].max() - power_spectrum['period'].min()) * (max_period - min_period) + min_period
+    # Add min_period and max_period to power_spectrum period coordinate
+    new_periods = np.sort(np.concatenate([power_spectrum['period'].values, [min_period, max_period]]))
+    power_spectrum = power_spectrum.reindex(period=new_periods, method='nearest')
+
+    # Interpolate power values for the new periods
+    power_spectrum['power'] = power_spectrum['power'].interpolate_na(dim='period')
+    
+    # Remove all points outside the range [min_period, max_period]
+    power_spectrum = power_spectrum.where((power_spectrum['period'] >= min_period) & (power_spectrum['period'] <= max_period), drop=True)
 
     # Map 'power' from power_spectrum onto a new wavelength scale and interpolate
     mapped_power_values = np.interp(np.linspace(min_period, max_period, len(cie['wavelength'])), power_spectrum['period'], power_spectrum['power'])
@@ -299,11 +306,13 @@ if __name__ == "__main__":
     plt.rcParams['axes.linewidth'] = 2  # Change the global linewidth
     myfigsize=(10,5)
     
-    min_period = 300
+    min_period = 280
 
-    timeseries = synthetic_timeseries(signal='annual', signal_amplitude=1.0, noise='white', noise_level=0.0, 
-                         temporal_resolution='monthly', time_start=datetime.datetime(2001, 1, 1), 
-                         time_stop=datetime.datetime(2020, 1, 1))
+    timeseries = synthetic_timeseries(signal='annual',
+        signal_amplitude=1.0, noise='white', noise_level=0.0, 
+        temporal_resolution='monthly',
+        time_start=datetime.datetime(2001, 1, 1), 
+        time_stop=datetime.datetime(2020, 1, 1))
 
     N = len(timeseries['time'])
     if N % 2: print(f"!!! WARNING!!! LENGTH NEEDS TO BE EVEN FOR NFFT, BUT: {len(timeseries['time']) = }")
@@ -327,11 +336,8 @@ if __name__ == "__main__":
     mapped_spectrum = map_power_spectrum(cie, power_spectrum, min_period)
     
     print(f"{mapped_spectrum = }")
-    
-    time.sleep(2)
-    
-    try:  plot_light_spectrum(mapped_spectrum,title="Light spectrum")
-    except: plot_fft_spectrum(mapped_spectrum,title="Light spectrum")
+        
+    plot_light_spectrum(mapped_spectrum,title="Light spectrum")
 
     if 0:
         print(f"{cie = }")    
