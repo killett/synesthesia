@@ -282,13 +282,7 @@ def convert_spectrum_from_frequency_to_period(ds):
 
     return new_ds
 
-def map_power_spectrum(cie, power_spectrum, min_period):
-    # Calculate the wavelength ratio
-    wavelength_ratio = cie['wavelength'].max() / cie['wavelength'].min()
-    
-    # Calculate the max_period
-    max_period = min_period * wavelength_ratio
-    
+def map_power_spectrum(cie, power_spectrum, min_period = -1, max_period = -1):    
     # Add min_period and max_period to power_spectrum period coordinate
     new_periods = np.sort(np.concatenate([power_spectrum['period'].values, [min_period, max_period]]))
     power_spectrum = power_spectrum.reindex(period=new_periods, method='nearest')
@@ -393,31 +387,7 @@ def extract_ssha_timeseries(ds, lat = 30, lon = 135):
 
     return ds
 
-if __name__ == "__main__":
-    plt.style.use('dark_background')
-    plt.rcParams['font.size'] = 14  # Change the global font size
-    plt.rcParams['axes.linewidth'] = 2  # Change the global linewidth
-    myfigsize=(10,5)
-    
-    min_period = 280
-
-    ds = load_ssha_files(tskip=4)
-    timeseries = extract_ssha_timeseries(ds, lat = 30, lon = 135)
-    #breakpoint()
-
-    if 0: timeseries = synthetic_timeseries(signal='annual',
-            signal_amplitude=1.0,
-            noise='white', noise_level=0.0,
-            temporal_resolution='monthly',
-            time_start=datetime.datetime(2001, 1, 1),
-            time_stop=datetime.datetime(2020, 1, 1))
-    #breakpoint()
-
-    N = len(timeseries['time'])
-    if N % 2: print(f"!!! WARNING!!! LENGTH NEEDS TO BE EVEN FOR NFFT, BUT: {len(timeseries['time']) = }")
-
-    plot_timeseries(timeseries,title="Time series")
-    
+def timeseries_to_rgb(timeseries, min_period, max_period):
     timeseries, fits = fancy_detrend(timeseries, x_key='time', y_key='measurements', terms=['constant', 'trend', 'accel'])
 
     plot_timeseries(timeseries,title="Detrended time series")
@@ -431,22 +401,28 @@ if __name__ == "__main__":
 
     power_spectrum = convert_spectrum_from_frequency_to_period(power_spectrum)
     
+    print(f"{min_period = } and {np.max(power_spectrum.period.values) = }")
+    if 0:#min_period >= np.max(power_spectrum.period.values):
+        print(f"!!! WARNING!!! originally {min_period = } but {np.max(power_spectrum.period.values) = }")
+        min_period = np.min(power_spectrum.period.values)
+        print(f"So now {min_period = } which equals {np.min(power_spectrum.period.values) = }")
     signal_period = 365.25
-    power_spectrum = power_spectrum.where((power_spectrum.period > signal_period * 0.2) & (power_spectrum.period < signal_period * 3), drop=True)
+    #power_spectrum = power_spectrum.where((power_spectrum.period > signal_period * 0.2) & (power_spectrum.period < signal_period * 3), drop=True)
 
     plot_fft_spectrum(power_spectrum,title="FFT Power spectrum")
 
     cie = load_cie_functions()
 
-    mapped_spectrum = map_power_spectrum(cie, power_spectrum, min_period)
+    mapped_spectrum = map_power_spectrum(cie, power_spectrum, min_period = min_period, max_period = max_period)
     
     print(f"{mapped_spectrum = }")
         
     plot_light_spectrum(mapped_spectrum,title="Light spectrum")
 
-    if 0:
-        print(f"{cie = }")    
-        spectrum = synthetic_spectrum(cie, 530, 30)
+    if 1:
+        #print(f"{cie = }")
+        #spectrum = synthetic_spectrum(cie, 530, 30)
+        spectrum = mapped_spectrum
         print(f"{spectrum = }")
         xyz = spectrum2xyz(spectrum, cie, 1.0)
         print(f"{xyz = }")
@@ -463,3 +439,56 @@ if __name__ == "__main__":
         date_str = datetime.datetime.now().strftime('%Y%m%d-%H%M%S')
         filename = os.path.join(outputfolder,f"{date_str}_color_plot.png")
         #plot_color(rgb, filename)
+        
+        return rgb
+
+# First, define your function
+def rms(x):
+    return np.sqrt(np.mean(x**2))
+
+if __name__ == "__main__":
+    plt.style.use('dark_background')
+    plt.rcParams['font.size'] = 14  # Change the global font size
+    plt.rcParams['axes.linewidth'] = 2  # Change the global linewidth
+    myfigsize=(10,5)
+    
+    min_period = 12
+    max_period = 200
+
+    # Calculate the wavelength ratio
+    #wavelength_ratio = cie['wavelength'].max() / cie['wavelength'].min()
+    # Calculate the max_period
+    #max_period = min_period * wavelength_ratio
+
+    ds = load_ssha_files(tskip=1)
+    #breakpoint()
+    # Stack 'Latitude' and 'Longitude' into a new single dimension 'position'
+    print("Stacking...")
+    stacked = ds.stack(position=['Latitude', 'Longitude'])
+    # Apply the function to the 'SLA' variable of the stacked dataset
+    print("Applying function to SLA variable...")
+    rms_SSHA = stacked['SLA'].groupby('position').map(rms)
+    print("Convert this DataArray back to a Dataset...")
+    rms_SSHA_dataset = rms_SSHA.to_dataset(name='SLA_RMS')
+    # If you need the result in the original shape, unstack 'position'
+    print("Unstacking...")
+    rms_SSHA_dataset = rms_SSHA_dataset.unstack('position')
+    breakpoint()
+    
+    timeseries = extract_ssha_timeseries(ds, lat = 30, lon = 135)
+    #breakpoint()
+
+    if 0: timeseries = synthetic_timeseries(signal='annual',
+            signal_amplitude=1.0,
+            noise='white', noise_level=0.0,
+            temporal_resolution='monthly',
+            time_start=datetime.datetime(2001, 1, 1),
+            time_stop=datetime.datetime(2020, 1, 1))
+    #breakpoint()
+
+    N = len(timeseries['time'])
+    if N % 2: print(f"!!! WARNING!!! LENGTH NEEDS TO BE EVEN FOR NFFT, BUT: {len(timeseries['time']) = }")
+
+    plot_timeseries(timeseries,title="Time series")
+    
+    rgb = timeseries_to_rgb(timeseries, min_period, max_period)
