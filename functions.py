@@ -1,19 +1,28 @@
 import csv
 import os
+import glob
 import xarray as xr
 import numpy as np
 import pandas as pd
-import nfft # pip install nfft From: https://github.com/jakevdp/nfft
+import nfft # pip install nfft Reference: https://github.com/jakevdp/nfft
+import statsmodels.api as sm #pip install statsmodels
 import matplotlib.pyplot as plt
 import datetime
 import time
 
 outputfolder = os.path.join('.', 'output')
+if not os.path.exists(outputfolder):
+    os.makedirs(outputfolder)
+elif not os.path.isdir(outputfolder):
+    raise ValueError(f"{outputfolder} exists but is not a directory.")
+
+sshafolder = os.path.join('.', 'sealevel_spectra','newest_full_grids','netCDF4')
 
 dpi_choice = 300
 
 def load_cie_functions():
     file = os.path.join('.', 'sealevel_spectra', 'ciexyz31_1_trimmed_400nm_700nm.csv')
+    #file = os.path.join('.', 'sealevel_spectra', 'ciexyz31_1_trimmed_380nm_760nm.csv') #Matches Hughes and Williams 2010
 
     data = {
         'x': [],
@@ -152,10 +161,61 @@ def synthetic_timeseries(signal='annual', signal_amplitude=1, noise='white', noi
 
     return ds
 
+def fancy_detrend(timeseries, x_key='time', y_key='measurements', terms=['constant', 'trend']):
+    print("!!!WARNING!!! Next line assumes these units are originally in ns and you want the units to be days!!!")
+    x = (timeseries[x_key] - timeseries[x_key][0]).values.astype(float) / (24*3600*1e9)
+    y = timeseries[y_key].values
+
+    design_matrix = []
+
+    if 'constant' in terms:
+        design_matrix.append(np.ones_like(x))
+
+    if 'trend' in terms:
+        design_matrix.append(x)
+
+    if 'accel' in terms:
+        design_matrix.append(x ** 2)
+
+    design_matrix = np.column_stack(design_matrix)
+
+    model = sm.OLS(y, design_matrix)
+    result = model.fit()
+
+    detrended_y = y - result.fittedvalues
+
+    detrended_timeseries = timeseries.copy()
+    detrended_timeseries[y_key].values = detrended_y
+
+    fits = {}
+    for i, term in enumerate(terms):
+        fits[term] = result.params[i]
+
+    return detrended_timeseries, fits
+
+def turn_fits_into_timeseries(timeseries, fits, x_key='time', y_key='measurements'):
+    print("!!!WARNING!!! Next line assumes these units are originally in ns and you want the units to be days!!!")
+    x = (timeseries[x_key] - timeseries[x_key][0]).values.astype(float) / (24*3600*1e9)
+    fitted_values = np.zeros_like(x)
+
+    for term, fit_value in fits.items():
+        if term == 'constant':
+            fitted_values += fit_value
+        elif term == 'trend':
+            fitted_values += fit_value * x
+        elif term == 'accel':
+            fitted_values += fit_value * x**2
+
+    fitted_timeseries = timeseries.copy()
+    fitted_timeseries[y_key].values = fitted_values
+
+    return fitted_timeseries
+
 def nfft_power(ds):
     # Convert datetime index to numeric (we use 'day' as the unit)
     print("!!!WARNING!!! Next line assumes these units are originally in ns and you want the units to be days!!!")
     x = (ds.time - ds.time[0]).values.astype(float) / (24*3600*1e9)
+    y = ds.measurements
 
     #If timeseries has an odd number of points,
     #remove the last data point, then calculate min, range.
@@ -170,6 +230,7 @@ def nfft_power(ds):
             print(f"!!! WARNING!!! LENGTH NEEDS TO BE EVEN FOR NFFT, BUT: {len(x) = }")
             print(f"!!! DELETING LAST DATA POINT!")
             x = np.delete(x, -1)
+            y = np.delete(y, -1)
 
     # Define Fourier modes
     k = -(N // 2) + np.arange(N)
@@ -177,7 +238,7 @@ def nfft_power(ds):
     xf = k / x_range
     
     #Perform NFFT.
-    f_k = nfft.nfft(x_norm,ds.measurements)
+    f_k = nfft.nfft(x_norm,y)
 
     #Compute power spectrum, which is the square of the absolute value of the Fourier Transform
     power_spectrum = np.abs(f_k)**2
@@ -249,7 +310,7 @@ def map_power_spectrum(cie, power_spectrum, min_period):
 
     return new_power_spectrum
 
-def plot_timeseries(ds,title):
+def plot_timeseries(ds, title):
     plt.figure(figsize=myfigsize)
     plt.plot(ds['time'], ds['measurements'], color='lime') # using a bright color for visibility
     plt.scatter(ds['time'], ds['measurements'], marker='s', color='cyan', s=10)
@@ -260,7 +321,7 @@ def plot_timeseries(ds,title):
     # Save the figure with the desired options
     plt.savefig(filename, dpi=dpi_choice, format='png', transparent=False, bbox_inches='tight', facecolor='black')
 
-def plot_fft_spectrum(power_spectrum,title):
+def plot_fft_spectrum(power_spectrum, title):
     plt.figure(figsize=myfigsize)
     plt.plot(power_spectrum.period, power_spectrum.power, color = 'lime', linewidth=2.0)
     plt.scatter(power_spectrum.period, power_spectrum.power, marker='s', color='cyan', s=10)
@@ -274,7 +335,7 @@ def plot_fft_spectrum(power_spectrum,title):
     # Save the figure with the desired options
     plt.savefig(filename, dpi=dpi_choice, format='png', transparent=False, bbox_inches='tight', facecolor='black')
 
-def plot_light_spectrum(power_spectrum,title):
+def plot_light_spectrum(power_spectrum, title):
     plt.figure(figsize=myfigsize)
     plt.plot(power_spectrum.wavelength, power_spectrum.power, color = 'lime', linewidth=2.0)
     plt.scatter(power_spectrum.wavelength, power_spectrum.power, marker='s', color='cyan', s=10)
@@ -300,6 +361,38 @@ def plot_color(rgb, filename):
     # Save the figure with the desired options
     plt.savefig(filename, dpi=dpi_choice, format='png', transparent=False, bbox_inches='tight')
 
+def load_ssha_files(tskip=1):
+    # Get the list of files
+    sshafiles = sorted(glob.glob(os.path.join(sshafolder,'*.nc')))
+
+    # Get every tskip file
+    tskip_files = sshafiles[::tskip]
+
+    # Load all files into the same dataset
+    print(f"Loading {len(tskip_files)} SSHA files...")
+    ds = xr.open_mfdataset(tskip_files, combine='by_coords')
+
+    return ds
+
+def extract_ssha_timeseries(ds, lat = 30, lon = 135):
+    print(f"Extracting SSHA timeseries at {lat = } and {lon = }")
+
+    # Convert the longitude to the range 0-360 if it's in -180 to 180
+    if lon < 0:
+        lon = 360 + lon
+
+    # Extract SLA values at the given latitude and longitude, and convert it to a numpy array
+    # Using method='nearest' to handle case if exact coordinates are not present in the dataset
+    measurements = ds['SLA'].sel(Latitude=lat, Longitude=lon, method='nearest').values
+
+    # Create xarray dataset
+    ds = xr.Dataset(
+        {'measurements': ('time', measurements)},
+        coords={'time': ds.Time.values}
+    )
+
+    return ds
+
 if __name__ == "__main__":
     plt.style.use('dark_background')
     plt.rcParams['font.size'] = 14  # Change the global font size
@@ -308,18 +401,30 @@ if __name__ == "__main__":
     
     min_period = 280
 
-    timeseries = synthetic_timeseries(signal='annual',
-        signal_amplitude=1.0, noise='white', noise_level=0.0, 
-        temporal_resolution='monthly',
-        time_start=datetime.datetime(2001, 1, 1), 
-        time_stop=datetime.datetime(2020, 1, 1))
+    ds = load_ssha_files(tskip=4)
+    timeseries = extract_ssha_timeseries(ds, lat = 30, lon = 135)
+    #breakpoint()
+
+    if 0: timeseries = synthetic_timeseries(signal='annual',
+            signal_amplitude=1.0,
+            noise='white', noise_level=0.0,
+            temporal_resolution='monthly',
+            time_start=datetime.datetime(2001, 1, 1),
+            time_stop=datetime.datetime(2020, 1, 1))
+    #breakpoint()
 
     N = len(timeseries['time'])
     if N % 2: print(f"!!! WARNING!!! LENGTH NEEDS TO BE EVEN FOR NFFT, BUT: {len(timeseries['time']) = }")
 
     plot_timeseries(timeseries,title="Time series")
     
-    print("!!!! DETREND BY REMOVING CONSTANT, TREND, ACCEL, AND POSSIBLY ANNUAL?")
+    timeseries, fits = fancy_detrend(timeseries, x_key='time', y_key='measurements', terms=['constant', 'trend', 'accel'])
+
+    plot_timeseries(timeseries,title="Detrended time series")
+
+    fitted_timeseries = turn_fits_into_timeseries(timeseries, fits=fits, x_key='time', y_key='measurements')
+
+    plot_timeseries(fitted_timeseries,title="Fitted time series")
 
     # Perform non-uniform FFT to get power spectrum.
     power_spectrum = nfft_power(timeseries)
