@@ -7,6 +7,7 @@ import pandas as pd
 import nfft # pip install nfft Reference: https://github.com/jakevdp/nfft
 import statsmodels.api as sm #pip install statsmodels
 import matplotlib.pyplot as plt
+#import cartopy.crs as ccrs
 import datetime
 import time
 
@@ -282,10 +283,25 @@ def convert_spectrum_from_frequency_to_period(ds):
 
     return new_ds
 
-def map_power_spectrum(cie, power_spectrum, min_period = -1, max_period = -1):    
-    # Add min_period and max_period to power_spectrum period coordinate
-    new_periods = np.sort(np.concatenate([power_spectrum['period'].values, [min_period, max_period]]))
-    power_spectrum = power_spectrum.reindex(period=new_periods, method='nearest')
+def map_power_spectrum(cie, power_spectrum, min_period = -1, max_period = -1):
+    # Get existing periods
+    existing_periods = power_spectrum['period'].values
+
+    # Create a flag to track if a new period was added
+    new_period_added = False
+
+    # Check if min_period and max_period are already in existing_periods
+    if min_period not in existing_periods:
+        existing_periods = np.append(existing_periods, min_period)
+        new_period_added = True
+    if max_period not in existing_periods:
+        existing_periods = np.append(existing_periods, max_period)
+        new_period_added = True
+
+    # If a new period was added, sort and reindex
+    if new_period_added:
+        new_periods = np.sort(existing_periods)
+        power_spectrum = power_spectrum.reindex(period=new_periods, method='nearest')
 
     # Interpolate power values for the new periods
     power_spectrum['power'] = power_spectrum['power'].interpolate_na(dim='period')
@@ -402,10 +418,15 @@ def timeseries_to_rgb(timeseries, min_period, max_period):
     power_spectrum = convert_spectrum_from_frequency_to_period(power_spectrum)
     
     print(f"{min_period = } and {np.max(power_spectrum.period.values) = }")
-    if 0:#min_period >= np.max(power_spectrum.period.values):
-        print(f"!!! WARNING!!! originally {min_period = } but {np.max(power_spectrum.period.values) = }")
+    if min_period < np.min(power_spectrum.period.values) or min_period >= np.max(power_spectrum.period.values):
+        print(f"!!! WARNING!!! originally {min_period = } but {np.min(power_spectrum.period.values) = } and {np.max(power_spectrum.period.values) = }")
         min_period = np.min(power_spectrum.period.values)
         print(f"So now {min_period = } which equals {np.min(power_spectrum.period.values) = }")
+    print(f"{max_period = } and {np.max(power_spectrum.period.values) = }")
+    if max_period <= np.min(power_spectrum.period.values) or max_period > np.max(power_spectrum.period.values):
+        print(f"!!! WARNING!!! originally {max_period = } but {np.min(power_spectrum.period.values) = } and {np.max(power_spectrum.period.values) = }")
+        max_period = np.max(power_spectrum.period.values)
+        print(f"So now {max_period = } which equals {np.max(power_spectrum.period.values) = }")
     signal_period = 365.25
     #power_spectrum = power_spectrum.where((power_spectrum.period > signal_period * 0.2) & (power_spectrum.period < signal_period * 3), drop=True)
 
@@ -446,14 +467,20 @@ def timeseries_to_rgb(timeseries, min_period, max_period):
 def rms(x):
     return np.sqrt(np.mean(x**2))
 
+# Define your function, that returns a Dataset
+def rms_and_mean(x):
+    rms_value = np.sqrt(np.mean(x**2))
+    mean_value = np.mean(x)
+    return xr.Dataset({'rms': rms_value, 'mean': mean_value})
+
 if __name__ == "__main__":
     plt.style.use('dark_background')
     plt.rcParams['font.size'] = 14  # Change the global font size
     plt.rcParams['axes.linewidth'] = 2  # Change the global linewidth
     myfigsize=(10,5)
     
-    min_period = 12
-    max_period = 200
+    min_period = 220
+    max_period = 2000
 
     # Calculate the wavelength ratio
     #wavelength_ratio = cie['wavelength'].max() / cie['wavelength'].min()
@@ -461,7 +488,12 @@ if __name__ == "__main__":
     #max_period = min_period * wavelength_ratio
 
     ds = load_ssha_files(tskip=1)
+    xskip = 24
+    print(f"Grabbing one lat/lon point in every {xskip**2} points...",end="")
+    ds =  ds.isel(Latitude=slice(None, None, xskip), Longitude=slice(None, None, xskip))
+    print(" done.")
     #breakpoint()
+
     # Stack 'Latitude' and 'Longitude' into a new single dimension 'position'
     print("Stacking...")
     stacked = ds.stack(position=['Latitude', 'Longitude'])
@@ -473,8 +505,62 @@ if __name__ == "__main__":
     # If you need the result in the original shape, unstack 'position'
     print("Unstacking...")
     rms_SSHA_dataset = rms_SSHA_dataset.unstack('position')
-    breakpoint()
+    #breakpoint()
     
+    if 0:
+        # Assuming `ds` is your xarray Dataset
+        sla_rms = ds['SLA_RMS']
+        title = 'SLA RMS'
+        # Create the figure and axes objects
+        fig = plt.figure(figsize=myfigsize)
+        ax = fig.add_subplot(1, 1, 1, projection=ccrs.PlateCarree())
+        # Make the plot
+        sla_rms.plot(ax=ax, transform=ccrs.PlateCarree(), cmap='viridis', cbar_kwargs={'label': 'RMS', 'orientation': 'horizontal', 'pad': 0.1})
+        # Add gridlines and labels
+        ax.coastlines()
+        ax.gridlines(draw_labels=True)
+        # Create filename with current date
+        date_str = datetime.datetime.now().strftime('%Y%m%d-%H%M%S')
+        filename = os.path.join(outputfolder, f"{date_str}_{title.replace(' ','_')}.png")
+        # Save the figure with the desired options
+        plt.savefig(filename, dpi=dpi_choice, format='png', transparent=False, bbox_inches='tight', facecolor='black')
+
+    # Stack 'Latitude' and 'Longitude' into a new single dimension 'position'
+    stacked = ds.stack(position=['Latitude', 'Longitude'])
+
+    # Apply the function to the 'SLA' variable of the stacked dataset
+    result = stacked['SLA'].groupby('position').map(rms_and_mean)
+
+    # Now `result` is a Dataset of Datasets, create a dictionary of unstacked datasets
+    datasets = {key: result[key].unstack('position') for key in result.data_vars}
+
+    for thekey in datasets.keys():
+        # Create filename with current date
+        date_str = datetime.datetime.now().strftime('%Y%m%d-%H%M%S')
+        filename = os.path.join(outputfolder, f"{date_str}_{thekey.replace(' ', '_')}.nc")
+        
+        # Save the dataset to a NetCDF file
+        datasets[thekey].to_netcdf(filename)
+
+    # Define your function, that returns a Dataset
+    def rms_and_mean(x):
+        rms_value = np.sqrt(np.mean(x**2))
+        mean_value = np.mean(x)
+        return xr.Dataset({'rms': rms_value, 'mean': mean_value})
+
+    # Chunk the data for Dask parallel processing
+    ds = ds.chunk({'Latitude': 'auto', 'Longitude': 'auto'})
+
+    # Stack 'Latitude' and 'Longitude' into a new single dimension 'position'
+    stacked = ds.stack(position=['Latitude', 'Longitude'])
+
+    # Apply the function to the 'SLA' variable of the stacked dataset
+    # Use Dask for computation
+    result = stacked['SLA'].groupby('position').map(rms_and_mean, shortcut=False)
+
+    # Now `result` is a Dataset of Datasets, create a dictionary of unstacked datasets
+    datasets = {key: result[key].unstack('position').compute() for key in result.data_vars}
+
     timeseries = extract_ssha_timeseries(ds, lat = 30, lon = 135)
     #breakpoint()
 
