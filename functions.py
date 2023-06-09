@@ -9,7 +9,9 @@ import statsmodels.api as sm #pip install statsmodels
 import matplotlib.pyplot as plt
 #import cartopy.crs as ccrs
 import datetime
+
 import time
+import timeit
 
 outputfolder = os.path.join('.', 'output')
 if not os.path.exists(outputfolder):
@@ -490,23 +492,31 @@ if __name__ == "__main__":
     ds = load_ssha_files(tskip=1)
     xskip = 24
     print(f"Grabbing one lat/lon point in every {xskip**2} points...",end="")
-    ds =  ds.isel(Latitude=slice(None, None, xskip), Longitude=slice(None, None, xskip))
+    ds = ds.isel(Latitude=slice(None, None, xskip), Longitude=slice(None, None, xskip))
     print(" done.")
     #breakpoint()
 
+    # Time the code
+    start_time = timeit.default_timer()
+    print("Starting map operation WITHOUT dask...")
+
     # Stack 'Latitude' and 'Longitude' into a new single dimension 'position'
-    print("Stacking...")
     stacked = ds.stack(position=['Latitude', 'Longitude'])
+
     # Apply the function to the 'SLA' variable of the stacked dataset
-    print("Applying function to SLA variable...")
-    rms_SSHA = stacked['SLA'].groupby('position').map(rms)
-    print("Convert this DataArray back to a Dataset...")
-    rms_SSHA_dataset = rms_SSHA.to_dataset(name='SLA_RMS')
-    # If you need the result in the original shape, unstack 'position'
-    print("Unstacking...")
-    rms_SSHA_dataset = rms_SSHA_dataset.unstack('position')
-    #breakpoint()
-    
+    result = stacked['SLA'].groupby('position').map(rms_and_mean)
+
+    # Now `result` is a Dataset of Datasets, create a dictionary of unstacked datasets
+    datasets = {key: result[key].unstack('position') for key in result.data_vars}
+
+    # Stop the timer
+    end_time = timeit.default_timer()
+
+    # Calculate the time taken
+    time_taken = end_time - start_time
+
+    print(f"Time taken WITHOUT DASK: {time_taken:.2f} seconds")
+    crashnow
     if 0:
         # Assuming `ds` is your xarray Dataset
         sla_rms = ds['SLA_RMS']
@@ -525,28 +535,19 @@ if __name__ == "__main__":
         # Save the figure with the desired options
         plt.savefig(filename, dpi=dpi_choice, format='png', transparent=False, bbox_inches='tight', facecolor='black')
 
-    # Stack 'Latitude' and 'Longitude' into a new single dimension 'position'
-    stacked = ds.stack(position=['Latitude', 'Longitude'])
-
-    # Apply the function to the 'SLA' variable of the stacked dataset
-    result = stacked['SLA'].groupby('position').map(rms_and_mean)
-
-    # Now `result` is a Dataset of Datasets, create a dictionary of unstacked datasets
-    datasets = {key: result[key].unstack('position') for key in result.data_vars}
-
     for thekey in datasets.keys():
         # Create filename with current date
         date_str = datetime.datetime.now().strftime('%Y%m%d-%H%M%S')
         filename = os.path.join(outputfolder, f"{date_str}_{thekey.replace(' ', '_')}.nc")
         
         # Save the dataset to a NetCDF file
+        print(f"Saving {filename}...")
         datasets[thekey].to_netcdf(filename)
+    print("Finished saving.")
 
-    # Define your function, that returns a Dataset
-    def rms_and_mean(x):
-        rms_value = np.sqrt(np.mean(x**2))
-        mean_value = np.mean(x)
-        return xr.Dataset({'rms': rms_value, 'mean': mean_value})
+    # Time the code
+    print("Starting map operation WITH    dask...")
+    start_time = timeit.default_timer()
 
     # Chunk the data for Dask parallel processing
     ds = ds.chunk({'Latitude': 'auto', 'Longitude': 'auto'})
@@ -558,8 +559,16 @@ if __name__ == "__main__":
     # Use Dask for computation
     result = stacked['SLA'].groupby('position').map(rms_and_mean, shortcut=False)
 
-    # Now `result` is a Dataset of Datasets, create a dictionary of unstacked datasets
+    # Now `result` is a Dataset containing DataArrays 'rms' and 'mean'
     datasets = {key: result[key].unstack('position').compute() for key in result.data_vars}
+
+    # Stop the timer
+    end_time = timeit.default_timer()
+
+    # Calculate the time taken
+    time_taken = end_time - start_time
+
+    print(f"Time taken WITH    DASK: {time_taken:.2f} seconds")
 
     timeseries = extract_ssha_timeseries(ds, lat = 30, lon = 135)
     #breakpoint()
