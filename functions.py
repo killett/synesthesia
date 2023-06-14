@@ -4,6 +4,7 @@ import glob
 import xarray as xr
 import numpy as np
 import pandas as pd
+import functools
 import nfft # pip install nfft Reference: https://github.com/jakevdp/nfft
 import statsmodels.api as sm #pip install statsmodels
 import matplotlib.pyplot as plt
@@ -158,14 +159,14 @@ def synthetic_timeseries(signal='annual', signal_amplitude=1, noise='white', noi
 
     # Create xarray dataset
     ds = xr.Dataset(
-        {'measurements': ('time', measurements)},
-        coords={'time': dates}
+        {y_key: (x_key, measurements)},
+        coords={x_key: dates}
     )
 
     return ds
 
-def fancy_detrend(timeseries, x_key='time', y_key='measurements', terms=['constant', 'trend']):
-    print("!!!WARNING!!! Next line assumes these units are originally in ns and you want the units to be days!!!")
+def fancy_detrend(timeseries, x_key, y_key, terms=['constant', 'trend']):
+    #print("!!!WARNING!!! Next line assumes these units are originally in ns and you want the units to be days!!!")
     x = (timeseries[x_key] - timeseries[x_key][0]).values.astype(float) / (24*3600*1e9)
     y = timeseries[y_key].values
 
@@ -196,8 +197,8 @@ def fancy_detrend(timeseries, x_key='time', y_key='measurements', terms=['consta
 
     return detrended_timeseries, fits
 
-def turn_fits_into_timeseries(timeseries, fits, x_key='time', y_key='measurements'):
-    print("!!!WARNING!!! Next line assumes these units are originally in ns and you want the units to be days!!!")
+def turn_fits_into_timeseries(timeseries, x_key, y_key, fits):
+    #print("!!!WARNING!!! Next line assumes these units are originally in ns and you want the units to be days!!!")
     x = (timeseries[x_key] - timeseries[x_key][0]).values.astype(float) / (24*3600*1e9)
     fitted_values = np.zeros_like(x)
 
@@ -216,9 +217,9 @@ def turn_fits_into_timeseries(timeseries, fits, x_key='time', y_key='measurement
 
 def nfft_power(ds):
     # Convert datetime index to numeric (we use 'day' as the unit)
-    print("!!!WARNING!!! Next line assumes these units are originally in ns and you want the units to be days!!!")
-    x = (ds.time - ds.time[0]).values.astype(float) / (24*3600*1e9)
-    y = ds.measurements
+    #print("!!!WARNING!!! Next line assumes these units are originally in ns and you want the units to be days!!!")
+    x = (ds[x_key] - ds[x_key][0]).values.astype(float) / (24*3600*1e9)
+    y = ds[y_key]
 
     #If timeseries has an odd number of points,
     #remove the last data point, then calculate min, range.
@@ -228,7 +229,7 @@ def nfft_power(ds):
         x_min = np.min(x)
         x_range = np.max(x) - np.min(x)
         x_norm = (x - x_min) / x_range - 0.5
-        print(f"{N = }, {x_min = }, {x_range = }")
+        #print(f"{N = }, {x_min = }, {x_range = }")
         if N % 2:
             print(f"!!! WARNING!!! LENGTH NEEDS TO BE EVEN FOR NFFT, BUT: {len(x) = }")
             print(f"!!! DELETING LAST DATA POINT!")
@@ -324,8 +325,8 @@ def map_power_spectrum(cie, power_spectrum, min_period = -1, max_period = -1):
 
 def plot_timeseries(ds, title):
     plt.figure(figsize=myfigsize)
-    plt.plot(ds['time'], ds['measurements'], color='lime') # using a bright color for visibility
-    plt.scatter(ds['time'], ds['measurements'], marker='s', color='cyan', s=10)
+    plt.plot(ds[x_key], ds[y_key], color='lime') # using a bright color for visibility
+    plt.scatter(ds[x_key], ds[y_key], marker='s', color='cyan', s=10)
     plt.title(title, color='white')
     # Create filename with current date
     date_str = datetime.datetime.now().strftime('%Y%m%d-%H%M%S')
@@ -395,79 +396,76 @@ def extract_ssha_timeseries(ds, lat = 30, lon = 135):
 
     # Extract SLA values at the given latitude and longitude, and convert it to a numpy array
     # Using method='nearest' to handle case if exact coordinates are not present in the dataset
-    measurements = ds['SLA'].sel(Latitude=lat, Longitude=lon, method='nearest').values
+    measurements = ds[y_key].sel(Latitude=lat, Longitude=lon, method='nearest').values
 
     # Create xarray dataset
     ds = xr.Dataset(
-        {'measurements': ('time', measurements)},
-        coords={'time': ds.Time.values}
+        {y_key: (x_key, measurements)},
+        coords={x_key: ds[x_key].values}
     )
 
     return ds
 
-def timeseries_to_rgb(timeseries, min_period, max_period):
-    timeseries, fits = fancy_detrend(timeseries, x_key='time', y_key='measurements', terms=['constant', 'trend', 'accel'])
+def timeseries_to_rgb(timeseries, x_key, y_key, min_period, max_period):
+    #print(f"{timeseries.keys() = }")
+    timeseries, fits = fancy_detrend(timeseries, x_key, y_key, terms=['constant', 'trend', 'accel'])
 
-    plot_timeseries(timeseries,title="Detrended time series")
+    if make_plots: plot_timeseries(timeseries,title="Detrended time series")
 
-    fitted_timeseries = turn_fits_into_timeseries(timeseries, fits=fits, x_key='time', y_key='measurements')
+    fitted_timeseries = turn_fits_into_timeseries(timeseries, x_key, y_key, fits=fits)
 
-    plot_timeseries(fitted_timeseries,title="Fitted time series")
+    if make_plots: plot_timeseries(fitted_timeseries,title="Fitted time series")
 
     # Perform non-uniform FFT to get power spectrum.
     power_spectrum = nfft_power(timeseries)
 
     power_spectrum = convert_spectrum_from_frequency_to_period(power_spectrum)
     
-    print(f"{min_period = } and {np.max(power_spectrum.period.values) = }")
+    #print(f"{min_period = } and {np.max(power_spectrum.period.values) = }")
     if min_period < np.min(power_spectrum.period.values) or min_period >= np.max(power_spectrum.period.values):
-        print(f"!!! WARNING!!! originally {min_period = } but {np.min(power_spectrum.period.values) = } and {np.max(power_spectrum.period.values) = }")
+        #print(f"!!! WARNING!!! originally {min_period = } but {np.min(power_spectrum.period.values) = } and {np.max(power_spectrum.period.values) = }")
         min_period = np.min(power_spectrum.period.values)
-        print(f"So now {min_period = } which equals {np.min(power_spectrum.period.values) = }")
-    print(f"{max_period = } and {np.max(power_spectrum.period.values) = }")
+        #print(f"So now {min_period = } which equals {np.min(power_spectrum.period.values) = }")
+    #print(f"{max_period = } and {np.max(power_spectrum.period.values) = }")
     if max_period <= np.min(power_spectrum.period.values) or max_period > np.max(power_spectrum.period.values):
-        print(f"!!! WARNING!!! originally {max_period = } but {np.min(power_spectrum.period.values) = } and {np.max(power_spectrum.period.values) = }")
+        #print(f"!!! WARNING!!! originally {max_period = } but {np.min(power_spectrum.period.values) = } and {np.max(power_spectrum.period.values) = }")
         max_period = np.max(power_spectrum.period.values)
-        print(f"So now {max_period = } which equals {np.max(power_spectrum.period.values) = }")
+        #print(f"So now {max_period = } which equals {np.max(power_spectrum.period.values) = }")
     signal_period = 365.25
     #power_spectrum = power_spectrum.where((power_spectrum.period > signal_period * 0.2) & (power_spectrum.period < signal_period * 3), drop=True)
 
-    plot_fft_spectrum(power_spectrum,title="FFT Power spectrum")
+    if make_plots: plot_fft_spectrum(power_spectrum,title="FFT Power spectrum")
 
     cie = load_cie_functions()
 
     mapped_spectrum = map_power_spectrum(cie, power_spectrum, min_period = min_period, max_period = max_period)
     
-    print(f"{mapped_spectrum = }")
+    #print(f"{mapped_spectrum = }")
         
-    plot_light_spectrum(mapped_spectrum,title="Light spectrum")
+    if make_plots: plot_light_spectrum(mapped_spectrum,title="Light spectrum")
 
-    if 1:
-        #print(f"{cie = }")
-        #spectrum = synthetic_spectrum(cie, 530, 30)
-        spectrum = mapped_spectrum
-        print(f"{spectrum = }")
-        xyz = spectrum2xyz(spectrum, cie, 1.0)
-        print(f"{xyz = }")
-        thepower = 1.0
-        print(f"Before raising y to power {thepower}: {xyz = }")
-        raise_y_to_power(xyz, thepower)
-        print(f"After  raising y to power {thepower}: {xyz = }")
-        rgb = xyz2rgb(xyz)
-        print(f"Before gamma correction: {rgb = }")
-        rgb = gamma_correct_rgb(rgb)
-        print(f"After  gamma correction: {rgb = }")
+    #print(f"{cie = }")
+    #spectrum = synthetic_spectrum(cie, 530, 30)
+    spectrum = mapped_spectrum
+    #print(f"{spectrum = }")
+    xyz = spectrum2xyz(spectrum, cie, 1.0)
+    #print(f"{xyz = }")
+    thepower = 1.0
+    #print(f"Before raising y to power {thepower}: {xyz = }")
+    raise_y_to_power(xyz, thepower)
+    #print(f"After  raising y to power {thepower}: {xyz = }")
+    rgb = xyz2rgb(xyz)
+    #print(f"Before gamma correction: {rgb = }")
+    rgb = gamma_correct_rgb(rgb)
+    #print(f"After  gamma correction: {rgb = }")
 
+    if make_plots:
         # Create filename with current date
         date_str = datetime.datetime.now().strftime('%Y%m%d-%H%M%S')
         filename = os.path.join(outputfolder,f"{date_str}_color_plot.png")
-        #plot_color(rgb, filename)
-        
-        return rgb
-
-# First, define your function
-def rms(x):
-    return np.sqrt(np.mean(x**2))
+        plot_color(rgb, filename)
+    
+    return xr.Dataset(rgb)
 
 # Define your function, that returns a Dataset
 def rms_and_mean(x):
@@ -480,7 +478,11 @@ if __name__ == "__main__":
     plt.rcParams['font.size'] = 14  # Change the global font size
     plt.rcParams['axes.linewidth'] = 2  # Change the global linewidth
     myfigsize=(10,5)
-    
+
+    make_plots = 0
+
+    x_key = 'Time'
+    y_key = 'SLA'
     min_period = 220
     max_period = 2000
 
@@ -490,11 +492,18 @@ if __name__ == "__main__":
     #max_period = min_period * wavelength_ratio
 
     ds = load_ssha_files(tskip=1)
-    xskip = 24
+    xskip = 6#24
     print(f"Grabbing one lat/lon point in every {xskip**2} points...",end="")
     ds = ds.isel(Latitude=slice(None, None, xskip), Longitude=slice(None, None, xskip))
     print(" done.")
     #breakpoint()
+    
+    # Check if the size of x_key dimension is odd
+    if ds.dims[x_key] % 2 == 1:
+        print(f"!!! WARNING!!! LENGTH NEEDS TO BE EVEN FOR NFFT, BUT: {ds.dims[x_key] = }")
+        print(f"!!! DELETING LAST DATA POINT!")
+        # If it is, select all elements up to the second last one
+        ds = ds.isel({x_key: slice(None, -1)})
 
     # Time the code
     start_time = timeit.default_timer()
@@ -503,8 +512,11 @@ if __name__ == "__main__":
     # Stack 'Latitude' and 'Longitude' into a new single dimension 'position'
     stacked = ds.stack(position=['Latitude', 'Longitude'])
 
+    # Create a new function with min_period and max_period filled
+    timeseries_to_rgb_partial = functools.partial(timeseries_to_rgb, x_key=x_key, y_key=y_key, min_period=min_period, max_period=max_period)
+
     # Apply the function to the 'SLA' variable of the stacked dataset
-    result = stacked['SLA'].groupby('position').map(rms_and_mean)
+    result = stacked.groupby('position').map(timeseries_to_rgb_partial)
 
     # Now `result` is a Dataset of Datasets, create a dictionary of unstacked datasets
     datasets = {key: result[key].unstack('position') for key in result.data_vars}
@@ -516,7 +528,7 @@ if __name__ == "__main__":
     time_taken = end_time - start_time
 
     print(f"Time taken WITHOUT DASK: {time_taken:.2f} seconds")
-    crashnow
+
     if 0:
         # Assuming `ds` is your xarray Dataset
         sla_rms = ds['SLA_RMS']
@@ -545,45 +557,4 @@ if __name__ == "__main__":
         datasets[thekey].to_netcdf(filename)
     print("Finished saving.")
 
-    # Time the code
-    print("Starting map operation WITH    dask...")
-    start_time = timeit.default_timer()
-
-    # Chunk the data for Dask parallel processing
-    ds = ds.chunk({'Latitude': 'auto', 'Longitude': 'auto'})
-
-    # Stack 'Latitude' and 'Longitude' into a new single dimension 'position'
-    stacked = ds.stack(position=['Latitude', 'Longitude'])
-
-    # Apply the function to the 'SLA' variable of the stacked dataset
-    # Use Dask for computation
-    result = stacked['SLA'].groupby('position').map(rms_and_mean, shortcut=False)
-
-    # Now `result` is a Dataset containing DataArrays 'rms' and 'mean'
-    datasets = {key: result[key].unstack('position').compute() for key in result.data_vars}
-
-    # Stop the timer
-    end_time = timeit.default_timer()
-
-    # Calculate the time taken
-    time_taken = end_time - start_time
-
-    print(f"Time taken WITH    DASK: {time_taken:.2f} seconds")
-
-    timeseries = extract_ssha_timeseries(ds, lat = 30, lon = 135)
-    #breakpoint()
-
-    if 0: timeseries = synthetic_timeseries(signal='annual',
-            signal_amplitude=1.0,
-            noise='white', noise_level=0.0,
-            temporal_resolution='monthly',
-            time_start=datetime.datetime(2001, 1, 1),
-            time_stop=datetime.datetime(2020, 1, 1))
-    #breakpoint()
-
-    N = len(timeseries['time'])
-    if N % 2: print(f"!!! WARNING!!! LENGTH NEEDS TO BE EVEN FOR NFFT, BUT: {len(timeseries['time']) = }")
-
-    plot_timeseries(timeseries,title="Time series")
-    
-    rgb = timeseries_to_rgb(timeseries, min_period, max_period)
+    print("!!!WARNING!!! Next line assumes these units are originally in ns and you want the units to be days!!!")
