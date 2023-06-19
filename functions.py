@@ -1283,7 +1283,7 @@ if __name__ == "__main__":
     
     write_gmt_scripts(plot_options, grid, results)
     
-    docker_command = f'docker run -e TZ=America/Los_Angeles -v {outputfolder}:/home -w /home grace/testing-bpr-grace2 /bin/bash -c "chmod +x create_plots.sh; chmod +x flip_backgrounds.sh; chmod +x animate.sh; chmod +x montage.sh; chmod +x trim.sh; cp create_plots.sh Zbackup_create_plots.sh; cp projections.sh Zbackup_projections.sh; ./create_plots.sh"'
+    docker_command = f'docker run -e TZ=America/Los_Angeles -v {outputfolder}:/home -w /home grace/testing-bpr-grace2 /bin/bash -c "cp create_plots.sh Zbackup_create_plots.sh; cp projections.sh Zbackup_projections.sh; ./create_plots.sh"'
     subprocess.run(docker_command, shell=True)
 
     print("!!!WARNING!!! Next line assumes these units are originally in ns and you want the units to be days!!!")
