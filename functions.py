@@ -1283,7 +1283,53 @@ if __name__ == "__main__":
     
     write_gmt_scripts(plot_options, grid, results)
     
-    docker_command = f'docker run -e TZ=America/Los_Angeles -v {outputfolder}:/home -w /home grace/testing-bpr-grace2 /bin/bash -c "cp create_plots.sh Zbackup_create_plots.sh; cp projections.sh Zbackup_projections.sh; ./create_plots.sh"'
-    subprocess.run(docker_command, shell=True)
+    #Internal Docker folder:
+    docker_internal_folder = '/home/jovyan'
+    # Define Docker internal script
+    docker_internal_filename = 'docker_internal.sh'
+    docker_internal_script = "#!/bin/bash\n" \
+                             "cp create_plots.sh Zbackup_create_plots.sh\n" \
+                             "cp projections.sh Zbackup_projections.sh\n" \
+                             "./create_plots.sh\n"
+    docker_internal_script = "#!/bin/bash\n" \
+                             "echo '----- Environment Variables -----'\n" \
+                             "echo 'PATH: '\n" \
+                             "echo $PATH\n" \
+                             "echo 'LD_LIBRARY_PATH: '\n" \
+                             "echo $LD_LIBRARY_PATH\n" \
+                             "echo '----- Conda Environments -----'\n" \
+                             "/opt/conda/bin/conda env list\n" \
+                             "echo '----- Working Directory -----'\n" \
+                             "pwd\n" \
+                             "cp create_plots.sh Zbackup_create_plots.sh\n" \
+                             "cp projections.sh Zbackup_projections.sh\n" \
+                             "./create_plots.sh\n"
+    
+    # Define Docker external command
+    docker_command = f'docker run -e TZ=America/Los_Angeles -v {outputfolder}:{docker_internal_folder} -w {docker_internal_folder} grace/testing-bpr-grace2 {docker_internal_folder}/{docker_internal_filename}'
+
+    docker_external_filename = 'docker_external.bat'
+    #Used to have this line in the docker_external_script before the docker command: @echo off
+    docker_external_script = f"""
+    {docker_command}
+    """
+
+    # Write Docker internal script
+    with open(os.path.join(outputfolder, docker_internal_filename), 'wb') as file:
+        file.write(docker_internal_script.encode())
+
+    # Write Docker external script
+    with open(os.path.join(outputfolder,docker_external_filename), 'w') as file:
+        file.write(docker_external_script)
+
+    # Change permissions of the Docker internal script
+    os.chmod(os.path.join(outputfolder, docker_internal_filename), 0o755)
+
+    # Run Docker external script
+    print(f"Running {docker_command}...")
+    results = subprocess.run(os.path.join(outputfolder, docker_external_filename), shell=True, capture_output=True, text=True, encoding='utf-8')
+    print(f"{results.stdout}")
+    if results.stderr:
+        print(f"!!!WARNING!!! Docker subprocess stderr: {results.stderr}")
 
     print("!!!WARNING!!! Next line assumes these units are originally in ns and you want the units to be days!!!")
