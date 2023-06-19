@@ -1,5 +1,7 @@
 import csv
 import os
+import subprocess
+import shutil
 import glob
 import xarray as xr
 import numpy as np
@@ -36,10 +38,9 @@ plot_options = {
     'outputfolder': outputfolder,
     'just_the_filenames': ['r.nc','g.nc','b.nc'],
     'output_base': 'map_parameter',
-    'GMT5': 1,
     'projection': 1, # Since the function uses plot_options.projection, a reasonable default might be 1 for the Robinson projection.
     'plot_mascons': 0,
-    'coastlines': 1, #1:pscoast, 2:pscoast+InSAR.
+    'coastlines': 1, #1:coast, 2:coast+InSAR.
     'blurb_disabled': 1, 
     'montage': 0, #1=left-justify titles, add (a),(b), run montage.sh.
     'region': 'global',    # Define a global region for all plots
@@ -84,7 +85,7 @@ grid = {
         'output_base': '',  # empty string as placeholder, will be updated in each iteration.
         'data_name': '',  # empty string as placeholder, will be updated in each iteration.
         'write_gmt_map_data': None,
-        'ps2raster': None,
+        'convert': None,
         'finish_flip_backgrounds': None,
         'finish_trim': None,
         'outputfolder': '',  # empty string as placeholder, need to be updated with real path
@@ -178,9 +179,13 @@ results = {
         'scale_y': 0.0,
         'scale_length': 0.0,
         'plot_base': '',
-        'gmt_prefix': '',
     },
 }
+
+files_to_copy = ['projections.sh', 'overflow.sh', 'notation.sh']
+
+for file in files_to_copy:
+    shutil.copy(file, outputfolder)
 
 def load_cie_functions():
     file = os.path.join('.', 'sealevel_spectra', 'ciexyz31_1_trimmed_400nm_700nm.csv')
@@ -636,35 +641,35 @@ def write_gmt_scripts(plot_options, grid, results):
     # Create GMT script in outputfolder, which should be netcdf_output.
     new_file = os.path.join(plot_options['outputfolder'], 'create_plots.sh')
     try:
-        new_fp = open(new_file, 'w')
+        new_fp = open(new_file, 'wb')
     except IOError:
         print("The create_plots.sh GMT script couldn't be created.")
 
     # Every bash script needs this to be the first line.
-    new_fp.write("#!/bin/bash\n")
-    new_fp.write("#set -x #Uncomment to echo these commands.\n")
+    new_fp.write(b"#!/bin/bash\n")
+    new_fp.write(b"#set -x #Uncomment to echo these commands.\n")
 
     # Create flip_backgrounds script in outputfolder, which should be netcdf_output.
     flip_file = os.path.join(plot_options['outputfolder'], 'flip_backgrounds.sh')
     try:
-        flip_fp = open(flip_file, 'w')
+        flip_fp = open(flip_file, 'wb')
     except IOError:
         print("The flip_backgrounds.sh script couldn't be created.")
 
     # Every bash script needs this to be the first line.
-    flip_fp.write("#!/bin/bash\n")
-    flip_fp.write("set -x\n")
+    flip_fp.write(b"#!/bin/bash\n")
+    flip_fp.write(b"set -x\n")
 
     # Create trim script in outputfolder, which should be netcdf_output.
     trim_file = os.path.join(plot_options['outputfolder'], 'trim.sh')
     try:
-        trim_fp = open(trim_file, 'w')
+        trim_fp = open(trim_file, 'wb')
     except IOError:
         print("The trim.sh script couldn't be created.")
 
     # Every bash script needs this to be the first line.
-    trim_fp.write("#!/bin/bash\n")
-    trim_fp.write("set -x\n")
+    trim_fp.write(b"#!/bin/bash\n")
+    trim_fp.write(b"set -x\n")
 
     # If RGB, only need GMT commands for a single map.
     if 1:#len(results['rgb']) == 3 and len(results['latlon']['outputs']) == 3:
@@ -674,27 +679,27 @@ def write_gmt_scripts(plot_options, grid, results):
         # If this is the first file...
         if i == 0:
             write_gmt_defs(new_fp)
-            new_fp.write(f"color_scheme={plot_options['color_scheme']} #1/2=white/black background\n")
-            new_fp.write(f"montage={plot_options['montage']} #1=left-justify titles, add (a),(b), run montage.sh.\n")
-            new_fp.write("prefixes=('(a)' '(b)' '(c)' '(d)' '(e)' '(f)' '(g)' '(h)' '(i)' '(j)' '(k)' '(l)' '(m)' '(n)' '(o)' '(p)' '(q)' '(r)' '(s)' '(t)' '(u)' '(v)' '(w)' '(x)' '(y)' '(z)')\n")
-            new_fp.write("index=-1 #Increments on each map, accesses prefixes above for montage.\n")
+            new_fp.write(f"color_scheme={plot_options['color_scheme']} #1/2=white/black background\n".encode())
+            new_fp.write(f"montage={plot_options['montage']} #1=left-justify titles, add (a),(b), run montage.sh.\n".encode())
+            new_fp.write(b"prefixes=('(a)' '(b)' '(c)' '(d)' '(e)' '(f)' '(g)' '(h)' '(i)' '(j)' '(k)' '(l)' '(m)' '(n)' '(o)' '(p)' '(q)' '(r)' '(s)' '(t)' '(u)' '(v)' '(w)' '(x)' '(y)' '(z)')\n")
+            new_fp.write(b"index=-1 #Increments on each map, accesses prefixes above for montage.\n")
             new_fp.write('png_options=" -P -Tg " #PDF default: -E720, else 300 dpi.\n')
-            new_fp.write("if [ $montage != 0 ]\nthen\n  png_options=\" -A\"$png_options\nfi\n")
-            new_fp.write("#Force off-white(dark gray) fore(back)ground color because\n#flip_backgrounds.sh can change the maps' text from\n#black to white, and their backgrounds from white to black.\n")
-            new_fp.write(f"$gmt_prefix gmtset COLOR_BACKGROUND=2/2/2 COLOR_FOREGROUND=253/253/253\n")
-            new_fp.write(f"digits={plot_options['scale_digits']}\n")
-            new_fp.write(f"$gmt_prefix gmtset D_FORMAT=%.${{digits}}f\n")
+            new_fp.write(b"if [ $montage != 0 ]\nthen\n  png_options=\" -A\"$png_options\nfi\n")
+            new_fp.write(b"#Force off-white(dark gray) fore(back)ground color because\n#flip_backgrounds.sh can change the maps' text from\n#black to white, and their backgrounds from white to black.\n")
+            new_fp.write(b"gmt set COLOR_BACKGROUND=2/2/2 COLOR_FOREGROUND=253/253/253\n")
+            new_fp.write(f"digits={plot_options['scale_digits']}\n".encode())
+            new_fp.write(b"gmt set D_FORMAT=%.${{digits}}f\n")
 
         # Define the filenames for PostScript output.
         s = f"{plot_options['output_base']}_{i+1:04d}"
-        new_fp.write("#######################################################\n")
+        new_fp.write(b"#######################################################\n")
         if 1:#len(results['rgb']) == 3 and len(results['latlon']['outputs']) == 3:
-            new_fp.write("data_name=redgreenblue\n")
+            new_fp.write(b"data_name=redgreenblue\n")
         else:
             new_fp.write(f'data_name="{just_the_filenames[i]}"\n')
         new_fp.write(f'plot_base="{s}"\n')
-        new_fp.write("let index=$index+1\n")
-        new_fp.write("#######################################################\n")
+        new_fp.write(b"let index=$index+1\n")
+        new_fp.write(b"#######################################################\n")
 
         # Record the filename bases in the flip_backgrounds.sh and trim.sh scripts.
         if i == 0:
@@ -714,39 +719,39 @@ def write_gmt_scripts(plot_options, grid, results):
         # Plot data, with title on top and coastlines.
         write_gmt_map_data(results, grid, plot_options, new_fp, results['titles'][i], i)
 
-        new_fp.write(f"ps2raster $png_options $plot_base.ps #Convert PS to PNG format.\n")
-        new_fp.write("#ps2raster -P -Tf $plot_base.ps #Convert PS to PDF, if uncommented.\n")
+        new_fp.write(b"convert $png_options $plot_base.ps #Convert PS to PNG format.\n")
+        new_fp.write(b"#convert -P -Tf $plot_base.ps #Convert PS to PDF, if uncommented.\n")
 
         # Delete PS file because it's twice as large (more at -E2000 and 0.25x0.25 global- 2.7MB PDF, 165MB PS!) as the PDF or PNG.
-        new_fp.write("rm -f $plot_base.ps\n")
+        new_fp.write(b"rm -f $plot_base.ps\n")
         
         # Move cpt file to backup version so it won't be automatically used
         # if this script is executed again... just in case write_gmt_cpt fails:
         # it's good for that failure to be obvious.
         if len(results['rgb']) != 3:
-            new_fp.write(f"mv map.cpt Zbackup_cpt_$plot_base.cpt\n")
+            new_fp.write(b"mv map.cpt Zbackup_cpt_$plot_base.cpt\n")
 
         # When this plot is finished, store its data_name in previous_data_name
         # so that the next plot (if it's a phase plot with amplitude masking) can
         # access that data.
-        new_fp.write("previous_data_name=$data_name\n")
+        new_fp.write(b"previous_data_name=$data_name\n")
     # Trim images.
-    new_fp.write("#######################################################\n")
-    new_fp.write(". ./trim.sh\n")
+    new_fp.write(b"#######################################################\n")
+    new_fp.write(b". ./trim.sh\n")
 
     # If requested, change colors using flip_backgrounds.sh.
-    new_fp.write("#######################################################\n")
-    new_fp.write("if [ $color_scheme == 2 ]\n")
-    new_fp.write("then\n")
-    new_fp.write("  . ./flip_backgrounds.sh\n")
-    new_fp.write("fi\n")
+    new_fp.write(b"#######################################################\n")
+    new_fp.write(b"if [ $color_scheme == 2 ]\n")
+    new_fp.write(b"then\n")
+    new_fp.write(b"  . ./flip_backgrounds.sh\n")
+    new_fp.write(b"fi\n")
 
     # If requested, make a montage using montage.sh.
-    new_fp.write("#######################################################\n")
-    new_fp.write("if [ $montage != 0 ]\n")
-    new_fp.write("then\n")
-    new_fp.write("  . ./montage.sh\n")
-    new_fp.write("fi\n")
+    new_fp.write(b"#######################################################\n")
+    new_fp.write(b"if [ $montage != 0 ]\n")
+    new_fp.write(b"then\n")
+    new_fp.write(b"  . ./montage.sh\n")
+    new_fp.write(b"fi\n")
     new_fp.close()
 
     # Either way, finish writing flip_backgrounds.sh so it can be used later.
@@ -765,17 +770,17 @@ def write_gmt_scripts(plot_options, grid, results):
         print("The animate.sh script couldn't be created.")
 
     # Every bash script needs this to be the first line.
-    extra_fp.write("#!/bin/bash\n")
-    extra_fp.write("set -x\n")
-    extra_fp.write("delay=100 #delay in hundredths of a second.\n")
-    extra_fp.write("#size=\"640x480\"\n")
-    extra_fp.write("#size=\"800x600\"\n")
-    extra_fp.write("size=\"1024x768\"\n")
-    extra_fp.write(f"output_base=\"{plot_options['output_base']}\"\n")
-    extra_fp.write("#Imagemagick can also output .mng (animated PNG, not well-supported), but ffmpeg is needed as a delegate for .mp4.\n")
-    extra_fp.write("#convert -verbose -delay $delay -loop 0 $output_base* -resize $size animation.gif\n")
-    extra_fp.write("#Or ffmpeg can output .mp4 directly.\n")
-    extra_fp.write("ffmpeg -f image2 -i $output_base%d.png animation.mp4\n")
+    extra_fp.write(b"#!/bin/bash\n")
+    extra_fp.write(b"set -x\n")
+    extra_fp.write(b"delay=100 #delay in hundredths of a second.\n")
+    extra_fp.write(b"#size=\"640x480\"\n")
+    extra_fp.write(b"#size=\"800x600\"\n")
+    extra_fp.write(b"size=\"1024x768\"\n")
+    extra_fp.write(f"output_base=\"{plot_options['output_base']}\"\n".encode())
+    extra_fp.write(b"#Imagemagick can also output .mng (animated PNG, not well-supported), but ffmpeg is needed as a delegate for .mp4.\n")
+    extra_fp.write(b"#convert -verbose -delay $delay -loop 0 $output_base* -resize $size animation.gif\n")
+    extra_fp.write(b"#Or ffmpeg can output .mp4 directly.\n")
+    extra_fp.write(b"ffmpeg -f image2 -i $output_base%d.png animation.mp4\n")
     extra_fp.close()
 
     # Create montage script in outputfolder, which should be netcdf_output.
@@ -786,10 +791,10 @@ def write_gmt_scripts(plot_options, grid, results):
         print("The montage.sh script couldn't be created.")
 
     # Every bash script needs this to be the first line.
-    extra_fp.write("#!/bin/bash\n")
-    extra_fp.write("set -x\n")
-    extra_fp.write(f"output_base=\"{plot_options['output_base']}\"\n")
-    extra_fp.write("montage $output_base* -geometry +2+2 montage.png\n")
+    extra_fp.write(b"#!/bin/bash\n")
+    extra_fp.write(b"set -x\n")
+    extra_fp.write(f"output_base=\"{plot_options['output_base']}\"\n".encode())
+    extra_fp.write(b"montage $output_base* -geometry +2+2 montage.png\n")
     extra_fp.close()
 
 def write_gmt_coastlines(new_fp):
@@ -798,11 +803,11 @@ def write_gmt_coastlines(new_fp):
     Input:  
         new_fp - file pointer to current gmt script file
     """
-    new_fp.write("$gmt_prefix pscoast -W$pscoast_thk/$coast_color $pscoast_res $range $projection $map_pos $middle >> $plot_base.ps\n")
-    new_fp.write("if [ $coastlines == 2 ]\n")
-    new_fp.write("then\n")
-    new_fp.write("  $gmt_prefix psxy -N $coast_file -: -Sc$coast_thk -W$coast_thk/$coast_color $range $projection $map_pos $middle >> $plot_base.ps\n")
-    new_fp.write("fi\n")
+    new_fp.write(b"gmt coast -W$coast_thk/$coast_color $coast_res $range $projection $map_pos $middle >> $plot_base.ps\n")
+    new_fp.write(b"if [ $coastlines == 2 ]\n")
+    new_fp.write(b"then\n")
+    new_fp.write(b"  gmt plot -N $coast_file -: -Sc$coast_thk -W$coast_thk/$coast_color $range $projection $map_pos $middle >> $plot_base.ps\n")
+    new_fp.write(b"fi\n")
 
 def is_polar(results: Dict, grid: Dict) -> int:
     """
@@ -847,37 +852,37 @@ def write_gmt_colorscale(new_fp, results, kml_output):
     rgb = {}  # Just to init choice and maxes.
 
     if len(results['rgb']) != 3:
-        new_fp.write("cpt_name=\"-Cmap.cpt \"\n")
+        new_fp.write(b"cpt_name=\"-Cmap.cpt \"\n")
     else:
-        new_fp.write("cpt_name=\"-C../../rgb00001.cpt \"\n")
+        new_fp.write(b"cpt_name=\"-C../../rgb00001.cpt \"\n")
     
     if len(results['rgb']) != 3 or results['rgb_choice'] < 2:
         # If this is intended for KMZ output, don't overlay the scale.
         if kml_output:
             # KMZ version writes to a different file.
-            new_fp.write("$gmt_prefix psscale $cpt_name -L $scale_format $overflow $scale_pos -A $start > scale_$plot_base.ps\n")
-            new_fp.write("# Print units manually, otherwise they're too close to numbers on scale.\n")
-            new_fp.write("echo $units_format $scale_units | $gmt_prefix pstext -N $units_pos $misc_range $end >> scale_$plot_base.ps\n")
+            new_fp.write(b"gmt colorbar $cpt_name -L $scale_format $overflow $scale_pos -A $start > scale_$plot_base.ps\n")
+            new_fp.write(b"# Print units manually, otherwise they're too close to numbers on scale.\n")
+            new_fp.write(b"echo $units_format $scale_units | gmt pstext -N $units_pos $misc_range $end >> scale_$plot_base.ps\n")
         else:
-            new_fp.write("$gmt_prefix psscale $cpt_name -L $scale_format $overflow $scale_pos -A $middle >> $plot_base.ps\n")
-            new_fp.write("# Print units manually, otherwise they're too close to numbers on scale.\n")
-            new_fp.write("echo $units_format $scale_units | $gmt_prefix pstext -N $units_pos $misc_range $middle >> $plot_base.ps\n")
+            new_fp.write(b"gmt colorbar $cpt_name -L $scale_format $overflow $scale_pos -A $middle >> $plot_base.ps\n")
+            new_fp.write(b"# Print units manually, otherwise they're too close to numbers on scale.\n")
+            new_fp.write(b"echo $units_format $scale_units | gmt pstext -N $units_pos $misc_range $middle >> $plot_base.ps\n")
     else:
-        new_fp.write("numwidths={}\n".format(results['max_widths']))
-        new_fp.write("$gmt_prefix gmtset TICK_LENGTH 0.3c\n")
-        new_fp.write("scale_width=$(bc <<< \"scale=5; $scale_width / $numwidths\")\n")
-        new_fp.write("for (( j=1; j <= $numwidths; j++ ))\n")
-        new_fp.write("do\n")
-        new_fp.write("  j_string=$(printf '%%05d' $j)\n")
-        new_fp.write("  cpt_name=\"-C../rgb$j_string.cpt\"\n")
-        new_fp.write("  $gmt_prefix psscale $cpt_name -L $scale_format $overflow $scale_pos -S -A $middle >> $plot_base.ps\n")
-        new_fp.write("  # Print units manually, otherwise they're too close to numbers on scale.\n")
-        new_fp.write("  echo $units_format $scale_units | $gmt_prefix pstext -N $units_pos $misc_range $middle >> $plot_base.ps\n")
-        new_fp.write("  # Move next scale to the right and get rid of the tick marks.\n")
-        new_fp.write("  scale_x=$(bc <<< \"scale=5; $scale_x+$scale_width\")\n")
-        new_fp.write("  scale_pos=\" -D${scale_x}c/${scale_y}c/${scale_length}c/${scale_width}c \"\n")
-        new_fp.write("  $gmt_prefix gmtset TICK_LENGTH 0.0\n")
-        new_fp.write("done\n")
+        new_fp.write(b"numwidths={}\n".format(results['max_widths']))
+        new_fp.write(b"gmt set TICK_LENGTH 0.3c\n")
+        new_fp.write(b"scale_width=$(bc <<< \"scale=5; $scale_width / $numwidths\")\n")
+        new_fp.write(b"for (( j=1; j <= $numwidths; j++ ))\n")
+        new_fp.write(b"do\n")
+        new_fp.write(b"  j_string=$(printf '%%05d' $j)\n")
+        new_fp.write(b"  cpt_name=\"-C../rgb$j_string.cpt\"\n")
+        new_fp.write(b"  gmt colorbar $cpt_name -L $scale_format $overflow $scale_pos -S -A $middle >> $plot_base.ps\n")
+        new_fp.write(b"  # Print units manually, otherwise they're too close to numbers on scale.\n")
+        new_fp.write(b"  echo $units_format $scale_units | gmt pstext -N $units_pos $misc_range $middle >> $plot_base.ps\n")
+        new_fp.write(b"  # Move next scale to the right and get rid of the tick marks.\n")
+        new_fp.write(b"  scale_x=$(bc <<< \"scale=5; $scale_x+$scale_width\")\n")
+        new_fp.write(b"  scale_pos=\" -D${scale_x}c/${scale_y}c/${scale_length}c/${scale_width}c \"\n")
+        new_fp.write(b"  gmt set TICK_LENGTH 0.0\n")
+        new_fp.write(b"done\n")
 
 def write_rgb_colorscale(results, cie, plot_options, verbose):
     # Initialize objects
@@ -889,7 +894,7 @@ def write_rgb_colorscale(results, cie, plot_options, verbose):
     if results['rgb_choice'] == 0:
         new_file = plot_options['outputfolder'] + "rgb00001.cpt"
         with open(new_file, 'w') as new_fp:
-            new_fp.write("# COLOR_MODEL = RGB\n")
+            new_fp.write(b"# COLOR_MODEL = RGB\n")
             print("Writing RGB colorscale to disk.")
             for i in range(len(results['xy']['x_values'][0][0])):
                 copy = results
@@ -902,14 +907,14 @@ def write_rgb_colorscale(results, cie, plot_options, verbose):
                 gamma_correct_single_rgb(copy, verbose)
                 for l in range(3): copy.rgb[l] *= 255.0
                 if i > 0:
-                    new_fp.write(f"{results['xy']['x_values'][0][0][i-1]:12.6e} {int(old.rgb[0]):3d} {int(old.rgb[1]):3d} {int(old.rgb[2]):3d} {results['xy']['x_values'][0][0][i]:12.6e} {int(copy.rgb[0]):3d} {int(copy.rgb[1]):3d} {int(copy.rgb[2]):3d}\n")
+                    new_fp.write(f"{results['xy']['x_values'][0][0][i-1]:12.6e} {int(old.rgb[0]):3d} {int(old.rgb[1]):3d} {int(old.rgb[2]):3d} {results['xy']['x_values'][0][0][i]:12.6e} {int(copy.rgb[0]):3d} {int(copy.rgb[1]):3d} {int(copy.rgb[2]):3d}\n".encode())
                 old = copy
     elif results['rgb_choice'] == 1:
         # Create CPT file in outputfolder, which is NOT netcdf_output bc that doesn't exist yet.
         new_file = os.path.join(plot_options['outputfolder'], 'rgb00001.cpt')
         try:
             with open(new_file, 'w') as new_fp:
-                new_fp.write("# COLOR_MODEL = RGB\n")
+                new_fp.write(b"# COLOR_MODEL = RGB\n")
                 print("Writing RGB colorscale to disk.")
                 
                 hw = 2 * (results['xy']['x_values'][0][0][1] - results['xy']['x_values'][0][0][0])
@@ -934,7 +939,7 @@ def write_rgb_colorscale(results, cie, plot_options, verbose):
                 spectra_end(all,2000,1) # mod_choice,norm_rgb
                 
                 for i in range(1,len(results['xy']['x_values'][0][0])):
-                    new_fp.write("%12.6e %3d %3d %3d %12.6e %3d %3d %3d\n" % (
+                    new_fp.write(b"%12.6e %3d %3d %3d %12.6e %3d %3d %3d\n" % (
                         results['xy']['x_values'][0][0][i-1], int(all['latlon']['outputs'][0][i-1][j]), int(all['latlon']['outputs'][1][i-1][j]), int(all['latlon']['outputs'][2][i-1][j]),
                         results['xy']['x_values'][0][0][i], int(all['latlon']['outputs'][0][i][j]), int(all['latlon']['outputs'][1][i][j]), int(all['latlon']['outputs'][2][i][j])
                     ))
@@ -959,8 +964,8 @@ def write_gmt_map_data(results, grid, plot_options, new_fp, title, i):
     polar = is_polar(results, grid)  # 0 - global, 1 - north pole, 2 - south pole.
 
     if i == 0:
-        new_fp.write("#Set resolution, coast_file, coast_thickness, and coastlines\n")
-        new_fp.write("#on first map only because they should be universal.\n")
+        new_fp.write(b"#Set resolution, coast_file, coast_thickness, and coastlines\n")
+        new_fp.write(b"#on first map only because they should be universal.\n")
         coast_file = plot_options['outputfolder'] + "data/ancillary/Rignot/InSAR_GL_Antarctica.txt"
         new_fp.write(f'coast_file="{coast_file}"\n')
 
@@ -969,27 +974,27 @@ def write_gmt_map_data(results, grid, plot_options, new_fp, title, i):
             delta_lat = abs(results['latlon']['lat'][1] - results['latlon']['lat'][0])
             if delta_lat < 0.4:  # Latlon lat spacing controls the resolution.
                 new_fp.write('resolution=" -E50 " #50/2000 is low/high quality.\n')
-                new_fp.write('pscoast_res=" -Df+ "\n')
+                new_fp.write('coast_res=" -Df+ "\n')
             elif delta_lat < 0.9:  # Latlon lat spacing controls the resolution.
                 new_fp.write('resolution=" -E50 " #50/2000 is low/high quality.\n')
-                new_fp.write('pscoast_res=" -Df+ "\n')
+                new_fp.write('coast_res=" -Df+ "\n')
             else:
                 new_fp.write('resolution=" -E50 " #50/2000 is low/high quality.\n')
-                new_fp.write('pscoast_res=" -Di+ "\n')
+                new_fp.write('coast_res=" -Di+ "\n')
         elif results['options']['output_choice'] in [1, 4]:
             new_fp.write('resolution=" -E50 " #50/2000 is low/high quality.\n')
-            new_fp.write('pscoast_res=" -Di+ "\n')
+            new_fp.write('coast_res=" -Di+ "\n')
         else:
             print(f"!!!!WARNING!!!!!! results['options']['output_choice'] {results['options']['output_choice']} isn't recognized.")
 
-        new_fp.write('pscoast_res_orig=$pscoast_res #Don\'t want USA maps to repeatedly add -N2.\n')
-        new_fp.write('pscoast_thk="0.6"\n')
+        new_fp.write('coast_res_orig=$coast_res #Don\'t want USA maps to repeatedly add -N2.\n')
+        new_fp.write('coast_thk="0.6"\n')
         new_fp.write('coast_thk="0.009"\n')
         if polar == 1:
             coastlines = 1  # InSAR is only in Antarctica, so disable for NP plots.
-        new_fp.write(f'coastlines={coastlines} #1:pscoast, 2:pscoast+InSAR.\n')
+        new_fp.write(f'coastlines={coastlines} #1:coast, 2:coast+InSAR.\n')
 
-    new_fp.write("#coast_color is gray82 for off-white, or gray10 for dark coastlines.\n")
+    new_fp.write(b"#coast_color is gray82 for off-white, or gray10 for dark coastlines.\n")
 
     # Adjust max/min latitudes for mapping points, otherwise points on edge aren't visible.
     if results['options']['output_choice'] in [1, 4]:
@@ -1004,10 +1009,10 @@ def write_gmt_map_data(results, grid, plot_options, new_fp, title, i):
     new_fp.write('blurb_format="0 0 15 0 1 ML"\n')
     new_fp.write('units_format="0 0 13 0 0 MC"\n')
     # Record units for the scale, which are the same for all projections and data types.
-    new_fp.write(f"scale_units=\"{results['units'][i]}\"\n")
+    new_fp.write(f"scale_units=\"{results['units'][i]}\"\n".encode())
 
     new_fp.write('misc_range=" -R0/1/0/1 -JX1c "\n')
-    new_fp.write("#grdcut requires actual limits, but if grdimage uses them: GMT Fatal Error: grdimage could not allocate memory [21.69 Gb, n_items = 5823567396]\n")
+    new_fp.write(b"#grdcut requires actual limits, but if grdimage uses them: GMT Fatal Error: grdimage could not allocate memory [21.69 Gb, n_items = 5823567396]\n")
     new_fp.write('minlon=%.3f\n' % 0.0)  # results['minlon']
     new_fp.write('maxlon=%.3f\n' % 360.0)  # results['maxlon']
     new_fp.write('minlat=%.3f\n' % -90.0)  # results['minlat']
@@ -1016,76 +1021,76 @@ def write_gmt_map_data(results, grid, plot_options, new_fp, title, i):
     if title:
         # All projections are always available.
         if i == 0:  # Only print this guide for the first map.
-            new_fp.write("#Global projections:\n")
-            new_fp.write("#    1 - Robinson\n")
-            new_fp.write("#    2 - Winkel Tripel\n")
-            new_fp.write("#    3 - Mollweide\n")
-            new_fp.write("#    4 - Miller\n")
-            new_fp.write("#Polar projections:\n")
-            new_fp.write("#  101 - N. Azimuthal Equidistant\n")
-            new_fp.write("#  102 - S. Azimuthal Equidistant\n")
-            new_fp.write("#Specific regions:\n")
-            new_fp.write("# 1001 - North America\n")
-            new_fp.write("# 1002 - South America\n")
-            new_fp.write("# 1003 - Africa\n")
-            new_fp.write("# 1004 - Greenland\n")
-            new_fp.write("# 1005 - South Asia\n")
-            new_fp.write("# 1006 - Australia\n")
-            new_fp.write("# 1007 - Europe\n")
-            new_fp.write("# 1101 - Contiguous United States\n")
-            new_fp.write("# 1102 - California\n")
+            new_fp.write(b"#Global projections:\n")
+            new_fp.write(b"#    1 - Robinson\n")
+            new_fp.write(b"#    2 - Winkel Tripel\n")
+            new_fp.write(b"#    3 - Mollweide\n")
+            new_fp.write(b"#    4 - Miller\n")
+            new_fp.write(b"#Polar projections:\n")
+            new_fp.write(b"#  101 - N. Azimuthal Equidistant\n")
+            new_fp.write(b"#  102 - S. Azimuthal Equidistant\n")
+            new_fp.write(b"#Specific regions:\n")
+            new_fp.write(b"# 1001 - North America\n")
+            new_fp.write(b"# 1002 - South America\n")
+            new_fp.write(b"# 1003 - Africa\n")
+            new_fp.write(b"# 1004 - Greenland\n")
+            new_fp.write(b"# 1005 - South Asia\n")
+            new_fp.write(b"# 1006 - Australia\n")
+            new_fp.write(b"# 1007 - Europe\n")
+            new_fp.write(b"# 1101 - Contiguous United States\n")
+            new_fp.write(b"# 1102 - California\n")
 
         if polar == 0:
-            new_fp.write(f"{'#' if i > 0 else ''}projection_choice={plot_options.projection}\n")
+            new_fp.write(f"{'#' if i > 0 else ''}projection_choice={plot_options.projection}\n".encode())
         else:
             if polar == 1:  # North pole.
-                new_fp.write(f"{'#' if i > 0 else ''}projection_choice=101\n")
+                new_fp.write(f"{'#' if i > 0 else ''}projection_choice=101\n".encode())
             else:  # South pole.
-                new_fp.write(f"{'#' if i > 0 else ''}projection_choice=102\n")
+                new_fp.write(f"{'#' if i > 0 else ''}projection_choice=102\n".encode())
 
-        new_fp.write("standard_circle=0 #1=all specific regions use standard circular projection.\n")
-        new_fp.write("standard_rect=0 #1=all specific regions use standard rectangular projection.\n")
-        # . ./projections.sh -> here you would need to execute your shell script
-        new_fp.write("if [ $projection_choice == 101 ]\n")
-        new_fp.write("then\n")
+        new_fp.write(b"standard_circle=0 #1=all specific regions use standard circular projection.\n")
+        new_fp.write(b"standard_rect=0 #1=all specific regions use standard rectangular projection.\n")
+        new_fp.write(b". ./projections.sh\n")
+        new_fp.write(b"if [ $projection_choice == 101 ]\n")
+        new_fp.write(b"then\n")
 
         minlat = results['minlat'] if polar == 1 else 0.0
-        new_fp.write(f"  minlat={minlat:.3f}\n")
-        new_fp.write("  actual_range=\" -R0.0/360.0/$minlat/90.0 \"\n")
+        new_fp.write(f"  minlat={minlat:.3f}\n".encode())
+        new_fp.write(b"  actual_range=\" -R0.0/360.0/$minlat/90.0 \"\n")
         polar_radius = 90 - minlat
-        new_fp.write(f"  polar_radius={polar_radius}\n")
-        new_fp.write(f"  projection=\" -JE0/90.0/{polar_radius}/${{map_width}}c \" #N. Azimuthal Equidistant\n")
-        new_fp.write("elif [ $projection_choice == 102 ]\n")
-        new_fp.write("then\n")
+        new_fp.write(f"  polar_radius={polar_radius}\n".encode())
+        new_fp.write(b"  projection=\" -JE0/90.0/{polar_radius}/${{map_width}}c \" #N. Azimuthal Equidistant\n")
+        new_fp.write(b"elif [ $projection_choice == 102 ]\n")
+        new_fp.write(b"then\n")
 
         maxlat = results['maxlat'] if polar == 2 else 0.0
-        new_fp.write(f"  maxlat={maxlat:.3f}\n")
-        new_fp.write("  actual_range=\" -R0.0/360.0/-90.0/$maxlat \"\n")
+        new_fp.write(f"  maxlat={maxlat:.3f}\n".encode())
+        new_fp.write(b"  actual_range=\" -R0.0/360.0/-90.0/$maxlat \"\n")
         polar_radius = 90 + maxlat
-        new_fp.write(f"  polar_radius={polar_radius}\n")
-        new_fp.write(f"  projection=\" -JE0/-90.0/{polar_radius}/${{map_width}}c \" #S. Azimuthal Equidistant\n")
-        new_fp.write("fi\n")
+        new_fp.write(f"  polar_radius={polar_radius}\n".encode())
+        new_fp.write(b"  projection=\" -JE0/-90.0/{polar_radius}/${{map_width}}c \" #S. Azimuthal Equidistant\n")
+        new_fp.write(b"fi\n")
 
-        new_fp.write(f"range=\" -R${{minlon}}/${{maxlon}}/${{minlat}}/${{maxlat}} \"\n")
-        new_fp.write(f"map_pos=\" -Xa${{map_x}}c -Ya${{map_y}}c \"\n")
+        new_fp.write(b"range=\" -R${{minlon}}/${{maxlon}}/${{minlat}}/${{maxlat}} \"\n")
+        new_fp.write(b"map_pos=\" -Xa${{map_x}}c -Ya${{map_y}}c \"\n")
 
         if len(results['rgb']) == 3 and results['rgb_choice'] >= 2:
-            new_fp.write("scale_width=1.2 #Override for RGB maps.\n")
+            new_fp.write(b"scale_width=1.2 #Override for RGB maps.\n")
 
-        new_fp.write("scale_pos=\" -D${{scale_x}}c/${{scale_y}}c/${{scale_length}}c/${{scale_width}}c \"\n")
-        new_fp.write("units_x=$(bc <<< \"scale=5; $scale_x+$scale_width/2\")\n");
-        new_fp.write("units_y=$(bc <<< \"scale=5; $scale_y+$scale_length/2\")\n");
-        new_fp.write("units_pos=\" -Xa${{units_x}}c -Ya${{units_y}}c \"\n")
-        new_fp.write("blurb_pos=\" -Xa${{blurb_x}}c -Ya${{blurbs_y}}c \"\n")
-        new_fp.write("blurb2_pos=\" -Xa${{blurb2_x}}c -Ya${{blurbs_y}}c \"\n")
+        new_fp.write(b"scale_pos=\" -D${{scale_x}}c/${{scale_y}}c/${{scale_length}}c/${{scale_width}}c \"\n")
+        new_fp.write(b"units_x=$(bc <<< \"scale=5; $scale_x+$scale_width/2\")\n");
+        new_fp.write(b"units_y=$(bc <<< \"scale=5; $scale_y+$scale_length/2\")\n");
+        new_fp.write(b"units_pos=\" -Xa${{units_x}}c -Ya${{units_y}}c \"\n")
+        new_fp.write(b"blurb_pos=\" -Xa${{blurb_x}}c -Ya${{blurbs_y}}c \"\n")
+        new_fp.write(b"blurb2_pos=\" -Xa${{blurb2_x}}c -Ya${{blurbs_y}}c \"\n")
     else: print("!!!WARNING!!! NO TITLE!")
 
     # Plot data, with title on top.
-    new_fp.write(f"title=\"{title}\"\n")
+    new_fp.write(f"title=\"{title}\"\n".encode())
     if len(results['rgb']) == 3 and len(results['latlon']['outputs']) == 3:
-        new_fp.write(f"$gmt_prefix grdimage red.nc green.nc blue.nc $boundary $resolution $range $projection $map_pos $start > $plot_base.ps\n")
+        new_fp.write(b"gmt grdimage red.nc green.nc blue.nc $boundary $resolution $range $projection $map_pos $start > $plot_base.ps\n")
     else:
-        new_fp.write(f"$gmt_prefix grdimage $data_name $boundary $resolution $range $projection $map_pos -Cmap.cpt $start > $plot_base.ps\n")
+        new_fp.write(b"gmt grdimage $data_name $boundary $resolution $range $projection $map_pos -Cmap.cpt $start > $plot_base.ps\n")
 
     write_gmt_coastlines(new_fp)
 
@@ -1093,25 +1098,25 @@ def write_gmt_map_data(results, grid, plot_options, new_fp, title, i):
     # Plot markers before mascons because mascons are smaller than markers.
     if len(results['marker_lats']) == len(results['latlon']['outputs']) and len(results['marker_lons']) == len(results['latlon']['outputs']) and results['latlon']['outputs']:
         if results['marker_lats'][i] and results['marker_lons'][i]:
-            new_fp.write(f"$gmt_prefix psxy -N $data_name -bcmarker_lons/marker_lats -S+0.5c -W5/244/164/96 -G244/164/96 $range $projection $map_pos $middle >> $plot_base.ps\n")
+            new_fp.write(b"gmt plot -N $data_name -bcmarker_lons/marker_lats -S+0.5c -W5/244/164/96 -G244/164/96 $range $projection $map_pos $middle >> $plot_base.ps\n")
 
-    new_fp.write("#Uncomment to put a marker at echoed coords, given as lon lat:\n")
-    new_fp.write("#echo -85.19 -77.36 | $gmt_prefix psxy -N -S+0.5c -W5/244/164/96 -G244/164/96 $range $projection $map_pos $middle >> $plot_base.ps\n")
+    new_fp.write(b"#Uncomment to put a marker at echoed coords, given as lon lat:\n")
+    new_fp.write(b"#echo -85.19 -77.36 | gmt plot -N -S+0.5c -W5/244/164/96 -G244/164/96 $range $projection $map_pos $middle >> $plot_base.ps\n")
 
     # If requested and mascon_lats/lons vectors aren't empty, plot mascon centers in the color "saddle brown".
     if plot_options['plot_mascons'] != 0 and results['latlon']['mascon_lats']:
-        new_fp.write(f"$gmt_prefix psxy $data_name -bcmascon_lons/mascon_lats -Sc0.01c -G139/69/19 $range $projection $map_pos $middle >> $plot_base.ps\n")
+        new_fp.write(b"gmt plot $data_name -bcmascon_lons/mascon_lats -Sc0.01c -G139/69/19 $range $projection $map_pos $middle >> $plot_base.ps\n")
 
-    new_fp.write("if [ $montage != 0 ]\n")
-    new_fp.write("then\n")
-    new_fp.write("  title=${prefixes[$index]}\" \"$title\n")
-    new_fp.write("  title_format=\"0 0 30 0 0 ML\" #Left-justify so montage titles are uniform.\n")
-    new_fp.write("  title_x=$(bc <<< \"scale=5; $blurb_x-0.1\")\n")
-    new_fp.write("else\n")
-    new_fp.write("  title_x=$(bc <<< \"scale=5; $map_x+$map_width/2\")\n")
-    new_fp.write("fi\n")
-    new_fp.write("title_pos=\" -Xa${title_x}c -Ya${title_y}c \"\n")
-    new_fp.write("echo $title_format $title | $gmt_prefix pstext -N $title_pos $misc_range $middle >> $plot_base.ps\n")
+    new_fp.write(b"if [ $montage != 0 ]\n")
+    new_fp.write(b"then\n")
+    new_fp.write(b"  title=${prefixes[$index]}\" \"$title\n")
+    new_fp.write(b"  title_format=\"0 0 30 0 0 ML\" #Left-justify so montage titles are uniform.\n")
+    new_fp.write(b"  title_x=$(bc <<< \"scale=5; $blurb_x-0.1\")\n")
+    new_fp.write(b"else\n")
+    new_fp.write(b"  title_x=$(bc <<< \"scale=5; $map_x+$map_width/2\")\n")
+    new_fp.write(b"fi\n")
+    new_fp.write(b"title_pos=\" -Xa${title_x}c -Ya${title_y}c \"\n")
+    new_fp.write(b"echo $title_format $title | gmt pstext -N $title_pos $misc_range $middle >> $plot_base.ps\n")
 
     # Draw color scale with units printed above.
     write_gmt_colorscale(new_fp, results, 0)  # 0 = next to map for GMT PDF output.
@@ -1121,9 +1126,9 @@ def write_gmt_map_data(results, grid, plot_options, new_fp, title, i):
     if len(results['rgb']) == 3 and len(results['latlon']['outputs']) == 3:
         plot_options['blurb_disabled'] = 1
     if plot_options['blurb_disabled']:
-        new_fp.write("blurb_contents=\"\"\n")
+        new_fp.write(b"blurb_contents=\"\"\n")
 
-    new_fp.write("echo $blurb_format $blurb_contents | $gmt_prefix pstext -N $blurb_pos $misc_range $middle >> $plot_base.ps\n")
+    new_fp.write(b"echo $blurb_format $blurb_contents | gmt pstext -N $blurb_pos $misc_range $middle >> $plot_base.ps\n")
 
     # Only print error bars if they're the right length, and this one is > 0.0.
     # Need to have separate copies for unstructured and latlon maps because
@@ -1132,41 +1137,24 @@ def write_gmt_map_data(results, grid, plot_options, new_fp, title, i):
     if len(results['latlon']['outputs']) == len(results['error_bars']) and results['latlon']['outputs']:
         if results['error_bars'][i] > 0.0:
             blurb2_written = 1
-            new_fp.write(f"blurb2_contents=\"Error bar: {results['error_bars'][i]:.1f} $scale_units\"\n")
+            new_fp.write(f"blurb2_contents=\"Error bar: {results['error_bars'][i]:.1f} $scale_units\"\n".encode())
 
     if not blurb2_written:
-        new_fp.write("blurb2_contents=\"\" #Error bar: N/A $scale_units\n")
+        new_fp.write(b"blurb2_contents=\"\" #Error bar: N/A $scale_units\n")
 
-    new_fp.write("echo $blurb_format $blurb2_contents | $gmt_prefix pstext -N $blurb2_pos $misc_range $end >> $plot_base.ps\n")
+    new_fp.write(b"echo $blurb_format $blurb2_contents | gmt pstext -N $blurb2_pos $misc_range $end >> $plot_base.ps\n")
 
 def write_gmt_defs(new_fp):
     """
-    Purpose: This function writes some clarifying definitions that help
-            me to consistently write working GMT data plotting commands.
-            2017-04-04 Update: Also added GMT4/5 compatibility which uses
-                            the "GMT5" define from definitions.hpp.
-                            THIS ISN'T FINISHED YET!
+    Purpose: This function writes some clarifying definitions that help me to consistently write working GMT data plotting commands.
     Input:  new_fp - file handle to current gmt script file
     """
-    new_fp.write("#######################################################\n")
-    new_fp.write("#Clarifying definitions. Do not change!################\n")
-    new_fp.write("start=\" -K \" #Should always redirect using > to write new PS.\n")
-    new_fp.write("middle=\" -O -K \" #Should always redirect using >> to append to PS.\n")
-    new_fp.write("end=\" -O \" #Should always redirect using >> to append to PS.\n")
-    new_fp.write("#######################################################\n")
-
-    # Assuming GMT5 as a global variable here.
-    if plot_options['GMT5']:
-        new_fp.write("gmt5=1 #1/0 = GMT v5/4. GMTv5 support not finished.\n")
-    else:
-        new_fp.write("gmt5=0 #1/0 = GMT v5/4. GMTv5 support not finished.\n")
-
-    new_fp.write("if [ $gmt5 != 0 ]\n")
-    new_fp.write("then\n")
-    new_fp.write("  gmt_prefix=\"gmt \"\n")
-    new_fp.write("else\n")
-    new_fp.write("  gmt_prefix=\"\"\n")
-    new_fp.write("fi\n")
+    new_fp.write(b"#######################################################\n")
+    new_fp.write(b"#Clarifying definitions. Do not change!################\n")
+    new_fp.write(b"start=\" -K \" #Should always redirect using > to write new PS.\n")
+    new_fp.write(b"middle=\" -O -K \" #Should always redirect using >> to append to PS.\n")
+    new_fp.write(b"end=\" -O \" #Should always redirect using >> to append to PS.\n")
+    new_fp.write(b"#######################################################\n")
 
 def finish_flip_backgrounds(flip_fp):
     """
@@ -1175,15 +1163,15 @@ def finish_flip_backgrounds(flip_fp):
     Input:  
         flip_fp - file pointer to flip_backgrounds.sh script file
     """
-    flip_fp.write("for current_base in $all_bases\n")
-    flip_fp.write("do\n")
-    flip_fp.write("  #Change black to cyan temporarily.\n")
-    flip_fp.write("  convert $current_base.png -fill cyan -opaque black $current_base.png\n")
-    flip_fp.write("  #Change white to black.\n")
-    flip_fp.write("  convert $current_base.png -fill black -opaque white $current_base.png\n")
-    flip_fp.write("  #Change temporary cyan to white.\n")
-    flip_fp.write("  convert $current_base.png -fill white -opaque cyan $current_base.png\n")
-    flip_fp.write("done\n")
+    flip_fp.write(b"for current_base in $all_bases\n")
+    flip_fp.write(b"do\n")
+    flip_fp.write(b"  #Change black to cyan temporarily.\n")
+    flip_fp.write(b"  convert $current_base.png -fill cyan -opaque black $current_base.png\n")
+    flip_fp.write(b"  #Change white to black.\n")
+    flip_fp.write(b"  convert $current_base.png -fill black -opaque white $current_base.png\n")
+    flip_fp.write(b"  #Change temporary cyan to white.\n")
+    flip_fp.write(b"  convert $current_base.png -fill white -opaque cyan $current_base.png\n")
+    flip_fp.write(b"done\n")
 
 def finish_trim(trim_fp):
     """
@@ -1192,10 +1180,10 @@ def finish_trim(trim_fp):
     Input:  
         trim_fp - file pointer to trim.sh script file
     """
-    trim_fp.write("for current_base in $all_bases\n")
-    trim_fp.write("do\n")
-    trim_fp.write("  convert $current_base.png -trim $current_base.png\n")
-    trim_fp.write("done\n")
+    trim_fp.write(b"for current_base in $all_bases\n")
+    trim_fp.write(b"do\n")
+    trim_fp.write(b"  convert $current_base.png -trim $current_base.png\n")
+    trim_fp.write(b"done\n")
 
 if __name__ == "__main__":
     plt.style.use('dark_background')
@@ -1216,7 +1204,7 @@ if __name__ == "__main__":
     #max_period = min_period * wavelength_ratio
 
     ds = load_ssha_files(tskip=1)
-    xskip = 24
+    xskip = 48
     print(f"Grabbing one lat/lon point in every {xskip**2} points...",end="")
     ds = ds.isel(Latitude=slice(None, None, xskip), Longitude=slice(None, None, xskip))
     print(" done.")
@@ -1282,5 +1270,8 @@ if __name__ == "__main__":
     print("Finished saving.")
     
     write_gmt_scripts(plot_options, grid, results)
+    
+    docker_command = f'docker run -e TZ=America/Los_Angeles -v {outputfolder}:/home -w /home grace/testing-bpr-grace2 /bin/bash -c "chmod +x create_plots.sh; chmod +x flip_backgrounds.sh; chmod +x animate.sh; chmod +x montage.sh; chmod +x trim.sh; cp create_plots.sh Zbackup_create_plots.sh; cp projections.sh Zbackup_projections.sh; ./create_plots.sh"'
+    subprocess.run(docker_command, shell=True)
 
     print("!!!WARNING!!! Next line assumes these units are originally in ns and you want the units to be days!!!")
