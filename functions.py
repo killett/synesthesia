@@ -6,6 +6,7 @@ import glob
 import xarray as xr
 import numpy as np
 import pandas as pd
+import zipfile
 import functools
 import nfft # pip install nfft Reference: https://github.com/jakevdp/nfft
 import statsmodels.api as sm #pip install statsmodels
@@ -52,7 +53,7 @@ plot_options = {
     'show_fig': False,
     'save_fig': True,
     'figsize': (10, 10),
-    'dpi': 300,
+    'dpi': dpi_choice,
     'linewidth': 2.0,
     'linestyle': '-',
     'color': 'black',
@@ -186,6 +187,17 @@ files_to_copy = ['projections.sh', 'overflow.sh', 'notation.sh']
 
 for file in files_to_copy:
     shutil.copy(file, outputfolder)
+
+# Determine the path of the script that is currently running
+current_script_path = os.path.abspath(__file__)
+# Make sure the directory exists, create if necessary
+os.makedirs(outputfolder, exist_ok=True)
+# Create the name for the zip file
+zip_file_name = os.path.join(outputfolder, os.path.basename(current_script_path) + '.zip')
+# Zip up the python script
+with zipfile.ZipFile(zip_file_name, 'w') as zipf:
+    zipf.write(current_script_path, arcname=os.path.basename(current_script_path))
+print(f'Successfully zipped {current_script_path} to {zip_file_name}')
 
 def load_cie_functions():
     file = os.path.join('.', 'sealevel_spectra', 'ciexyz31_1_trimmed_400nm_700nm.csv')
@@ -683,12 +695,12 @@ def write_gmt_scripts(plot_options, grid, results):
             new_fp.write(f"montage={plot_options['montage']} #1=left-justify titles, add (a),(b), run montage.sh.\n".encode())
             new_fp.write(b"prefixes=('(a)' '(b)' '(c)' '(d)' '(e)' '(f)' '(g)' '(h)' '(i)' '(j)' '(k)' '(l)' '(m)' '(n)' '(o)' '(p)' '(q)' '(r)' '(s)' '(t)' '(u)' '(v)' '(w)' '(x)' '(y)' '(z)')\n")
             new_fp.write(b"index=-1 #Increments on each map, accesses prefixes above for montage.\n")
-            new_fp.write('png_options=" -P -Tg " #PDF default: -E720, else 300 dpi.\n')
+            new_fp.write(b'png_options=" -P -Tg " #PDF default: -E720, else 300 dpi.\n')
             new_fp.write(b"if [ $montage != 0 ]\nthen\n  png_options=\" -A\"$png_options\nfi\n")
             new_fp.write(b"#Force off-white(dark gray) fore(back)ground color because\n#flip_backgrounds.sh can change the maps' text from\n#black to white, and their backgrounds from white to black.\n")
             new_fp.write(b"gmt set COLOR_BACKGROUND=2/2/2 COLOR_FOREGROUND=253/253/253\n")
             new_fp.write(f"digits={plot_options['scale_digits']}\n".encode())
-            new_fp.write(b"gmt set D_FORMAT=%.${{digits}}f\n")
+            new_fp.write(b"gmt set D_FORMAT=%.${digits}f\n")
 
         # Define the filenames for PostScript output.
         s = f"{plot_options['output_base']}_{i+1:04d}"
@@ -696,25 +708,25 @@ def write_gmt_scripts(plot_options, grid, results):
         if 1:#len(results['rgb']) == 3 and len(results['latlon']['outputs']) == 3:
             new_fp.write(b"data_name=redgreenblue\n")
         else:
-            new_fp.write(f'data_name="{just_the_filenames[i]}"\n')
-        new_fp.write(f'plot_base="{s}"\n')
+            new_fp.write(f'data_name="{just_the_filenames[i]}"\n'.encode())
+        new_fp.write(f'plot_base="{s}"\n'.encode())
         new_fp.write(b"let index=$index+1\n")
         new_fp.write(b"#######################################################\n")
 
         # Record the filename bases in the flip_backgrounds.sh and trim.sh scripts.
         if i == 0:
             if len(just_the_filenames) == 1:
-                flip_fp.write(f'all_bases="{s}"\n')  # First and last base starts and ends the string list.
-                trim_fp.write(f'all_bases="{s}"\n')  # First and last base starts and ends the string list.
+                flip_fp.write(f'all_bases="{s}"\n'.encode())  # First and last base starts and ends the string list.
+                trim_fp.write(f'all_bases="{s}"\n'.encode())  # First and last base starts and ends the string list.
             else:
-                flip_fp.write(f'all_bases="{s}\n')  # First base starts the string list.
-                trim_fp.write(f'all_bases="{s}\n')  # First base starts the string list.
+                flip_fp.write(f'all_bases="{s}\n'.encode())  # First base starts the string list.
+                trim_fp.write(f'all_bases="{s}\n'.encode())  # First base starts the string list.
         elif i < len(just_the_filenames) - 1:
-            flip_fp.write(f'{s}\n')  # Bases that aren't first or last are unadorned.
-            trim_fp.write(f'{s}\n')  # Bases that aren't first or last are unadorned.
+            flip_fp.write(f'{s}\n'.encode())  # Bases that aren't first or last are unadorned.
+            trim_fp.write(f'{s}\n'.encode())  # Bases that aren't first or last are unadorned.
         else:
-            flip_fp.write(f'{s}"\n')  # Last base ends with a " to terminate string list.
-            trim_fp.write(f'{s}"\n')  # Last base ends with a " to terminate string list.
+            flip_fp.write(f'{s}"\n'.encode())  # Last base ends with a " to terminate string list.
+            trim_fp.write(f'{s}"\n'.encode())  # Last base ends with a " to terminate string list.
 
         # Plot data, with title on top and coastlines.
         write_gmt_map_data(results, grid, plot_options, new_fp, results['titles'][i], i)
@@ -765,7 +777,7 @@ def write_gmt_scripts(plot_options, grid, results):
     # Create animate script in outputfolder, which should be netcdf_output.
     extra_file = os.path.join(plot_options['outputfolder'], "animate.sh")
     try:
-        extra_fp = open(extra_file, "w")
+        extra_fp = open(extra_file, 'wb')
     except IOError:
         print("The animate.sh script couldn't be created.")
 
@@ -786,7 +798,7 @@ def write_gmt_scripts(plot_options, grid, results):
     # Create montage script in outputfolder, which should be netcdf_output.
     extra_file = os.path.join(plot_options['outputfolder'], "montage.sh")
     try:
-        extra_fp = open(extra_file, "w")
+        extra_fp = open(extra_file, 'wb')
     except IOError:
         print("The montage.sh script couldn't be created.")
 
@@ -868,7 +880,7 @@ def write_gmt_colorscale(new_fp, results, kml_output):
             new_fp.write(b"# Print units manually, otherwise they're too close to numbers on scale.\n")
             new_fp.write(b"echo $units_format $scale_units | gmt pstext -N $units_pos $misc_range $middle >> $plot_base.ps\n")
     else:
-        new_fp.write(b"numwidths={}\n".format(results['max_widths']))
+        new_fp.write(f"numwidths={results['max_widths']}\n".encode())
         new_fp.write(b"gmt set TICK_LENGTH 0.3c\n")
         new_fp.write(b"scale_width=$(bc <<< \"scale=5; $scale_width / $numwidths\")\n")
         new_fp.write(b"for (( j=1; j <= $numwidths; j++ ))\n")
@@ -967,32 +979,32 @@ def write_gmt_map_data(results, grid, plot_options, new_fp, title, i):
         new_fp.write(b"#Set resolution, coast_file, coast_thickness, and coastlines\n")
         new_fp.write(b"#on first map only because they should be universal.\n")
         coast_file = plot_options['outputfolder'] + "data/ancillary/Rignot/InSAR_GL_Antarctica.txt"
-        new_fp.write(f'coast_file="{coast_file}"\n')
+        new_fp.write(f'coast_file="{coast_file}"\n'.encode())
 
         # Only latlon data determines resolution using delta_lat.
         if results['options']['output_choice'] == 5:
             delta_lat = abs(results['latlon']['lat'][1] - results['latlon']['lat'][0])
             if delta_lat < 0.4:  # Latlon lat spacing controls the resolution.
-                new_fp.write('resolution=" -E50 " #50/2000 is low/high quality.\n')
-                new_fp.write('coast_res=" -Df+ "\n')
+                new_fp.write(b'resolution=" -E50 " #50/2000 is low/high quality.\n')
+                new_fp.write(b'coast_res=" -Df+ "\n')
             elif delta_lat < 0.9:  # Latlon lat spacing controls the resolution.
-                new_fp.write('resolution=" -E50 " #50/2000 is low/high quality.\n')
-                new_fp.write('coast_res=" -Df+ "\n')
+                new_fp.write(b'resolution=" -E50 " #50/2000 is low/high quality.\n')
+                new_fp.write(b'coast_res=" -Df+ "\n')
             else:
-                new_fp.write('resolution=" -E50 " #50/2000 is low/high quality.\n')
-                new_fp.write('coast_res=" -Di+ "\n')
+                new_fp.write(b'resolution=" -E50 " #50/2000 is low/high quality.\n')
+                new_fp.write(b'coast_res=" -Di+ "\n')
         elif results['options']['output_choice'] in [1, 4]:
-            new_fp.write('resolution=" -E50 " #50/2000 is low/high quality.\n')
-            new_fp.write('coast_res=" -Di+ "\n')
+            new_fp.write(b'resolution=" -E50 " #50/2000 is low/high quality.\n')
+            new_fp.write(b'coast_res=" -Di+ "\n')
         else:
             print(f"!!!!WARNING!!!!!! results['options']['output_choice'] {results['options']['output_choice']} isn't recognized.")
 
-        new_fp.write('coast_res_orig=$coast_res #Don\'t want USA maps to repeatedly add -N2.\n')
-        new_fp.write('coast_thk="0.6"\n')
-        new_fp.write('coast_thk="0.009"\n')
+        new_fp.write(b'coast_res_orig=$coast_res #Don\'t want USA maps to repeatedly add -N2.\n')
+        new_fp.write(b'coast_thk="0.6"\n')
+        new_fp.write(b'coast_thk="0.009"\n')
         if polar == 1:
             coastlines = 1  # InSAR is only in Antarctica, so disable for NP plots.
-        new_fp.write(f'coastlines={coastlines} #1:coast, 2:coast+InSAR.\n')
+        new_fp.write(f'coastlines={coastlines} #1:coast, 2:coast+InSAR.\n'.encode())
 
     new_fp.write(b"#coast_color is gray82 for off-white, or gray10 for dark coastlines.\n")
 
@@ -1005,18 +1017,18 @@ def write_gmt_map_data(results, grid, plot_options, new_fp, title, i):
             results['minlat'] -= buffer
 
     # Record text formats, which are the same for all projections and data types.
-    new_fp.write('title_format="0 0 30 0 0 MC"\n')
-    new_fp.write('blurb_format="0 0 15 0 1 ML"\n')
-    new_fp.write('units_format="0 0 13 0 0 MC"\n')
+    new_fp.write(b'title_format="0 0 30 0 0 MC"\n')
+    new_fp.write(b'blurb_format="0 0 15 0 1 ML"\n')
+    new_fp.write(b'units_format="0 0 13 0 0 MC"\n')
     # Record units for the scale, which are the same for all projections and data types.
     new_fp.write(f"scale_units=\"{results['units'][i]}\"\n".encode())
 
-    new_fp.write('misc_range=" -R0/1/0/1 -JX1c "\n')
+    new_fp.write(b'misc_range=" -R0/1/0/1 -JX1c "\n')
     new_fp.write(b"#grdcut requires actual limits, but if grdimage uses them: GMT Fatal Error: grdimage could not allocate memory [21.69 Gb, n_items = 5823567396]\n")
-    new_fp.write('minlon=%.3f\n' % 0.0)  # results['minlon']
-    new_fp.write('maxlon=%.3f\n' % 360.0)  # results['maxlon']
-    new_fp.write('minlat=%.3f\n' % -90.0)  # results['minlat']
-    new_fp.write('maxlat=%.3f\n' % 90.0)  # results['maxlat']
+    new_fp.write(b'minlon=%.3f\n' % 0.0)  # results['minlon']
+    new_fp.write(b'maxlon=%.3f\n' % 360.0)  # results['maxlon']
+    new_fp.write(b'minlat=%.3f\n' % -90.0)  # results['minlat']
+    new_fp.write(b'maxlat=%.3f\n' % 90.0)  # results['maxlat']
 
     if title:
         # All projections are always available.
@@ -1059,7 +1071,7 @@ def write_gmt_map_data(results, grid, plot_options, new_fp, title, i):
         new_fp.write(b"  actual_range=\" -R0.0/360.0/$minlat/90.0 \"\n")
         polar_radius = 90 - minlat
         new_fp.write(f"  polar_radius={polar_radius}\n".encode())
-        new_fp.write(b"  projection=\" -JE0/90.0/{polar_radius}/${{map_width}}c \" #N. Azimuthal Equidistant\n")
+        new_fp.write(b"  projection=\" -JE0/90.0/{polar_radius}/${map_width}c \" #N. Azimuthal Equidistant\n")
         new_fp.write(b"elif [ $projection_choice == 102 ]\n")
         new_fp.write(b"then\n")
 
@@ -1068,21 +1080,21 @@ def write_gmt_map_data(results, grid, plot_options, new_fp, title, i):
         new_fp.write(b"  actual_range=\" -R0.0/360.0/-90.0/$maxlat \"\n")
         polar_radius = 90 + maxlat
         new_fp.write(f"  polar_radius={polar_radius}\n".encode())
-        new_fp.write(b"  projection=\" -JE0/-90.0/{polar_radius}/${{map_width}}c \" #S. Azimuthal Equidistant\n")
+        new_fp.write(b"  projection=\" -JE0/-90.0/{polar_radius}/${map_width}c \" #S. Azimuthal Equidistant\n")
         new_fp.write(b"fi\n")
 
-        new_fp.write(b"range=\" -R${{minlon}}/${{maxlon}}/${{minlat}}/${{maxlat}} \"\n")
-        new_fp.write(b"map_pos=\" -Xa${{map_x}}c -Ya${{map_y}}c \"\n")
+        new_fp.write(b"range=\" -R${minlon}/${maxlon}/${minlat}/${maxlat} \"\n")
+        new_fp.write(b"map_pos=\" -Xa${map_x}c -Ya${map_y}c \"\n")
 
         if len(results['rgb']) == 3 and results['rgb_choice'] >= 2:
             new_fp.write(b"scale_width=1.2 #Override for RGB maps.\n")
 
-        new_fp.write(b"scale_pos=\" -D${{scale_x}}c/${{scale_y}}c/${{scale_length}}c/${{scale_width}}c \"\n")
+        new_fp.write(b"scale_pos=\" -D${scale_x}c/${scale_y}c/${scale_length}c/${scale_width}c \"\n")
         new_fp.write(b"units_x=$(bc <<< \"scale=5; $scale_x+$scale_width/2\")\n");
         new_fp.write(b"units_y=$(bc <<< \"scale=5; $scale_y+$scale_length/2\")\n");
-        new_fp.write(b"units_pos=\" -Xa${{units_x}}c -Ya${{units_y}}c \"\n")
-        new_fp.write(b"blurb_pos=\" -Xa${{blurb_x}}c -Ya${{blurbs_y}}c \"\n")
-        new_fp.write(b"blurb2_pos=\" -Xa${{blurb2_x}}c -Ya${{blurbs_y}}c \"\n")
+        new_fp.write(b"units_pos=\" -Xa${units_x}c -Ya${units_y}c \"\n")
+        new_fp.write(b"blurb_pos=\" -Xa${blurb_x}c -Ya${blurbs_y}c \"\n")
+        new_fp.write(b"blurb2_pos=\" -Xa${blurb2_x}c -Ya${blurbs_y}c \"\n")
     else: print("!!!WARNING!!! NO TITLE!")
 
     # Plot data, with title on top.
@@ -1203,8 +1215,8 @@ if __name__ == "__main__":
     # Calculate the max_period
     #max_period = min_period * wavelength_ratio
 
-    ds = load_ssha_files(tskip=1)
-    xskip = 48
+    ds = load_ssha_files(tskip=4)
+    xskip = 96
     print(f"Grabbing one lat/lon point in every {xskip**2} points...",end="")
     ds = ds.isel(Latitude=slice(None, None, xskip), Longitude=slice(None, None, xskip))
     print(" done.")
