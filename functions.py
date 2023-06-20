@@ -1071,7 +1071,7 @@ def write_gmt_map_data(results, grid, plot_options, new_fp, title, i):
         new_fp.write(b"  actual_range=\" -R0.0/360.0/$minlat/90.0 \"\n")
         polar_radius = 90 - minlat
         new_fp.write(f"  polar_radius={polar_radius}\n".encode())
-        new_fp.write(b"  projection=\" -JE0/90.0/{polar_radius}/${map_width}c \" #N. Azimuthal Equidistant\n")
+        new_fp.write(b"  projection=\" -JE0/90.0/${polar_radius}/${map_width}c \" #N. Azimuthal Equidistant\n")
         new_fp.write(b"elif [ $projection_choice == 102 ]\n")
         new_fp.write(b"then\n")
 
@@ -1215,8 +1215,8 @@ if __name__ == "__main__":
     # Calculate the max_period
     #max_period = min_period * wavelength_ratio
 
-    ds = load_ssha_files(tskip=4)
-    xskip = 96
+    ds = load_ssha_files(tskip=1)
+    xskip = 6#96#192
     print(f"Grabbing one lat/lon point in every {xskip**2} points...",end="")
     ds = ds.isel(Latitude=slice(None, None, xskip), Longitude=slice(None, None, xskip))
     print(" done.")
@@ -1307,6 +1307,7 @@ if __name__ == "__main__":
     
     # Define Docker external command
     docker_command = f'docker run -e TZ=America/Los_Angeles -v {outputfolder}:{docker_internal_folder} -w {docker_internal_folder} grace/testing-bpr-grace2 {docker_internal_folder}/{docker_internal_filename}'
+    docker_command = f'docker run -it -e TZ=America/Los_Angeles -v .:{docker_internal_folder} -w {docker_internal_folder} grace/testing-bpr-grace2 /bin/bash'
 
     docker_external_filename = 'docker_external.bat'
     #Used to have this line in the docker_external_script before the docker command: @echo off
@@ -1326,10 +1327,10 @@ if __name__ == "__main__":
     os.chmod(os.path.join(outputfolder, docker_internal_filename), 0o755)
 
     # Run Docker external script
-    print(f"Running {docker_command}...")
-    results = subprocess.run(os.path.join(outputfolder, docker_external_filename), shell=True, capture_output=True, text=True, encoding='utf-8')
-    print(f"{results.stdout}")
-    if results.stderr:
-        print(f"!!!WARNING!!! Docker subprocess stderr: {results.stderr}")
+    print(f"Opening an interactive shell. Run {docker_external_filename}, then run {docker_internal_filename}")
+    # Go to the outputfolder directory
+    os.chdir(outputfolder)
+    # Start an interactive shell
+    os.system('cmd')
 
     print("!!!WARNING!!! Next line assumes these units are originally in ns and you want the units to be days!!!")
