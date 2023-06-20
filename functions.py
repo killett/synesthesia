@@ -582,7 +582,7 @@ def extract_ssha_timeseries(ds, lat = 30, lon = 135):
 
     return ds
 
-def timeseries_to_rgb(timeseries, x_key, y_key, min_period, max_period):
+def timeseries_to_xyz(timeseries, x_key, y_key, min_period, max_period):
     #print(f"{timeseries.keys() = }")
     timeseries, fits = fancy_detrend(timeseries, x_key, y_key, terms=['constant', 'trend', 'accel'])
 
@@ -630,18 +630,7 @@ def timeseries_to_rgb(timeseries, x_key, y_key, min_period, max_period):
     #print(f"Before raising y to power {thepower}: {xyz = }")
     raise_y_to_power(xyz, thepower)
     #print(f"After  raising y to power {thepower}: {xyz = }")
-    rgb = xyz2rgb(xyz)
-    #print(f"Before gamma correction: {rgb = }")
-    rgb = gamma_correct_rgb(rgb)
-    #print(f"After  gamma correction: {rgb = }")
-
-    if make_plots:
-        # Create filename with current date
-        date_str = datetime.datetime.now().strftime('%Y%m%d-%H%M%S')
-        filename = os.path.join(outputfolder,f"{date_str}_color_plot.png")
-        plot_color(rgb, filename)
-    
-    return xr.Dataset(rgb)
+    return xr.Dataset(xyz)
 
 # Define your function, that returns a Dataset
 def rms_and_mean(x):
@@ -1238,10 +1227,10 @@ if __name__ == "__main__":
     stacked = ds.stack(position=['Latitude', 'Longitude'])
 
     # Create a new function with min_period and max_period filled
-    timeseries_to_rgb_partial = functools.partial(timeseries_to_rgb, x_key=x_key, y_key=y_key, min_period=min_period, max_period=max_period)
+    timeseries_to_xyz_partial = functools.partial(timeseries_to_xyz, x_key=x_key, y_key=y_key, min_period=min_period, max_period=max_period)
 
     # Apply the function to the 'SLA' variable of the stacked dataset
-    result = stacked.groupby('position').map(timeseries_to_rgb_partial)
+    result = stacked.groupby('position').map(timeseries_to_xyz_partial)
 
     # Now `result` is a Dataset of Datasets, create a dictionary of unstacked datasets
     datasets = {key: result[key].unstack('position') for key in result.data_vars}
