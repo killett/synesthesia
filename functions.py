@@ -15,6 +15,7 @@ import matplotlib.pyplot as plt
 import datetime
 import time
 import timeit
+import netCDF4 as nc
 
 from typing import Dict
 
@@ -1216,7 +1217,7 @@ if __name__ == "__main__":
     #max_period = min_period * wavelength_ratio
 
     ds = load_ssha_files(tskip=1)
-    xskip = 6#96#192
+    xskip = 192
     print(f"Grabbing one lat/lon point in every {xskip**2} points...",end="")
     ds = ds.isel(Latitude=slice(None, None, xskip), Longitude=slice(None, None, xskip))
     print(" done.")
@@ -1271,66 +1272,39 @@ if __name__ == "__main__":
         # Save the figure with the desired options
         plt.savefig(filename, dpi=dpi_choice, format='png', transparent=False, bbox_inches='tight', facecolor='black')
 
+    #Normalize RGB values:
+    max_value = max(np.nanmax(val.values) for val in datasets.values())
+    print(f"Rescaling RGB values: dividing by {max_value}")
+    for key in datasets:
+        datasets[key] = datasets[key] / max_value
+
+    rgb_filenames = []
     for thekey in datasets.keys():
         # Create filename with current date
         date_str = datetime.datetime.now().strftime('%Y%m%d-%H%M%S')
         filename = os.path.join(outputfolder, f"{thekey.replace(' ', '_')}.nc")
+        rgb_filenames.append(filename)
         
         # Save the dataset to a NetCDF file
         print(f"Saving {filename}...")
         datasets[thekey].to_netcdf(filename)
     print("Finished saving.")
     
-    write_gmt_scripts(plot_options, grid, results)
-    
-    #Internal Docker folder:
-    docker_internal_folder = '/home/jovyan'
-    # Define Docker internal script
-    docker_internal_filename = 'docker_internal.sh'
-    docker_internal_script = "#!/bin/bash\n" \
-                             "cp create_plots.sh Zbackup_create_plots.sh\n" \
-                             "cp projections.sh Zbackup_projections.sh\n" \
-                             "./create_plots.sh\n"
-    docker_internal_script = "#!/bin/bash\n" \
-                             "echo '----- Environment Variables -----'\n" \
-                             "echo 'PATH: '\n" \
-                             "echo $PATH\n" \
-                             "echo 'LD_LIBRARY_PATH: '\n" \
-                             "echo $LD_LIBRARY_PATH\n" \
-                             "echo '----- Conda Environments -----'\n" \
-                             "/opt/conda/bin/conda env list\n" \
-                             "echo '----- Working Directory -----'\n" \
-                             "pwd\n" \
-                             "cp create_plots.sh Zbackup_create_plots.sh\n" \
-                             "cp projections.sh Zbackup_projections.sh\n" \
-                             "./create_plots.sh\n"
-    
-    # Define Docker external command
-    docker_command = f'docker run -e TZ=America/Los_Angeles -v {outputfolder}:{docker_internal_folder} -w {docker_internal_folder} grace/testing-bpr-grace2 {docker_internal_folder}/{docker_internal_filename}'
-    docker_command = f'docker run -it -e TZ=America/Los_Angeles -v .:{docker_internal_folder} -w {docker_internal_folder} grace/testing-bpr-grace2 /bin/bash'
+    # Load your data
+    #breakpoint()
+    red = nc.Dataset(rgb_filenames[0]).variables['red'][:]
+    green = nc.Dataset(rgb_filenames[1]).variables['green'][:]
+    blue = nc.Dataset(rgb_filenames[2]).variables['blue'][:]
 
-    docker_external_filename = 'docker_external.bat'
-    #Used to have this line in the docker_external_script before the docker command: @echo off
-    docker_external_script = f"""
-    {docker_command}
-    """
+    # Stack into an RGB image
+    image = np.dstack((red, green, blue))
 
-    # Write Docker internal script
-    with open(os.path.join(outputfolder, docker_internal_filename), 'wb') as file:
-        file.write(docker_internal_script.encode())
+    # Display the image
+    plt.imshow(image, origin='lower')
 
-    # Write Docker external script
-    with open(os.path.join(outputfolder,docker_external_filename), 'w') as file:
-        file.write(docker_external_script)
+    # Save the image to disk as a png
+    plt.savefig(os.path.join(outputfolder, 'image_matplotlib.png'), dpi=300)
 
-    # Change permissions of the Docker internal script
-    os.chmod(os.path.join(outputfolder, docker_internal_filename), 0o755)
-
-    # Run Docker external script
-    print(f"Opening an interactive shell. Run {docker_external_filename}, then run {docker_internal_filename}")
-    # Go to the outputfolder directory
-    os.chdir(outputfolder)
-    # Start an interactive shell
-    os.system('cmd')
+    plt.close()
 
     print("!!!WARNING!!! Next line assumes these units are originally in ns and you want the units to be days!!!")
