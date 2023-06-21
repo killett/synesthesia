@@ -1,5 +1,6 @@
 import numpy as np
-from colour.colorimetry import SpectralDistribution, CMFS, sd_to_XYZ
+from colour.colorimetry import SpectralDistribution, sd_to_XYZ
+from colour.colorimetry import STANDARD_OBSERVERS_CMFS as CMFS
 
 # Define your spectral power distribution data.
 wavelengths = np.arange(360, 781)  # For example, from 360 to 780 nm
