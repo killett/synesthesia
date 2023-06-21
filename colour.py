@@ -1,5 +1,5 @@
 import numpy as np
-from colour import SpectralDistribution, COLOR_MATCHING_FUNCTIONS, sd_to_XYZ
+from colour import SpectralDistribution, MSDS_CMFS_STANDARD_OBSERVER, sd_to_XYZ
 
 # Define your spectral power distribution data.
 wavelengths = np.arange(360, 781)  # For example, from 360 to 780 nm
@@ -9,7 +9,7 @@ values = np.random.random_sample(len(wavelengths))  # Your actual SPD data here
 spd = SpectralDistribution(values, wavelengths)
 
 # Define the standard observer color matching functions.
-cmfs = COLOR_MATCHING_FUNCTIONS['CIE 1931 2 Degree Standard Observer']
+cmfs = MSDS_CMFS_STANDARD_OBSERVER['CIE 1931 2 Degree Standard Observer']
 
 # Compute the XYZ tristimulus values.
 XYZ = sd_to_XYZ(spd, cmfs)
