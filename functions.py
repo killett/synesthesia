@@ -257,13 +257,13 @@ def spectrum2xyz(spectrum, cie, normalization_factor):
         temp_values = spectrum['power'].values * cie[l].values
         # Integrate over wavelengths to get a single tristimulus value
         xyz[l] = (temp_values.sum() * wavelength_step_size) / normalization_factor
-    return xyz
+    return xr.Dataset(xyz)
 
 def raise_y_to_power(xyz, power):
     power = 1 - power
-    factor = pow(xyz['y'], power)
-    for key in xyz:
-        xyz[key] /= factor
+    factor = pow(xyz['y'].values, power)
+    for key in xyz.data_vars:
+        xyz[key].values /= factor
     return xyz
 
 def xyz2rgb(xyz):
@@ -287,9 +287,9 @@ def xyz2rgb(xyz):
     rgb = {'red': rgb[0], 'green': rgb[1], 'blue': rgb[2]}
     max_value = max(rgb.values())
     for key in rgb:
-        rgb[key] /= max_value
-
-    return rgb
+        rgb[key].values /= max_value
+    breakpoint()
+    return xr.Dataset(rgb)
 
 def gamma_correct_rgb(rgb):
     gamma_inv = 0.45
@@ -297,13 +297,14 @@ def gamma_correct_rgb(rgb):
     h = 4.506813168
     g = -0.09914989
     f = 1.09914989
-    for key in rgb:
+    for key in rgb.data_vars:
         # Typo in Hughes and Williams 2010 equation A7, compared to Charles Poynton's GammaFAQ:
         # http://www.poynton.com/GammaFAQ.html
         if rgb[key] <= crit:
             rgb[key] *= h
         else:
             rgb[key] = f * pow(rgb[key], gamma_inv) + g
+    breakpoint()
     return rgb
 
 def synthetic_timeseries(signal='annual', signal_amplitude=1, noise='white', noise_level=0.1, 
@@ -1232,8 +1233,8 @@ if __name__ == "__main__":
     # Apply the function to the 'SLA' variable of the stacked dataset
     result = stacked.groupby('position').map(timeseries_to_xyz_partial)
 
-    # Now `result` is a Dataset of Datasets, create a dictionary of unstacked datasets
-    datasets = {key: result[key].unstack('position') for key in result.data_vars}
+    # Unstack all variables and keep as a dataset
+    spectral_color_maps = xr.Dataset({key: result[key].unstack('position') for key in result.data_vars})
 
     # Stop the timer
     end_time = timeit.default_timer()
@@ -1243,32 +1244,14 @@ if __name__ == "__main__":
 
     print(f"Time taken WITHOUT DASK: {time_taken:.2f} seconds")
 
-    if 0:
-        # Assuming `ds` is your xarray Dataset
-        sla_rms = ds['SLA_RMS']
-        title = 'SLA RMS'
-        # Create the figure and axes objects
-        fig = plt.figure(figsize=myfigsize)
-        ax = fig.add_subplot(1, 1, 1, projection=ccrs.PlateCarree())
-        # Make the plot
-        sla_rms.plot(ax=ax, transform=ccrs.PlateCarree(), cmap='viridis', cbar_kwargs={'label': 'RMS', 'orientation': 'horizontal', 'pad': 0.1})
-        # Add gridlines and labels
-        ax.coastlines()
-        ax.gridlines(draw_labels=True)
-        # Create filename with current date
-        date_str = datetime.datetime.now().strftime('%Y%m%d-%H%M%S')
-        filename = os.path.join(outputfolder, f"{date_str}_{title.replace(' ','_')}.png")
-        # Save the figure with the desired options
-        plt.savefig(filename, dpi=dpi_choice, format='png', transparent=False, bbox_inches='tight', facecolor='black')
-
     #Normalize RGB values:
-    max_value = max(np.nanmax(val.values) for val in datasets.values())
-    print(f"Rescaling RGB values: dividing by {max_value}")
-    for key in datasets:
-        datasets[key] = datasets[key] / max_value
+    #max_value = max(np.nanmax(val.values) for val in spectral_color_maps.values())
+    #print(f"Rescaling RGB values: dividing by {max_value}")
+    #for key in spectral_color_maps:
+    #    spectral_color_maps[key] = spectral_color_maps[key] / max_value
 
     rgb_filenames = []
-    for thekey in datasets.keys():
+    for thekey in spectral_color_maps.keys():
         # Create filename with current date
         date_str = datetime.datetime.now().strftime('%Y%m%d-%H%M%S')
         filename = os.path.join(outputfolder, f"{thekey.replace(' ', '_')}.nc")
@@ -1276,15 +1259,17 @@ if __name__ == "__main__":
         
         # Save the dataset to a NetCDF file
         print(f"Saving {filename}...")
-        datasets[thekey].to_netcdf(filename)
+        spectral_color_maps[thekey].to_netcdf(filename)
     print("Finished saving.")
     
     # Load your data
     #breakpoint()
-    red = nc.Dataset(rgb_filenames[0]).variables['red'][:]
-    green = nc.Dataset(rgb_filenames[1]).variables['green'][:]
-    blue = nc.Dataset(rgb_filenames[2]).variables['blue'][:]
-
+    #red = nc.Dataset(rgb_filenames[0]).variables['red'][:]
+    #green = nc.Dataset(rgb_filenames[1]).variables['green'][:]
+    #blue = nc.Dataset(rgb_filenames[2]).variables['blue'][:]
+    #Bypass loading from disk because that's broken for some reason:
+    red, green, blue = [spectral_color_maps[thekey].values for thekey in spectral_color_maps.data_vars]
+ 
     # Stack into an RGB image
     image = np.dstack((red, green, blue))
 
