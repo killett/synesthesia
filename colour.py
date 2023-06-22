@@ -1,18 +1,18 @@
+from PIL import Image
 import numpy as np
-from colour.colorimetry import MSDS_CMFS_STANDARD_OBSERVER
-from colour import SpectralDistribution, sd_to_XYZ
+import colour
 
-# Define your spectral power distribution data.
-wavelengths = np.arange(360, 781)  # For example, from 360 to 780 nm
-values = np.random.random_sample(len(wavelengths))  # Your actual SPD data here
+# Open image file
+im = Image.open('image.png')
 
-# Create a SpectralDistribution object
-spd = SpectralDistribution(values, wavelengths)
+# Convert image data to an array
+data = np.array(im)
 
-# Define the standard observer color matching functions.
-cmfs = MSDS_CMFS_STANDARD_OBSERVER['CIE 1931 2 Degree Standard Observer']
+# Normalise the RGB values
+rgb = data / 255.0
 
-# Compute the XYZ tristimulus values.
-XYZ = sd_to_XYZ(spd, cmfs)
+# Convert RGB to XYZ
+xyz = colour.sRGB_to_XYZ(rgb)
 
-print(XYZ)
+# Convert XYZ to Spectral Distribution
+sd = colour.recovery.XYZ_to_sd_Rayleigh_Scattering(xyz)
