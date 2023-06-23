@@ -19,6 +19,10 @@ import netCDF4 as nc
 
 from typing import Dict
 
+from colour.colorimetry import MSDS_CMFS_STANDARD_OBSERVER
+from colour import SpectralDistribution, sd_to_XYZ
+from colour import XYZ_to_sRGB
+
 outputfolder = os.path.join('.', 'output')
 if not os.path.exists(outputfolder):
     os.makedirs(outputfolder)
@@ -249,7 +253,7 @@ def synthetic_spectrum(cie,mu,sig):
 
     return spectrum
 
-def spectrum2xyz(spectrum, cie, normalization_factor):
+def spectrum2xyz_old(spectrum, cie, normalization_factor):
     xyz = {}
     wavelength_step_size = np.diff(cie['wavelength'].values).mean()  # Average wavelength step size
     for l in ['x', 'y', 'z']:
@@ -259,6 +263,22 @@ def spectrum2xyz(spectrum, cie, normalization_factor):
         xyz[l] = (temp_values.sum() * wavelength_step_size) / normalization_factor
     return xr.Dataset(xyz)
 
+def spectrum2xyz_new(spectrum, cie, normalization_factor):
+    # Create a SpectralDistribution object from the input xarray DataArray
+    spd = SpectralDistribution(spectrum['power'].values, spectrum.coords['wavelength'].values)
+
+    # Define the standard observer color matching functions.
+    cmfs = MSDS_CMFS_STANDARD_OBSERVER['CIE 1931 2 Degree Standard Observer']
+
+    # Compute the XYZ tristimulus values.
+    XYZ = sd_to_XYZ(spd, cmfs)
+
+    # Create a dataset for the XYZ values
+    xyz = xr.Dataset({'x': XYZ[0],
+                      'y': XYZ[1],
+                      'z': XYZ[2]})
+    return xyz
+
 def raise_y_to_power(xyz, power):
     power = 1 - power
     factor = pow(xyz['y'].values, power)
@@ -266,7 +286,7 @@ def raise_y_to_power(xyz, power):
         xyz[key].values /= factor
     return xyz
 
-def xyz2rgb(xyz):
+def xyz2rgb_old(xyz):
     A = np.array([[3.2409699, -1.5373832, -0.49861079],
                   [-0.96924375, 1.8759676, 0.041555082],
                   [0.055630032, -0.20397685, 1.0569714]])
@@ -275,21 +295,50 @@ def xyz2rgb(xyz):
 
     # Multiply A*xyz to obtain rgb
     rgb = np.dot(A, xyz_vector)
-
-    # If any values are < 0, add enough white light to make them all positive
-    min_val = rgb.min()
-    if min_val < 0:
-        min_val = -min_val + 1.0/255.0
-        factor = xyz['y'] / (xyz['y'] + min_val)
-        rgb = (rgb + min_val) * factor
-
-    # Normalize to [0, 1]
     rgb = {'red': rgb[0], 'green': rgb[1], 'blue': rgb[2]}
-    max_value = max(rgb.values())
-    for key in rgb:
-        rgb[key].values /= max_value
-    breakpoint()
     return xr.Dataset(rgb)
+
+def fix_gamut(rgb, xyz):
+    # Extract the RGB values
+    R = rgb['red'].values
+    G = rgb['green'].values
+    B = rgb['blue'].values
+    # Combine RGB into a numpy array
+    rgb_values = np.array([R, G, B])
+    
+    # If any values are < 0, add enough white light to make them all positive
+    min_val = rgb_values.min()
+    if min_val < 0:
+        #Make "min" positive as in paper's appendix, and add 1/255 so the rescale value isn't 0.
+        min_val = -min_val + 1.0/255.0
+        #This factor rescales the luminance back to its original value.
+        factor = xyz['y'].values / (xyz['y'].values + min_val)
+        rgb_values = (rgb_values + min_val) * factor
+    
+    # Normalize to [0, 1]
+    max_value = rgb_values.max()
+    rgb_values /= max_value
+
+    # Create a new xarray Dataset with the corrected RGB values
+    rgb_corrected = xr.Dataset({'red': rgb_values[0],
+                                'green': rgb_values[1],
+                                'blue': rgb_values[2]})
+    
+    return rgb_corrected
+
+def xyz2rgb_new(xyz):
+    # Extract the XYZ tristimulus values from the xyz dataset
+    XYZ = [xyz['x'].values, xyz['y'].values, xyz['z'].values]
+
+    # Convert the XYZ tristimulus values to sRGB values
+    RGB = XYZ_to_sRGB(XYZ)
+
+    # Create the xarray Dataset
+    rgb = xr.Dataset({'red': RGB[0],
+                      'green': RGB[1],
+                      'blue': RGB[2]})
+
+    return rgb
 
 def gamma_correct_rgb(rgb):
     gamma_inv = 0.45
@@ -1196,10 +1245,30 @@ if __name__ == "__main__":
 
     make_plots = 0
 
+    if 0:
+        spectrum2xyz = spectrum2xyz_old
+        xyz2rgb      = xyz2rgb_old
+    else:
+        spectrum2xyz = spectrum2xyz_new
+        xyz2rgb      = xyz2rgb_new
+        
     x_key = 'Time'
     y_key = 'SLA'
     min_period = 220
     max_period = 2000
+
+    if 1:
+        cie = load_cie_functions()
+        spectrum = synthetic_spectrum(cie, 420, 50)
+        if make_plots: plot_light_spectrum(spectrum,title="Synthetic spectrum")
+        print(f"{spectrum = }")
+        xyz = spectrum2xyz(spectrum, cie, 1.0)
+        print(f"{xyz = }")
+        rgb = xyz2rgb(xyz)
+        print(f"{rgb = }")
+        rgb = fix_gamut(rgb,xyz)
+        print(f"{rgb = }")
+        crashnow
 
     # Calculate the wavelength ratio
     #wavelength_ratio = cie['wavelength'].max() / cie['wavelength'].min()
