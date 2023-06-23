@@ -16,6 +16,7 @@ import datetime
 import time
 import timeit
 import netCDF4 as nc
+import argparse
 
 from typing import Dict
 
@@ -24,17 +25,22 @@ from colour import SpectralDistribution, sd_to_XYZ
 from colour import XYZ_to_sRGB
 
 outputfolder = os.path.join('.', 'output')
-if not os.path.exists(outputfolder):
-    os.makedirs(outputfolder)
-elif not os.path.isdir(outputfolder):
-    raise ValueError(f"{outputfolder} exists but is not a directory.")
-
 # Create output folder with current date
 date_str = datetime.datetime.now().strftime('%Y%m%d-%H%M%S')
 outputfolder = os.path.join(outputfolder,f"{date_str}")
-os.makedirs(outputfolder)
+parser = argparse.ArgumentParser()
+parser.add_argument('description', type=str, help='a description string encapsulated in quotes', default="", nargs='?')
+args = parser.parse_args()
+if args.description != "":
+    outputfolder += " - "+args.description
+os.mkdir(outputfolder)
 if not os.path.isdir(outputfolder):
     raise ValueError(f"!!! Problem creating {outputfolder}")
+
+if not os.path.exists(outputfolder):
+    os.mkdir(outputfolder)
+elif not os.path.isdir(outputfolder):
+    raise ValueError(f"{outputfolder} exists but is not a directory.")
 
 sshafolder = os.path.join('.', 'sealevel_spectra','newest_full_grids','netCDF4')
 
@@ -195,8 +201,6 @@ for file in files_to_copy:
 
 # Determine the path of the script that is currently running
 current_script_path = os.path.abspath(__file__)
-# Make sure the directory exists, create if necessary
-os.makedirs(outputfolder, exist_ok=True)
 # Create the name for the zip file
 zip_file_name = os.path.join(outputfolder, os.path.basename(current_script_path) + '.zip')
 # Zip up the python script
@@ -1237,6 +1241,59 @@ def finish_trim(trim_fp):
     trim_fp.write(b"  convert $current_base.png -trim $current_base.png\n")
     trim_fp.write(b"done\n")
 
+def run_gmt_scripts():
+    
+    #Internal Docker folder:
+    docker_internal_folder = '/home/jovyan'
+    # Define Docker internal script
+    docker_internal_filename = 'docker_internal.sh'
+    docker_internal_script = "#!/bin/bash\n" \
+                             "cp create_plots.sh Zbackup_create_plots.sh\n" \
+                             "cp projections.sh Zbackup_projections.sh\n" \
+                             "./create_plots.sh\n"
+    docker_internal_script = "#!/bin/bash\n" \
+                             "gmt grdmix red.nc green.nc blue.nc -C -Gcombined.tif:GTiff\n" \
+                             "echo '----- Environment Variables -----'\n" \
+                             "echo 'PATH: '\n" \
+                             "echo $PATH\n" \
+                             "echo 'LD_LIBRARY_PATH: '\n" \
+                             "echo $LD_LIBRARY_PATH\n" \
+                             "echo '----- Conda Environments -----'\n" \
+                             "/opt/conda/bin/conda env list\n" \
+                             "echo '----- Working Directory -----'\n" \
+                             "pwd\n" \
+                             "cp create_plots.sh Zbackup_create_plots.sh\n" \
+                             "cp projections.sh Zbackup_projections.sh\n" \
+                             "./create_plots.sh\n"
+    
+    # Define Docker external command
+    docker_command = f'docker run -e TZ=America/Los_Angeles -v {outputfolder}:{docker_internal_folder} -w {docker_internal_folder} grace/testing-bpr-grace2 {docker_internal_folder}/{docker_internal_filename}'
+    docker_command = f'docker run -it -e TZ=America/Los_Angeles -v .:{docker_internal_folder} -w {docker_internal_folder} grace/testing-bpr-grace2 /bin/bash'
+
+    docker_external_filename = 'docker_external.bat'
+    #Used to have this line in the docker_external_script before the docker command: @echo off
+    docker_external_script = f"""
+    {docker_command}
+    """
+
+    # Write Docker internal script
+    with open(os.path.join(outputfolder, docker_internal_filename), 'wb') as file:
+        file.write(docker_internal_script.encode())
+
+    # Write Docker external script
+    with open(os.path.join(outputfolder,docker_external_filename), 'w') as file:
+        file.write(docker_external_script)
+
+    # Change permissions of the Docker internal script
+    os.chmod(os.path.join(outputfolder, docker_internal_filename), 0o755)
+
+    # Run Docker external script
+    print(f"Opening an interactive shell. Run {docker_external_filename}, then run {docker_internal_filename}")
+    # Go to the outputfolder directory
+    os.chdir(outputfolder)
+    # Start an interactive shell
+    os.system('cmd')
+
 if __name__ == "__main__":
     plt.style.use('dark_background')
     plt.rcParams['font.size'] = 14  # Change the global font size
@@ -1257,7 +1314,7 @@ if __name__ == "__main__":
     min_period = 220
     max_period = 2000
 
-    if 1:
+    if 0:
         cie = load_cie_functions()
         spectrum = synthetic_spectrum(cie, 420, 50)
         if make_plots: plot_light_spectrum(spectrum,title="Synthetic spectrum")
@@ -1349,5 +1406,8 @@ if __name__ == "__main__":
     plt.savefig(os.path.join(outputfolder, 'image_matplotlib.png'), dpi=300)
 
     plt.close()
+
+    write_gmt_scripts(plot_options, grid, results)
+    run_gmt_scripts()
 
     print("!!!WARNING!!! Next line assumes these units are originally in ns and you want the units to be days!!!")
