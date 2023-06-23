@@ -17,6 +17,7 @@ import time
 import timeit
 import netCDF4 as nc
 import argparse
+import logging
 
 from typing import Dict
 
@@ -199,6 +200,39 @@ files_to_copy = ['projections.sh', 'overflow.sh', 'notation.sh']
 for file in files_to_copy:
     shutil.copy(file, outputfolder)
 
+def logging_setup(basename):
+  # Create a custom logger
+  global logger
+  logger = logging.getLogger("my_logger")
+  logger.setLevel(logging.DEBUG)
+  # Create a file handler
+  global now
+  now = datetime.datetime.now()
+  log_base = os.path.join(outputfolder,basename+"-log-"+now.strftime("%Y%m%d-%H%M%S"))
+  log_info = log_base+".out"
+  log_errors = log_base+".err"
+  # Create a file handler for debug and info messages
+  debug_info_handler = logging.FileHandler(log_info)
+  debug_info_handler.setLevel(logging.DEBUG)
+  # Create a file handler for warning, error, and critical messages
+  warning_error_handler = logging.FileHandler(log_errors)
+  warning_error_handler.setLevel(logging.WARNING)
+  # Create a stream handler (console)
+  console_handler = logging.StreamHandler()
+  console_handler.setLevel(logging.DEBUG)
+  # Set a log format
+  log_format = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
+  # Apply the format to all handlers
+  debug_info_handler.setFormatter(log_format)
+  warning_error_handler.setFormatter(log_format)
+  console_handler.setFormatter(log_format)
+  # Add the handlers to the logger
+  logger.addHandler(debug_info_handler)
+  logger.addHandler(warning_error_handler)
+  logger.addHandler(console_handler)
+
+logging_setup("spectral_colors")
+
 # Determine the path of the script that is currently running
 current_script_path = os.path.abspath(__file__)
 # Create the name for the zip file
@@ -206,7 +240,7 @@ zip_file_name = os.path.join(outputfolder, os.path.basename(current_script_path)
 # Zip up the python script
 with zipfile.ZipFile(zip_file_name, 'w') as zipf:
     zipf.write(current_script_path, arcname=os.path.basename(current_script_path))
-print(f'Successfully zipped {current_script_path} to {zip_file_name}')
+logger.info(f'Successfully zipped {current_script_path} to {zip_file_name}')
 
 def load_cie_functions():
     file = os.path.join('.', 'sealevel_spectra', 'ciexyz31_1_trimmed_400nm_700nm.csv')
@@ -232,7 +266,7 @@ def load_cie_functions():
                     data[list(data.keys())[i]].append(float(val))
 
     except IOError:
-        print(f"The CIE file, {file}, failed to open.")
+        logger.error(f"The CIE file, {file}, failed to open.")
 
     da = xr.Dataset(
         {var: ('wavelength', data[var]) for var in data},
@@ -277,11 +311,10 @@ def spectrum2xyz_new(spectrum, cie, normalization_factor):
     # Compute the XYZ tristimulus values.
     XYZ = sd_to_XYZ(spd, cmfs)
 
-    # Create a dataset for the XYZ values
-    xyz = xr.Dataset({'x': XYZ[0],
+    # Return a dataset of the XYZ values
+    return xr.Dataset({'x': XYZ[0],
                       'y': XYZ[1],
                       'z': XYZ[2]})
-    return xyz
 
 def raise_y_to_power(xyz, power):
     power = 1 - power
@@ -300,35 +333,9 @@ def xyz2rgb_old(xyz):
     # Multiply A*xyz to obtain rgb
     rgb = np.dot(A, xyz_vector)
     rgb = {'red': rgb[0], 'green': rgb[1], 'blue': rgb[2]}
-    return xr.Dataset(rgb)
-
-def fix_gamut(rgb, xyz):
-    # Extract the RGB values
-    R = rgb['red'].values
-    G = rgb['green'].values
-    B = rgb['blue'].values
-    # Combine RGB into a numpy array
-    rgb_values = np.array([R, G, B])
-    
-    # If any values are < 0, add enough white light to make them all positive
-    min_val = rgb_values.min()
-    if min_val < 0:
-        #Make "min" positive as in paper's appendix, and add 1/255 so the rescale value isn't 0.
-        min_val = -min_val + 1.0/255.0
-        #This factor rescales the luminance back to its original value.
-        factor = xyz['y'].values / (xyz['y'].values + min_val)
-        rgb_values = (rgb_values + min_val) * factor
-    
-    # Normalize to [0, 1]
-    max_value = rgb_values.max()
-    rgb_values /= max_value
-
-    # Create a new xarray Dataset with the corrected RGB values
-    rgb_corrected = xr.Dataset({'red': rgb_values[0],
-                                'green': rgb_values[1],
-                                'blue': rgb_values[2]})
-    
-    return rgb_corrected
+    # Merge the original and new datasets
+    result = xr.merge([xyz, rgb])
+    return result
 
 def xyz2rgb_new(xyz):
     # Extract the XYZ tristimulus values from the xyz dataset
@@ -342,8 +349,39 @@ def xyz2rgb_new(xyz):
                       'green': RGB[1],
                       'blue': RGB[2]})
 
-    return rgb
+    # Merge the original and new datasets
+    result = xr.merge([xyz, rgb])
+    return result
 
+def fix_gamut(rgb):
+    # Extract the RGB values
+    R = rgb['red'].values
+    G = rgb['green'].values
+    B = rgb['blue'].values
+    # Combine RGB into a numpy array
+    rgb_values = np.array([R, G, B])
+    
+    # If any values are < 0, add enough white light to make them all positive
+    min_val = rgb_values.min()
+    if min_val < 0:
+        #Make "min" positive as in paper's appendix, and add 1/255 so the rescale value isn't 0.
+        min_val = -min_val + 1.0/255.0
+        #This factor rescales the luminance back to its original value.
+        factor = rgb['y'].values / (rgb['y'].values + min_val)
+        rgb_values = (rgb_values + min_val) * factor
+    
+    # Normalize to [0, 1]
+    max_value = rgb_values.max()
+    rgb_values /= max_value
+
+    # Create a new xarray Dataset with the corrected RGB values
+    return xr.Dataset({'red': rgb_values[0],
+                       'green': rgb_values[1],
+                       'blue': rgb_values[2],
+                       'x': rgb['x'],
+                       'y': rgb['y'],
+                       'z': rgb['z']})
+    
 def gamma_correct_rgb(rgb):
     gamma_inv = 0.45
     crit = 0.018  # RGB values are gamma corrected differently below and above crit.
@@ -369,20 +407,20 @@ def synthetic_timeseries(signal='annual', signal_amplitude=1, noise='white', noi
     elif temporal_resolution == 'daily':
         dates = pd.date_range(start=time_start, end=time_stop, freq='D')
     else:
-        print(f"!!!WARNING!!! {temporal_resolution = }")
+        logger.error(f"!!!WARNING!!! {temporal_resolution = }")
 
     # Generate signal
     if signal == 'annual':
         t = (dates - time_start).days / 365.25
         signal_values = signal_amplitude * np.sin(2 * np.pi * t)
     else:
-        print(f"!!!WARNING!!! {signal = }")
+        logger.error(f"!!!WARNING!!! {signal = }")
 
     # Generate noise
     if noise == 'white':
         noise_values = noise_level * np.random.randn(len(dates))
     else:
-        print(f"!!!WARNING!!! {noise = }")
+        logger.error(f"!!!WARNING!!! {noise = }")
 
     # Combine signal and noise
     measurements = signal_values + noise_values
@@ -396,7 +434,7 @@ def synthetic_timeseries(signal='annual', signal_amplitude=1, noise='white', noi
     return ds
 
 def fancy_detrend(timeseries, x_key, y_key, terms=['constant', 'trend']):
-    #print("!!!WARNING!!! Next line assumes these units are originally in ns and you want the units to be days!!!")
+    #logger.error("!!!WARNING!!! Next line assumes these units are originally in ns and you want the units to be days!!!")
     x = (timeseries[x_key] - timeseries[x_key][0]).values.astype(float) / (24*3600*1e9)
     y = timeseries[y_key].values
 
@@ -428,7 +466,7 @@ def fancy_detrend(timeseries, x_key, y_key, terms=['constant', 'trend']):
     return detrended_timeseries, fits
 
 def turn_fits_into_timeseries(timeseries, x_key, y_key, fits):
-    #print("!!!WARNING!!! Next line assumes these units are originally in ns and you want the units to be days!!!")
+    #logger.error("!!!WARNING!!! Next line assumes these units are originally in ns and you want the units to be days!!!")
     x = (timeseries[x_key] - timeseries[x_key][0]).values.astype(float) / (24*3600*1e9)
     fitted_values = np.zeros_like(x)
 
@@ -447,7 +485,7 @@ def turn_fits_into_timeseries(timeseries, x_key, y_key, fits):
 
 def nfft_power(ds):
     # Convert datetime index to numeric (we use 'day' as the unit)
-    #print("!!!WARNING!!! Next line assumes these units are originally in ns and you want the units to be days!!!")
+    #logger.error("!!!WARNING!!! Next line assumes these units are originally in ns and you want the units to be days!!!")
     x = (ds[x_key] - ds[x_key][0]).values.astype(float) / (24*3600*1e9)
     y = ds[y_key]
 
@@ -459,10 +497,10 @@ def nfft_power(ds):
         x_min = np.min(x)
         x_range = np.max(x) - np.min(x)
         x_norm = (x - x_min) / x_range - 0.5
-        #print(f"{N = }, {x_min = }, {x_range = }")
+        #logger.info(f"{N = }, {x_min = }, {x_range = }")
         if N % 2:
-            print(f"!!! WARNING!!! LENGTH NEEDS TO BE EVEN FOR NFFT, BUT: {len(x) = }")
-            print(f"!!! DELETING LAST DATA POINT!")
+            logger.error(f"!!! WARNING!!! LENGTH NEEDS TO BE EVEN FOR NFFT, BUT: {len(x) = }")
+            logger.error(f"!!! DELETING LAST DATA POINT!")
             x = np.delete(x, -1)
             y = np.delete(y, -1)
 
@@ -503,7 +541,7 @@ def convert_spectrum_from_frequency_to_period(ds):
     if freq_units in units_map:
         period.attrs['units'] = units_map[freq_units]
     else:
-        print(f"!!!WARNING!!! DID NOT RECOGNIZE {freq_units = }")
+        logger.error(f"!!!WARNING!!! DID NOT RECOGNIZE {freq_units = }")
 
     # Create a new Dataset with the same variables but with an additional 'period' data variable
     new_ds = ds.assign_coords(period=('frequency', period.data))  # use .data to get the underlying numpy array
@@ -612,13 +650,13 @@ def load_ssha_files(tskip=1):
     tskip_files = sshafiles[::tskip]
 
     # Load all files into the same dataset
-    print(f"Loading {len(tskip_files)} SSHA files...")
+    logger.info(f"Loading {len(tskip_files)} SSHA files...")
     ds = xr.open_mfdataset(tskip_files, combine='by_coords')
 
     return ds
 
 def extract_ssha_timeseries(ds, lat = 30, lon = 135):
-    print(f"Extracting SSHA timeseries at {lat = } and {lon = }")
+    logger.info(f"Extracting SSHA timeseries at {lat = } and {lon = }")
 
     # Convert the longitude to the range 0-360 if it's in -180 to 180
     if lon < 0:
@@ -637,7 +675,7 @@ def extract_ssha_timeseries(ds, lat = 30, lon = 135):
     return ds
 
 def timeseries_to_xyz(timeseries, x_key, y_key, min_period, max_period):
-    #print(f"{timeseries.keys() = }")
+    #logger.info(f"{timeseries.keys() = }")
     timeseries, fits = fancy_detrend(timeseries, x_key, y_key, terms=['constant', 'trend', 'accel'])
 
     if make_plots: plot_timeseries(timeseries,title="Detrended time series")
@@ -651,16 +689,16 @@ def timeseries_to_xyz(timeseries, x_key, y_key, min_period, max_period):
 
     power_spectrum = convert_spectrum_from_frequency_to_period(power_spectrum)
     
-    #print(f"{min_period = } and {np.max(power_spectrum.period.values) = }")
+    #logger.info(f"{min_period = } and {np.max(power_spectrum.period.values) = }")
     if min_period < np.min(power_spectrum.period.values) or min_period >= np.max(power_spectrum.period.values):
-        #print(f"!!! WARNING!!! originally {min_period = } but {np.min(power_spectrum.period.values) = } and {np.max(power_spectrum.period.values) = }")
+        #logger.error(f"!!! WARNING!!! originally {min_period = } but {np.min(power_spectrum.period.values) = } and {np.max(power_spectrum.period.values) = }")
         min_period = np.min(power_spectrum.period.values)
-        #print(f"So now {min_period = } which equals {np.min(power_spectrum.period.values) = }")
-    #print(f"{max_period = } and {np.max(power_spectrum.period.values) = }")
+        #logger.error(f"So now {min_period = } which equals {np.min(power_spectrum.period.values) = }")
+    #logger.info(f"{max_period = } and {np.max(power_spectrum.period.values) = }")
     if max_period <= np.min(power_spectrum.period.values) or max_period > np.max(power_spectrum.period.values):
-        #print(f"!!! WARNING!!! originally {max_period = } but {np.min(power_spectrum.period.values) = } and {np.max(power_spectrum.period.values) = }")
+        #logger.error(f"!!! WARNING!!! originally {max_period = } but {np.min(power_spectrum.period.values) = } and {np.max(power_spectrum.period.values) = }")
         max_period = np.max(power_spectrum.period.values)
-        #print(f"So now {max_period = } which equals {np.max(power_spectrum.period.values) = }")
+        #logger.error(f"So now {max_period = } which equals {np.max(power_spectrum.period.values) = }")
     signal_period = 365.25
     #power_spectrum = power_spectrum.where((power_spectrum.period > signal_period * 0.2) & (power_spectrum.period < signal_period * 3), drop=True)
 
@@ -670,21 +708,21 @@ def timeseries_to_xyz(timeseries, x_key, y_key, min_period, max_period):
 
     mapped_spectrum = map_power_spectrum(cie, power_spectrum, min_period = min_period, max_period = max_period)
     
-    #print(f"{mapped_spectrum = }")
+    #logger.info(f"{mapped_spectrum = }")
         
     if make_plots: plot_light_spectrum(mapped_spectrum,title="Light spectrum")
 
-    #print(f"{cie = }")
+    #logger.info(f"{cie = }")
     #spectrum = synthetic_spectrum(cie, 530, 30)
     spectrum = mapped_spectrum
-    #print(f"{spectrum = }")
+    #logger.info(f"{spectrum = }")
     xyz = spectrum2xyz(spectrum, cie, 1.0)
-    #print(f"{xyz = }")
+    #logger.info(f"{xyz = }")
     thepower = 1.0
-    #print(f"Before raising y to power {thepower}: {xyz = }")
+    #logger.info(f"Before raising y to power {thepower}: {xyz = }")
     raise_y_to_power(xyz, thepower)
-    #print(f"After  raising y to power {thepower}: {xyz = }")
-    return xr.Dataset(xyz)
+    #logger.info(f"After  raising y to power {thepower}: {xyz = }")
+    return xyz
 
 # Define your function, that returns a Dataset
 def rms_and_mean(x):
@@ -699,7 +737,7 @@ def write_gmt_scripts(plot_options, grid, results):
     try:
         new_fp = open(new_file, 'wb')
     except IOError:
-        print("The create_plots.sh GMT script couldn't be created.")
+        logger.error("The create_plots.sh GMT script couldn't be created.")
 
     # Every bash script needs this to be the first line.
     new_fp.write(b"#!/bin/bash\n")
@@ -710,7 +748,7 @@ def write_gmt_scripts(plot_options, grid, results):
     try:
         flip_fp = open(flip_file, 'wb')
     except IOError:
-        print("The flip_backgrounds.sh script couldn't be created.")
+        logger.error("The flip_backgrounds.sh script couldn't be created.")
 
     # Every bash script needs this to be the first line.
     flip_fp.write(b"#!/bin/bash\n")
@@ -721,7 +759,7 @@ def write_gmt_scripts(plot_options, grid, results):
     try:
         trim_fp = open(trim_file, 'wb')
     except IOError:
-        print("The trim.sh script couldn't be created.")
+        logger.error("The trim.sh script couldn't be created.")
 
     # Every bash script needs this to be the first line.
     trim_fp.write(b"#!/bin/bash\n")
@@ -823,7 +861,7 @@ def write_gmt_scripts(plot_options, grid, results):
     try:
         extra_fp = open(extra_file, 'wb')
     except IOError:
-        print("The animate.sh script couldn't be created.")
+        logger.error("The animate.sh script couldn't be created.")
 
     # Every bash script needs this to be the first line.
     extra_fp.write(b"#!/bin/bash\n")
@@ -844,7 +882,7 @@ def write_gmt_scripts(plot_options, grid, results):
     try:
         extra_fp = open(extra_file, 'wb')
     except IOError:
-        print("The montage.sh script couldn't be created.")
+        logger.error("The montage.sh script couldn't be created.")
 
     # Every bash script needs this to be the first line.
     extra_fp.write(b"#!/bin/bash\n")
@@ -887,7 +925,7 @@ def is_polar(results: Dict, grid: Dict) -> int:
         results['maxlon'] = max(results['latlon']['lon'])
         
     else:
-        print(f"!!!!WARNING!!!!!! results['options']['output_choice'] {results['options']['output_choice']} isn't recognized.")
+        logger.error(f"!!!!WARNING!!!!!! results['options']['output_choice'] {results['options']['output_choice']} isn't recognized.")
         
     if results['minlat'] < 0 and results['maxlat'] > 0:
         polar = 0
@@ -951,7 +989,7 @@ def write_rgb_colorscale(results, cie, plot_options, verbose):
         new_file = plot_options['outputfolder'] + "rgb00001.cpt"
         with open(new_file, 'w') as new_fp:
             new_fp.write(b"# COLOR_MODEL = RGB\n")
-            print("Writing RGB colorscale to disk.")
+            logger.info("Writing RGB colorscale to disk.")
             for i in range(len(results['xy']['x_values'][0][0])):
                 copy = results
                 create_synthetic_plot(copy,20,0,0,0,results['xy']['x_values'][0][0][i],0.2)
@@ -971,7 +1009,7 @@ def write_rgb_colorscale(results, cie, plot_options, verbose):
         try:
             with open(new_file, 'w') as new_fp:
                 new_fp.write(b"# COLOR_MODEL = RGB\n")
-                print("Writing RGB colorscale to disk.")
+                logger.info("Writing RGB colorscale to disk.")
                 
                 hw = 2 * (results['xy']['x_values'][0][0][1] - results['xy']['x_values'][0][0][0])
                 all['options']['output_choice'] = 5
@@ -1000,9 +1038,9 @@ def write_rgb_colorscale(results, cie, plot_options, verbose):
                         results['xy']['x_values'][0][0][i], int(all['latlon']['outputs'][0][i][j]), int(all['latlon']['outputs'][1][i][j]), int(all['latlon']['outputs'][2][i][j])
                     ))
         except Exception as e:
-            print(f"The rgb00001.cpt file couldn't be created due to the following error: {e}")
+            logger.error(f"The rgb00001.cpt file couldn't be created due to the following error: {e}")
 
-    else: print(f"!!!WARNING!!! Didn't recognize {results['rgb_choice'] = }")
+    else: logger.error(f"!!!WARNING!!! Didn't recognize {results['rgb_choice'] = }")
 
 def write_gmt_map_data(results, grid, plot_options, new_fp, title, i):
     """
@@ -1041,7 +1079,7 @@ def write_gmt_map_data(results, grid, plot_options, new_fp, title, i):
             new_fp.write(b'resolution=" -E50 " #50/2000 is low/high quality.\n')
             new_fp.write(b'coast_res=" -Di+ "\n')
         else:
-            print(f"!!!!WARNING!!!!!! results['options']['output_choice'] {results['options']['output_choice']} isn't recognized.")
+            logger.error(f"!!!!WARNING!!!!!! results['options']['output_choice'] {results['options']['output_choice']} isn't recognized.")
 
         new_fp.write(b'coast_res_orig=$coast_res #Don\'t want USA maps to repeatedly add -N2.\n')
         new_fp.write(b'coast_thk="0.6"\n')
@@ -1139,7 +1177,7 @@ def write_gmt_map_data(results, grid, plot_options, new_fp, title, i):
         new_fp.write(b"units_pos=\" -Xa${units_x}c -Ya${units_y}c \"\n")
         new_fp.write(b"blurb_pos=\" -Xa${blurb_x}c -Ya${blurbs_y}c \"\n")
         new_fp.write(b"blurb2_pos=\" -Xa${blurb2_x}c -Ya${blurbs_y}c \"\n")
-    else: print("!!!WARNING!!! NO TITLE!")
+    else: logger.error("!!!WARNING!!! NO TITLE!")
 
     # Plot data, with title on top.
     new_fp.write(f"title=\"{title}\"\n".encode())
@@ -1288,7 +1326,7 @@ def run_gmt_scripts():
     os.chmod(os.path.join(outputfolder, docker_internal_filename), 0o755)
 
     # Run Docker external script
-    print(f"Opening an interactive shell. Run {docker_external_filename}, then run {docker_internal_filename}")
+    logger.info(f"Opening an interactive shell. Run {docker_external_filename}, then run {docker_internal_filename}")
     # Go to the outputfolder directory
     os.chdir(outputfolder)
     # Start an interactive shell
@@ -1302,7 +1340,7 @@ if __name__ == "__main__":
 
     make_plots = 0
 
-    if 0:
+    if 1:
         spectrum2xyz = spectrum2xyz_old
         xyz2rgb      = xyz2rgb_old
     else:
@@ -1316,15 +1354,15 @@ if __name__ == "__main__":
 
     if 0:
         cie = load_cie_functions()
-        spectrum = synthetic_spectrum(cie, 420, 50)
+        spectrum = synthetic_spectrum(cie, 550, 5)
         if make_plots: plot_light_spectrum(spectrum,title="Synthetic spectrum")
-        print(f"{spectrum = }")
+        logger.info(f"{spectrum = }")
         xyz = spectrum2xyz(spectrum, cie, 1.0)
-        print(f"{xyz = }")
+        logger.info(f"{xyz = }")
         rgb = xyz2rgb(xyz)
-        print(f"{rgb = }")
-        rgb = fix_gamut(rgb,xyz)
-        print(f"{rgb = }")
+        logger.info(f"{rgb = }")
+        rgb = fix_gamut(rgb)
+        logger.info(f"{rgb = }")
         crashnow
 
     # Calculate the wavelength ratio
@@ -1332,32 +1370,47 @@ if __name__ == "__main__":
     # Calculate the max_period
     #max_period = min_period * wavelength_ratio
 
-    ds = load_ssha_files(tskip=1)
+    input_data = load_ssha_files(tskip=1)
     xskip = 192
-    print(f"Grabbing one lat/lon point in every {xskip**2} points...",end="")
-    ds = ds.isel(Latitude=slice(None, None, xskip), Longitude=slice(None, None, xskip))
-    print(" done.")
+    logger.info(f"Grabbing one lat/lon point in every {xskip**2} points...")
+    input_data = input_data.isel(Latitude=slice(None, None, xskip), Longitude=slice(None, None, xskip))
+    logger.info(" done.")
     #breakpoint()
     
     # Check if the size of x_key dimension is odd
-    if ds.dims[x_key] % 2 == 1:
-        print(f"!!! WARNING!!! LENGTH NEEDS TO BE EVEN FOR NFFT, BUT: {ds.dims[x_key] = }")
-        print(f"!!! DELETING LAST DATA POINT!")
+    if input_data.dims[x_key] % 2 == 1:
+        logger.error(f"!!! WARNING!!! LENGTH NEEDS TO BE EVEN FOR NFFT, BUT: {input_data.dims[x_key] = }")
+        logger.error(f"!!! DELETING LAST DATA POINT!")
         # If it is, select all elements up to the second last one
-        ds = ds.isel({x_key: slice(None, -1)})
+        input_data = input_data.isel({x_key: slice(None, -1)})
 
     # Time the code
     start_time = timeit.default_timer()
-    print("Starting map operation WITHOUT dask...")
+    logger.info("Starting map operation WITHOUT dask...")
 
     # Stack 'Latitude' and 'Longitude' into a new single dimension 'position'
-    stacked = ds.stack(position=['Latitude', 'Longitude'])
+    stacked = input_data.stack(position=['Latitude', 'Longitude'])
 
     # Create a new function with min_period and max_period filled
     timeseries_to_xyz_partial = functools.partial(timeseries_to_xyz, x_key=x_key, y_key=y_key, min_period=min_period, max_period=max_period)
 
-    # Apply the function to the 'SLA' variable of the stacked dataset
+    # Apply the function to the 'y_key' variable of the stacked dataset
     result = stacked.groupby('position').map(timeseries_to_xyz_partial)
+
+    # Find the maximum 'y' value
+    max_y = result['y'].max()
+
+    # Print the maximum 'y' value
+    logger.info(f"The highest value of 'y' is: {max_y.item()}")
+
+    # Divide all 'y' values by the maximum 'y' value
+    result['y'] = result['y'] / max_y
+
+    #Convert to RGB, but keep XYZ values around.
+    logger.info("Converting to RGB...")
+    result = result.groupby('position').map(xyz2rgb)
+    logger.info("Fixing RGB out-of-gamut values and normalizing...")
+    result = result.groupby('position').map(fix_gamut)
 
     # Unstack all variables and keep as a dataset
     spectral_color_maps = xr.Dataset({key: result[key].unstack('position') for key in result.data_vars})
@@ -1368,11 +1421,11 @@ if __name__ == "__main__":
     # Calculate the time taken
     time_taken = end_time - start_time
 
-    print(f"Time taken WITHOUT DASK: {time_taken:.2f} seconds")
+    logger.info(f"Time taken WITHOUT DASK: {time_taken:.2f} seconds")
 
     #Normalize RGB values:
     #max_value = max(np.nanmax(val.values) for val in spectral_color_maps.values())
-    #print(f"Rescaling RGB values: dividing by {max_value}")
+    #logger.info(f"Rescaling RGB values: dividing by {max_value}")
     #for key in spectral_color_maps:
     #    spectral_color_maps[key] = spectral_color_maps[key] / max_value
 
@@ -1384,20 +1437,12 @@ if __name__ == "__main__":
         rgb_filenames.append(filename)
         
         # Save the dataset to a NetCDF file
-        print(f"Saving {filename}...")
+        logger.info(f"Saving {filename}...")
         spectral_color_maps[thekey].to_netcdf(filename)
-    print("Finished saving.")
-    
-    # Load your data
-    #breakpoint()
-    #red = nc.Dataset(rgb_filenames[0]).variables['red'][:]
-    #green = nc.Dataset(rgb_filenames[1]).variables['green'][:]
-    #blue = nc.Dataset(rgb_filenames[2]).variables['blue'][:]
-    #Bypass loading from disk because that's broken for some reason:
-    red, green, blue = [spectral_color_maps[thekey].values for thekey in spectral_color_maps.data_vars]
- 
+    logger.info("Finished saving.")
+     
     # Stack into an RGB image
-    image = np.dstack((red, green, blue))
+    image = np.dstack((spectral_color_maps['red'].values, spectral_color_maps['green'].values, spectral_color_maps['blue'].values))
 
     # Display the image
     plt.imshow(image, origin='lower')
@@ -1410,4 +1455,5 @@ if __name__ == "__main__":
     write_gmt_scripts(plot_options, grid, results)
     run_gmt_scripts()
 
-    print("!!!WARNING!!! Next line assumes these units are originally in ns and you want the units to be days!!!")
+    logger.error("!!!WARNING!!! Next line assumes these units are originally in ns and you want the units to be days!!!")
+    logger.info("All finished!")
