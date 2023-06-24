@@ -200,36 +200,36 @@ files_to_copy = ['projections.sh', 'overflow.sh', 'notation.sh']
 for file in files_to_copy:
     shutil.copy(file, outputfolder)
 
-def logging_setup(basename):
-  # Create a custom logger
-  global logger
-  logger = logging.getLogger("my_logger")
-  logger.setLevel(logging.DEBUG)
-  # Create a file handler
-  global now
-  now = datetime.datetime.now()
-  log_base = os.path.join(outputfolder,basename+"-log-"+now.strftime("%Y%m%d-%H%M%S"))
-  log_info = log_base+".out"
-  log_errors = log_base+".err"
-  # Create a file handler for debug and info messages
-  debug_info_handler = logging.FileHandler(log_info)
-  debug_info_handler.setLevel(logging.DEBUG)
-  # Create a file handler for warning, error, and critical messages
-  warning_error_handler = logging.FileHandler(log_errors)
-  warning_error_handler.setLevel(logging.WARNING)
-  # Create a stream handler (console)
-  console_handler = logging.StreamHandler()
-  console_handler.setLevel(logging.DEBUG)
-  # Set a log format
-  log_format = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
-  # Apply the format to all handlers
-  debug_info_handler.setFormatter(log_format)
-  warning_error_handler.setFormatter(log_format)
-  console_handler.setFormatter(log_format)
-  # Add the handlers to the logger
-  logger.addHandler(debug_info_handler)
-  logger.addHandler(warning_error_handler)
-  logger.addHandler(console_handler)
+def logging_setup(basename: str):
+    # Create a custom logger
+    global logger
+    logger = logging.getLogger("my_logger")
+    logger.setLevel(logging.DEBUG)
+    # Create a file handler
+    global now
+    now = datetime.datetime.now()
+    log_base = os.path.join(outputfolder,basename+"-log-"+now.strftime("%Y%m%d-%H%M%S"))
+    log_info = log_base+".out"
+    log_errors = log_base+".err"
+    # Create a file handler for debug and info messages
+    debug_info_handler = logging.FileHandler(log_info)
+    debug_info_handler.setLevel(logging.DEBUG)
+    # Create a file handler for warning, error, and critical messages
+    warning_error_handler = logging.FileHandler(log_errors)
+    warning_error_handler.setLevel(logging.WARNING)
+    # Create a stream handler (console)
+    console_handler = logging.StreamHandler()
+    console_handler.setLevel(logging.DEBUG)
+    # Set a log format
+    log_format = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
+    # Apply the format to all handlers
+    debug_info_handler.setFormatter(log_format)
+    warning_error_handler.setFormatter(log_format)
+    console_handler.setFormatter(log_format)
+    # Add the handlers to the logger
+    logger.addHandler(debug_info_handler)
+    logger.addHandler(warning_error_handler)
+    logger.addHandler(console_handler)
 
 logging_setup("spectral_colors")
 
@@ -242,7 +242,7 @@ with zipfile.ZipFile(zip_file_name, 'w') as zipf:
     zipf.write(current_script_path, arcname=os.path.basename(current_script_path))
 logger.info(f'Successfully zipped {current_script_path} to {zip_file_name}')
 
-def load_cie_functions():
+def load_cie_functions() -> xr.Dataset:
     file = os.path.join('.', 'sealevel_spectra', 'ciexyz31_1_trimmed_400nm_700nm.csv')
     #file = os.path.join('.', 'sealevel_spectra', 'ciexyz31_1_trimmed_380nm_760nm.csv') #Matches Hughes and Williams 2010
 
@@ -281,7 +281,7 @@ def load_cie_functions():
 def gaussian(x, mu, sig):
     return np.exp(-np.power(x - mu, 2.) / (2 * np.power(sig, 2.)))
 
-def synthetic_spectrum(cie,mu,sig):
+def synthetic_spectrum(cie,mu,sig) -> xr.Dataset:
 
     wavelengths = cie.coords['wavelength'].values
     power = gaussian(wavelengths, mu, sig)
@@ -291,7 +291,7 @@ def synthetic_spectrum(cie,mu,sig):
 
     return spectrum
 
-def spectrum2xyz_old(spectrum, cie):
+def spectrum2xyz_old(spectrum, cie) -> xr.Dataset:
     xyz = {}
     wavelength_step_size = np.diff(cie['wavelength'].values).mean()  # Average wavelength step size
     for l in ['x', 'y', 'z']:
@@ -301,7 +301,7 @@ def spectrum2xyz_old(spectrum, cie):
         xyz[l] = (temp_values.sum() * wavelength_step_size)
     return xr.Dataset(xyz)
 
-def spectrum2xyz_new(spectrum, cie):
+def spectrum2xyz_new(spectrum, cie) -> xr.Dataset:
     # Create a SpectralDistribution object from the input xarray DataArray
     spd = SpectralDistribution(spectrum['power'].values, spectrum.coords['wavelength'].values)
 
@@ -316,14 +316,14 @@ def spectrum2xyz_new(spectrum, cie):
                       'y': XYZ[1],
                       'z': XYZ[2]})
 
-def raise_y_to_power(xyz, power):
+def raise_y_to_power(xyz, power) -> xr.Dataset:
     power = 1 - power
     factor = pow(xyz['y'].values, power)
     for key in xyz.data_vars:
         xyz[key].values /= factor
     return xyz
 
-def xyz2rgb_old(xyz):
+def xyz2rgb_old(xyz) -> xr.Dataset:
     A = np.array([[3.2409699, -1.5373832, -0.49861079],
                   [-0.96924375, 1.8759676, 0.041555082],
                   [0.055630032, -0.20397685, 1.0569714]])
@@ -338,7 +338,7 @@ def xyz2rgb_old(xyz):
     logger.info(f"xyz2rgb_old: {result = }")
     return result
 
-def xyz2rgb_new(xyz):
+def xyz2rgb_new(xyz) -> xr.Dataset:
     # Extract the XYZ tristimulus values from the xyz dataset
     XYZ = [xyz['x'].values, xyz['y'].values, xyz['z'].values]
 
@@ -355,7 +355,7 @@ def xyz2rgb_new(xyz):
     logger.info(f"xyz2rgb_new: {result = }")
     return result
 
-def fix_gamut(rgb):
+def fix_gamut(rgb) -> xr.Dataset:
     # Extract the RGB values
     R = rgb['red'].values
     G = rgb['green'].values
@@ -385,7 +385,7 @@ def fix_gamut(rgb):
                           'blue': rgb_values[2]})
     logger.info(f"fix_gamut: {result = }")
     
-def gamma_correct_rgb(rgb):
+def gamma_correct_rgb(rgb) -> xr.Dataset:
     gamma_inv = 0.45
     crit = 0.018  # RGB values are gamma corrected differently below and above crit.
     h = 4.506813168
@@ -403,7 +403,7 @@ def gamma_correct_rgb(rgb):
 
 def synthetic_timeseries(signal='annual', signal_amplitude=1, noise='white', noise_level=0.1, 
                          temporal_resolution='monthly', time_start=datetime.datetime(2001, 1, 1), 
-                         time_stop=datetime.datetime(2005, 1, 1)):
+                         time_stop=datetime.datetime(2005, 1, 1)) -> xr.Dataset:
     # Generate time series
     if temporal_resolution == 'monthly':
         dates = pd.date_range(start=time_start, end=time_stop, freq='M') + pd.Timedelta(days=15)
@@ -428,13 +428,10 @@ def synthetic_timeseries(signal='annual', signal_amplitude=1, noise='white', noi
     # Combine signal and noise
     measurements = signal_values + noise_values
 
-    # Create xarray dataset
-    ds = xr.Dataset(
+    return xr.Dataset(
         {y_key: (x_key, measurements)},
         coords={x_key: dates}
     )
-
-    return ds
 
 def fancy_detrend(timeseries, x_key, y_key, terms=['constant', 'trend']):
     #logger.error("!!!WARNING!!! Next line assumes these units are originally in ns and you want the units to be days!!!")
@@ -468,7 +465,7 @@ def fancy_detrend(timeseries, x_key, y_key, terms=['constant', 'trend']):
 
     return detrended_timeseries, fits
 
-def turn_fits_into_timeseries(timeseries, x_key, y_key, fits):
+def turn_fits_into_timeseries(timeseries, x_key, y_key, fits) -> xr.Dataset:
     #logger.error("!!!WARNING!!! Next line assumes these units are originally in ns and you want the units to be days!!!")
     x = (timeseries[x_key] - timeseries[x_key][0]).values.astype(float) / (24*3600*1e9)
     fitted_values = np.zeros_like(x)
@@ -486,11 +483,11 @@ def turn_fits_into_timeseries(timeseries, x_key, y_key, fits):
 
     return fitted_timeseries
 
-def nfft_power(ds):
+def nfft_power(timeseries) -> xr.Dataset:
     # Convert datetime index to numeric (we use 'day' as the unit)
     #logger.error("!!!WARNING!!! Next line assumes these units are originally in ns and you want the units to be days!!!")
-    x = (ds[x_key] - ds[x_key][0]).values.astype(float) / (24*3600*1e9)
-    y = ds[y_key]
+    x = (timeseries[x_key] - timeseries[x_key][0]).values.astype(float) / (24*3600*1e9)
+    y = timeseries[y_key]
 
     #If timeseries has an odd number of points,
     #remove the last data point, then calculate min, range.
@@ -526,19 +523,19 @@ def nfft_power(ds):
     power_spectrum_da = xr.DataArray(power_spectrum, coords=[('frequency', xf_half)], name='power')
 
     # Convert this DataArray to a Dataset
-    ds = power_spectrum_da.to_dataset()
-    ds['frequency'].attrs['units'] = '1/days'
+    spectrum = power_spectrum_da.to_dataset()
+    spectrum['frequency'].attrs['units'] = '1/days'
     
-    return ds
+    return spectrum
 
-def convert_spectrum_from_frequency_to_period(ds):
-    freq_units = ds['frequency'].attrs.get('units', None)
+def convert_spectrum_from_frequency_to_period(spectrum) -> xr.Dataset:
+    freq_units = spectrum['frequency'].attrs.get('units', None)
 
     # Map of frequency units to period units
     units_map = {'1/days': 'days', 'Hz': 'seconds', '1/years': 'years'}
 
     # Calculate period as reciprocal of frequency.
-    period = 1.0 / ds['frequency']
+    period = 1.0 / spectrum['frequency']
 
     # Handle units attribute
     if freq_units in units_map:
@@ -547,17 +544,17 @@ def convert_spectrum_from_frequency_to_period(ds):
         logger.error(f"!!!WARNING!!! DID NOT RECOGNIZE {freq_units = }")
 
     # Create a new Dataset with the same variables but with an additional 'period' data variable
-    new_ds = ds.assign_coords(period=('frequency', period.data))  # use .data to get the underlying numpy array
+    new_spectrum = spectrum.assign_coords(period=('frequency', period.data))  # use .data to get the underlying numpy array
 
     # Drop the 'frequency' dimension and coordinate
-    new_ds = new_ds.swap_dims({'frequency': 'period'}).drop('frequency')
+    new_spectrum = new_spectrum.swap_dims({'frequency': 'period'}).drop('frequency')
 
     # Reorder the dataset so that period is increasing
-    new_ds = new_ds.sortby('period')
+    new_spectrum = new_spectrum.sortby('period')
 
-    return new_ds
+    return new_spectrum
 
-def map_power_spectrum(cie, power_spectrum, min_period = -1, max_period = -1):
+def map_power_spectrum(cie, power_spectrum, min_period = -1, max_period = -1) -> xr.Dataset:
     # Get existing periods
     existing_periods = power_spectrum['period'].values
 
@@ -645,7 +642,7 @@ def plot_color(rgb, filename):
     # Save the figure with the desired options
     plt.savefig(filename, dpi=dpi_choice, format='png', transparent=False, bbox_inches='tight')
 
-def load_ssha_files(tskip=1):
+def load_ssha_files(tskip=1) -> xr.Dataset:
     # Get the list of files
     sshafiles = sorted(glob.glob(os.path.join(sshafolder,'*.nc')))
 
@@ -654,11 +651,10 @@ def load_ssha_files(tskip=1):
 
     # Load all files into the same dataset
     logger.info(f"Loading {len(tskip_files)} SSHA files...")
-    ds = xr.open_mfdataset(tskip_files, combine='by_coords')
+    input_data = xr.open_mfdataset(tskip_files, combine='by_coords')
+    return input_data
 
-    return ds
-
-def extract_ssha_timeseries(ds, lat = 30, lon = 135):
+def extract_ssha_timeseries(ds, lat = 30, lon = 135) -> xr.Dataset:
     logger.info(f"Extracting SSHA timeseries at {lat = } and {lon = }")
 
     # Convert the longitude to the range 0-360 if it's in -180 to 180
@@ -674,13 +670,13 @@ def extract_ssha_timeseries(ds, lat = 30, lon = 135):
         {y_key: (x_key, measurements)},
         coords={x_key: ds[x_key].values}
     )
-
     return ds
 
-def timeseries_to_xyz(timeseries, x_key, y_key, min_period, max_period, cie):
+def timeseries_to_xyz(timeseries: xr.Dataset, x_key: str, y_key: str, min_period: float, max_period: float, cie: xr.Dataset) -> xr.Dataset:
     if 1:
-        lat = timeseries[y_key].values[0]
-        lon = timeseries[y_key].values[1]
+        global lat_key, lon_key
+        lat = timeseries[lat_key].values
+        lon = timeseries[lon_key].values
         #spectrum = synthetic_spectrum(cie, 500+lat, 5)
         spectrum = synthetic_spectrum(cie, 550, 5)
         xyz = spectrum2xyz(spectrum, cie)
@@ -698,7 +694,7 @@ def timeseries_to_xyz(timeseries, x_key, y_key, min_period, max_period, cie):
     return spectrum2xyz(mapped_spectrum, cie)
 
 # Define your function, that returns a Dataset
-def rms_and_mean(x):
+def rms_and_mean(x) -> xr.Dataset:
     rms_value = np.sqrt(np.mean(x**2))
     mean_value = np.mean(x)
     return xr.Dataset({'rms': rms_value, 'mean': mean_value})
@@ -1305,19 +1301,6 @@ def run_gmt_scripts():
     # Start an interactive shell
     os.system('cmd')
 
-def replace_elements(input_data: xr.Dataset, x_key: str, y_key: str, lat_key: str, lon_key: str) -> xr.Dataset:
-    # Iterate over each latitude
-    for lat in input_data[lat_key]:
-        # Replace the first element in the x_key dimension with the current latitude value
-        input_data[y_key].loc[{x_key: input_data[x_key][0], lat_key: lat}] = lat.item()
-    
-    # Iterate over each longitude
-    for lon in input_data[lon_key]:
-        # Replace the second element in the x_key dimension with the current longitude value
-        input_data[y_key].loc[{x_key: input_data[x_key][1], lon_key: lon}] = lon.item()
-    
-    return input_data
-
 if __name__ == "__main__":
     plt.style.use('dark_background')
     plt.rcParams['font.size'] = 14  # Change the global font size
@@ -1363,7 +1346,6 @@ if __name__ == "__main__":
     logger.info(f"Grabbing one lat/lon point in every {xskip**2} points...")
     input_data = input_data.isel({lat_key: slice(None, None, xskip), lon_key: slice(None, None, xskip)})
     logger.info(" done.")
-    input_data = replace_elements(input_data, x_key, y_key, lat_key, lon_key)
     # Check if the size of x_key dimension is odd
     if input_data.dims[x_key] % 2 == 1:
         logger.error(f"!!! WARNING!!! LENGTH NEEDS TO BE EVEN FOR NFFT, BUT: {input_data.dims[x_key] = }")
@@ -1371,17 +1353,8 @@ if __name__ == "__main__":
         # If it is, select all elements up to the second last one
         input_data = input_data.isel({x_key: slice(None, -1)})
 
-    # Extract the first element, which is lat
-    lat_image = input_data[y_key].isel({x_key: 0})
-    plt.imshow(lat_image, origin='lower')
-    plt.savefig(os.path.join(outputfolder, 'lat_image.png'), dpi=300)
-    plt.close()
-    # Extract the second element, which is lon
-    lon_image = input_data[y_key].isel({x_key: 1})
-    plt.imshow(lon_image, origin='lower')
-    plt.savefig(os.path.join(outputfolder, 'lon_image.png'), dpi=300)
-    plt.close()
-
+    #Grab timeseries from the first lat/lon pair to
+    #check min/max_period against available periods.
     sliced_data = input_data.isel({lat_key: 0, lon_key: 0})
     # Perform non-uniform FFT to get power spectrum.
     power_spectrum = nfft_power(sliced_data)
