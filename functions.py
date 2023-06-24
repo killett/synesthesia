@@ -384,6 +384,7 @@ def fix_gamut(rgb) -> xr.Dataset:
                           'green': rgb_values[1],
                           'blue': rgb_values[2]})
     logger.info(f"fix_gamut: {result = }")
+    return result
     
 def gamma_correct_rgb(rgb) -> xr.Dataset:
     gamma_inv = 0.45
@@ -678,9 +679,10 @@ def timeseries_to_xyz(timeseries: xr.Dataset, x_key: str, y_key: str, min_period
         lat = timeseries[lat_key].values
         lon = timeseries[lon_key].values
         #spectrum = synthetic_spectrum(cie, 500+lat, 5)
-        spectrum = synthetic_spectrum(cie, 550, 5)
+        spectrum = synthetic_spectrum(cie, 580+2*lat, 5)
+        #spectrum = synthetic_spectrum(cie, 550, 5)
         xyz = spectrum2xyz(spectrum, cie)
-        #xyz['y'] = lon*lon*lon
+        xyz['y'] = lon*lon*lon*lon
         return xyz
 
     timeseries, fits = fancy_detrend(timeseries, x_key, y_key, terms=['constant', 'trend', 'accel'])
@@ -1414,8 +1416,8 @@ if __name__ == "__main__":
     logger.info(f"Time taken WITHOUT DASK: {time_taken:.2f} seconds")
 
     #Convert RGB values from [0,1] to [0,255]
-    for thiskey in ['red','green','blue']:
-        spectral_color_maps[thiskey] = spectral_color_maps[thiskey] * 255.0
+    #for thiskey in ['red','green','blue']:
+    #    spectral_color_maps[thiskey] = spectral_color_maps[thiskey] * 255.0
 
     rgb_filenames = []
     for thekey in spectral_color_maps.keys():
