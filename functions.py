@@ -291,17 +291,17 @@ def synthetic_spectrum(cie,mu,sig):
 
     return spectrum
 
-def spectrum2xyz_old(spectrum, cie, normalization_factor):
+def spectrum2xyz_old(spectrum, cie):
     xyz = {}
     wavelength_step_size = np.diff(cie['wavelength'].values).mean()  # Average wavelength step size
     for l in ['x', 'y', 'z']:
         # Multiply each spectrum value by the corresponding cie value
         temp_values = spectrum['power'].values * cie[l].values
         # Integrate over wavelengths to get a single tristimulus value
-        xyz[l] = (temp_values.sum() * wavelength_step_size) / normalization_factor
+        xyz[l] = (temp_values.sum() * wavelength_step_size)
     return xr.Dataset(xyz)
 
-def spectrum2xyz_new(spectrum, cie, normalization_factor):
+def spectrum2xyz_new(spectrum, cie):
     # Create a SpectralDistribution object from the input xarray DataArray
     spd = SpectralDistribution(spectrum['power'].values, spectrum.coords['wavelength'].values)
 
@@ -674,7 +674,7 @@ def extract_ssha_timeseries(ds, lat = 30, lon = 135):
 
     return ds
 
-def timeseries_to_xyz(timeseries, x_key, y_key, min_period, max_period):
+def timeseries_to_xyz(timeseries, x_key, y_key, min_period, max_period, cie):
     #logger.info(f"{timeseries.keys() = }")
     timeseries, fits = fancy_detrend(timeseries, x_key, y_key, terms=['constant', 'trend', 'accel'])
 
@@ -689,40 +689,9 @@ def timeseries_to_xyz(timeseries, x_key, y_key, min_period, max_period):
 
     power_spectrum = convert_spectrum_from_frequency_to_period(power_spectrum)
     
-    #logger.info(f"{min_period = } and {np.max(power_spectrum.period.values) = }")
-    if min_period < np.min(power_spectrum.period.values) or min_period >= np.max(power_spectrum.period.values):
-        #logger.error(f"!!! WARNING!!! originally {min_period = } but {np.min(power_spectrum.period.values) = } and {np.max(power_spectrum.period.values) = }")
-        min_period = np.min(power_spectrum.period.values)
-        #logger.error(f"So now {min_period = } which equals {np.min(power_spectrum.period.values) = }")
-    #logger.info(f"{max_period = } and {np.max(power_spectrum.period.values) = }")
-    if max_period <= np.min(power_spectrum.period.values) or max_period > np.max(power_spectrum.period.values):
-        #logger.error(f"!!! WARNING!!! originally {max_period = } but {np.min(power_spectrum.period.values) = } and {np.max(power_spectrum.period.values) = }")
-        max_period = np.max(power_spectrum.period.values)
-        #logger.error(f"So now {max_period = } which equals {np.max(power_spectrum.period.values) = }")
-    signal_period = 365.25
-    #power_spectrum = power_spectrum.where((power_spectrum.period > signal_period * 0.2) & (power_spectrum.period < signal_period * 3), drop=True)
-
-    if make_plots: plot_fft_spectrum(power_spectrum,title="FFT Power spectrum")
-
-    cie = load_cie_functions()
-
     mapped_spectrum = map_power_spectrum(cie, power_spectrum, min_period = min_period, max_period = max_period)
     
-    #logger.info(f"{mapped_spectrum = }")
-        
-    if make_plots: plot_light_spectrum(mapped_spectrum,title="Light spectrum")
-
-    #logger.info(f"{cie = }")
-    #spectrum = synthetic_spectrum(cie, 530, 30)
-    spectrum = mapped_spectrum
-    #logger.info(f"{spectrum = }")
-    xyz = spectrum2xyz(spectrum, cie, 1.0)
-    #logger.info(f"{xyz = }")
-    thepower = 1.0
-    #logger.info(f"Before raising y to power {thepower}: {xyz = }")
-    raise_y_to_power(xyz, thepower)
-    #logger.info(f"After  raising y to power {thepower}: {xyz = }")
-    return xyz
+    return spectrum2xyz(mapped_spectrum, cie)
 
 # Define your function, that returns a Dataset
 def rms_and_mean(x):
@@ -995,10 +964,10 @@ def write_rgb_colorscale(results, cie, plot_options, verbose):
                 create_synthetic_plot(copy,20,0,0,0,results['xy']['x_values'][0][0][i],0.2)
                 match_x_axes(copy, cie)
                 interpolate(copy, cie)
-                spectrum2xyz(copy, cie, verbose)
+                spectrum2xyz(copy, cie)
                 xyz2rgb(copy)
-                rescale_single_rgb(copy, verbose)
-                gamma_correct_single_rgb(copy, verbose)
+                rescale_single_rgb(copy)
+                gamma_correct_single_rgb(copy)
                 for l in range(3): copy.rgb[l] *= 255.0
                 if i > 0:
                     new_fp.write(f"{results['xy']['x_values'][0][0][i-1]:12.6e} {int(old.rgb[0]):3d} {int(old.rgb[1]):3d} {int(old.rgb[2]):3d} {results['xy']['x_values'][0][0][i]:12.6e} {int(copy.rgb[0]):3d} {int(copy.rgb[1]):3d} {int(copy.rgb[2]):3d}\n".encode())
@@ -1025,7 +994,7 @@ def write_rgb_colorscale(results, cie, plot_options, verbose):
                     create_synthetic_plot(copy,20,0,0,0,results['xy']['x_values'][0][0][i],hw) # choice,#pts,x0,delta,param1,2.
                     match_x_axes(copy,cie)
                     interpolate(copy,cie)
-                    spectrum2xyz(copy,cie,verbose)
+                    spectrum2xyz(copy,cie)
                     xyz2rgb(copy)
                     for l in range(3):
                         all['latlon']['outputs'][l][i][j] = copy.rgb[l]
@@ -1332,6 +1301,19 @@ def run_gmt_scripts():
     # Start an interactive shell
     os.system('cmd')
 
+def replace_elements(input_data: xr.Dataset, x_key: str, y_key: str, lat_key: str, lon_key: str) -> xr.Dataset:
+    # Iterate over each latitude
+    for lat in input_data[lat_key]:
+        # Replace the first element in the x_key dimension with the current latitude value
+        input_data[y_key].loc[{x_key: input_data[x_key][0], lat_key: lat}] = lat.item()
+    
+    # Iterate over each longitude
+    for lon in input_data[lon_key]:
+        # Replace the second element in the x_key dimension with the current longitude value
+        input_data[y_key].loc[{x_key: input_data[x_key][1], lon_key: lon}] = lon.item()
+    
+    return input_data
+
 if __name__ == "__main__":
     plt.style.use('dark_background')
     plt.rcParams['font.size'] = 14  # Change the global font size
@@ -1349,6 +1331,8 @@ if __name__ == "__main__":
         
     x_key = 'Time'
     y_key = 'SLA'
+    lat_key = 'Latitude'
+    lon_key = 'Longitude'
     min_period = 220
     max_period = 2000
 
@@ -1357,7 +1341,7 @@ if __name__ == "__main__":
         spectrum = synthetic_spectrum(cie, 550, 5)
         if make_plots: plot_light_spectrum(spectrum,title="Synthetic spectrum")
         logger.info(f"{spectrum = }")
-        xyz = spectrum2xyz(spectrum, cie, 1.0)
+        xyz = spectrum2xyz(spectrum, cie)
         logger.info(f"{xyz = }")
         rgb = xyz2rgb(xyz)
         logger.info(f"{rgb = }")
@@ -1373,10 +1357,9 @@ if __name__ == "__main__":
     input_data = load_ssha_files(tskip=1)
     xskip = 192
     logger.info(f"Grabbing one lat/lon point in every {xskip**2} points...")
-    input_data = input_data.isel(Latitude=slice(None, None, xskip), Longitude=slice(None, None, xskip))
+    input_data = input_data.isel({lat_key: slice(None, None, xskip), lon_key: slice(None, None, xskip)})
     logger.info(" done.")
-    #breakpoint()
-    
+    replace_elements(input_data, x_key, y_key, lat_key, lon_key)    
     # Check if the size of x_key dimension is odd
     if input_data.dims[x_key] % 2 == 1:
         logger.error(f"!!! WARNING!!! LENGTH NEEDS TO BE EVEN FOR NFFT, BUT: {input_data.dims[x_key] = }")
@@ -1384,18 +1367,38 @@ if __name__ == "__main__":
         # If it is, select all elements up to the second last one
         input_data = input_data.isel({x_key: slice(None, -1)})
 
+    if 1:
+        sliced_data = input_data.isel({lat_key: 0, lon_key: 0})
+        # Perform non-uniform FFT to get power spectrum.
+        power_spectrum = nfft_power(sliced_data)
+
+        power_spectrum = convert_spectrum_from_frequency_to_period(power_spectrum)
+        
+        logger.info(f"{min_period = } and {np.max(power_spectrum.period.values) = }")
+        if min_period < np.min(power_spectrum.period.values) or min_period >= np.max(power_spectrum.period.values):
+            logger.error(f"!!! WARNING!!! originally {min_period = } but {np.min(power_spectrum.period.values) = } and {np.max(power_spectrum.period.values) = }")
+            min_period = np.min(power_spectrum.period.values)
+            logger.error(f"So now {min_period = } which equals {np.min(power_spectrum.period.values) = }")
+        logger.info(f"{max_period = } and {np.max(power_spectrum.period.values) = }")
+        if max_period <= np.min(power_spectrum.period.values) or max_period > np.max(power_spectrum.period.values):
+            logger.error(f"!!! WARNING!!! originally {max_period = } but {np.min(power_spectrum.period.values) = } and {np.max(power_spectrum.period.values) = }")
+            max_period = np.max(power_spectrum.period.values)
+            logger.error(f"So now {max_period = } which equals {np.max(power_spectrum.period.values) = }")
+
+    cie = load_cie_functions()
+
     # Time the code
     start_time = timeit.default_timer()
     logger.info("Starting map operation WITHOUT dask...")
 
-    # Stack 'Latitude' and 'Longitude' into a new single dimension 'position'
-    stacked = input_data.stack(position=['Latitude', 'Longitude'])
+    # Stack latitude and longitude into a new single dimension latlon
+    stacked = input_data.stack(latlon=[lat_key, lon_key])
 
     # Create a new function with min_period and max_period filled
-    timeseries_to_xyz_partial = functools.partial(timeseries_to_xyz, x_key=x_key, y_key=y_key, min_period=min_period, max_period=max_period)
+    timeseries_to_xyz_partial = functools.partial(timeseries_to_xyz, x_key=x_key, y_key=y_key, min_period=min_period, max_period=max_period, cie=cie)
 
     # Apply the function to the 'y_key' variable of the stacked dataset
-    result = stacked.groupby('position').map(timeseries_to_xyz_partial)
+    result = stacked.groupby('latlon').map(timeseries_to_xyz_partial)
 
     # Find the maximum 'y' value
     max_y = result['y'].max()
@@ -1408,12 +1411,12 @@ if __name__ == "__main__":
 
     #Convert to RGB, but keep XYZ values around.
     logger.info("Converting to RGB...")
-    result = result.groupby('position').map(xyz2rgb)
+    result = result.groupby('latlon').map(xyz2rgb)
     logger.info("Fixing RGB out-of-gamut values and normalizing...")
-    result = result.groupby('position').map(fix_gamut)
+    result = result.groupby('latlon').map(fix_gamut)
 
     # Unstack all variables and keep as a dataset
-    spectral_color_maps = xr.Dataset({key: result[key].unstack('position') for key in result.data_vars})
+    spectral_color_maps = xr.Dataset({key: result[key].unstack('latlon') for key in result.data_vars})
 
     # Stop the timer
     end_time = timeit.default_timer()
