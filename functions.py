@@ -335,6 +335,7 @@ def xyz2rgb_old(xyz):
     rgb = {'red': rgb[0], 'green': rgb[1], 'blue': rgb[2]}
     # Merge the original and new datasets
     result = xr.merge([xyz, rgb])
+    logger.info(f"xyz2rgb_old: {result = }")
     return result
 
 def xyz2rgb_new(xyz):
@@ -351,6 +352,7 @@ def xyz2rgb_new(xyz):
 
     # Merge the original and new datasets
     result = xr.merge([xyz, rgb])
+    logger.info(f"xyz2rgb_new: {result = }")
     return result
 
 def fix_gamut(rgb):
@@ -375,12 +377,13 @@ def fix_gamut(rgb):
     rgb_values /= max_value
 
     # Create a new xarray Dataset with the corrected RGB values
-    return xr.Dataset({'red': rgb_values[0],
-                       'green': rgb_values[1],
-                       'blue': rgb_values[2],
-                       'x': rgb['x'],
-                       'y': rgb['y'],
-                       'z': rgb['z']})
+    result =  xr.Dataset({'x': rgb['x'],
+                          'y': rgb['y'],
+                          'z': rgb['z'],
+                          'red': rgb_values[0],
+                          'green': rgb_values[1],
+                          'blue': rgb_values[2]})
+    logger.info(f"fix_gamut: {result = }")
     
 def gamma_correct_rgb(rgb):
     gamma_inv = 0.45
@@ -675,18 +678,19 @@ def extract_ssha_timeseries(ds, lat = 30, lon = 135):
     return ds
 
 def timeseries_to_xyz(timeseries, x_key, y_key, min_period, max_period, cie):
-    #logger.info(f"{timeseries.keys() = }")
+    if 1:
+        lat = timeseries[y_key].values[0]
+        lon = timeseries[y_key].values[1]
+        #spectrum = synthetic_spectrum(cie, 500+lat, 5)
+        spectrum = synthetic_spectrum(cie, 550, 5)
+        xyz = spectrum2xyz(spectrum, cie)
+        #xyz['y'] = lon*lon*lon
+        return xyz
+
     timeseries, fits = fancy_detrend(timeseries, x_key, y_key, terms=['constant', 'trend', 'accel'])
-
-    if make_plots: plot_timeseries(timeseries,title="Detrended time series")
-
-    fitted_timeseries = turn_fits_into_timeseries(timeseries, x_key, y_key, fits=fits)
-
-    if make_plots: plot_timeseries(fitted_timeseries,title="Fitted time series")
 
     # Perform non-uniform FFT to get power spectrum.
     power_spectrum = nfft_power(timeseries)
-
     power_spectrum = convert_spectrum_from_frequency_to_period(power_spectrum)
     
     mapped_spectrum = map_power_spectrum(cie, power_spectrum, min_period = min_period, max_period = max_period)
@@ -1344,9 +1348,9 @@ if __name__ == "__main__":
         xyz = spectrum2xyz(spectrum, cie)
         logger.info(f"{xyz = }")
         rgb = xyz2rgb(xyz)
-        logger.info(f"{rgb = }")
+        logger.info(f"BEFORE fix_gamut: {rgb = }")
         rgb = fix_gamut(rgb)
-        logger.info(f"{rgb = }")
+        logger.info(f"AFTER fix_gamut: {rgb = }")
         crashnow
 
     # Calculate the wavelength ratio
@@ -1359,7 +1363,7 @@ if __name__ == "__main__":
     logger.info(f"Grabbing one lat/lon point in every {xskip**2} points...")
     input_data = input_data.isel({lat_key: slice(None, None, xskip), lon_key: slice(None, None, xskip)})
     logger.info(" done.")
-    replace_elements(input_data, x_key, y_key, lat_key, lon_key)    
+    input_data = replace_elements(input_data, x_key, y_key, lat_key, lon_key)
     # Check if the size of x_key dimension is odd
     if input_data.dims[x_key] % 2 == 1:
         logger.error(f"!!! WARNING!!! LENGTH NEEDS TO BE EVEN FOR NFFT, BUT: {input_data.dims[x_key] = }")
@@ -1367,23 +1371,33 @@ if __name__ == "__main__":
         # If it is, select all elements up to the second last one
         input_data = input_data.isel({x_key: slice(None, -1)})
 
-    if 1:
-        sliced_data = input_data.isel({lat_key: 0, lon_key: 0})
-        # Perform non-uniform FFT to get power spectrum.
-        power_spectrum = nfft_power(sliced_data)
+    # Extract the first element, which is lat
+    lat_image = input_data[y_key].isel({x_key: 0})
+    plt.imshow(lat_image, origin='lower')
+    plt.savefig(os.path.join(outputfolder, 'lat_image.png'), dpi=300)
+    plt.close()
+    # Extract the second element, which is lon
+    lon_image = input_data[y_key].isel({x_key: 1})
+    plt.imshow(lon_image, origin='lower')
+    plt.savefig(os.path.join(outputfolder, 'lon_image.png'), dpi=300)
+    plt.close()
 
-        power_spectrum = convert_spectrum_from_frequency_to_period(power_spectrum)
-        
-        logger.info(f"{min_period = } and {np.max(power_spectrum.period.values) = }")
-        if min_period < np.min(power_spectrum.period.values) or min_period >= np.max(power_spectrum.period.values):
-            logger.error(f"!!! WARNING!!! originally {min_period = } but {np.min(power_spectrum.period.values) = } and {np.max(power_spectrum.period.values) = }")
-            min_period = np.min(power_spectrum.period.values)
-            logger.error(f"So now {min_period = } which equals {np.min(power_spectrum.period.values) = }")
-        logger.info(f"{max_period = } and {np.max(power_spectrum.period.values) = }")
-        if max_period <= np.min(power_spectrum.period.values) or max_period > np.max(power_spectrum.period.values):
-            logger.error(f"!!! WARNING!!! originally {max_period = } but {np.min(power_spectrum.period.values) = } and {np.max(power_spectrum.period.values) = }")
-            max_period = np.max(power_spectrum.period.values)
-            logger.error(f"So now {max_period = } which equals {np.max(power_spectrum.period.values) = }")
+    sliced_data = input_data.isel({lat_key: 0, lon_key: 0})
+    # Perform non-uniform FFT to get power spectrum.
+    power_spectrum = nfft_power(sliced_data)
+
+    power_spectrum = convert_spectrum_from_frequency_to_period(power_spectrum)
+    
+    logger.info(f"{min_period = } and {np.max(power_spectrum.period.values) = }")
+    if min_period < np.min(power_spectrum.period.values) or min_period >= np.max(power_spectrum.period.values):
+        logger.error(f"!!! WARNING!!! originally {min_period = } but {np.min(power_spectrum.period.values) = } and {np.max(power_spectrum.period.values) = }")
+        min_period = np.min(power_spectrum.period.values)
+        logger.error(f"So now {min_period = } which equals {np.min(power_spectrum.period.values) = }")
+    logger.info(f"{max_period = } and {np.max(power_spectrum.period.values) = }")
+    if max_period <= np.min(power_spectrum.period.values) or max_period > np.max(power_spectrum.period.values):
+        logger.error(f"!!! WARNING!!! originally {max_period = } but {np.min(power_spectrum.period.values) = } and {np.max(power_spectrum.period.values) = }")
+        max_period = np.max(power_spectrum.period.values)
+        logger.error(f"So now {max_period = } which equals {np.max(power_spectrum.period.values) = }")
 
     cie = load_cie_functions()
 
@@ -1426,11 +1440,9 @@ if __name__ == "__main__":
 
     logger.info(f"Time taken WITHOUT DASK: {time_taken:.2f} seconds")
 
-    #Normalize RGB values:
-    #max_value = max(np.nanmax(val.values) for val in spectral_color_maps.values())
-    #logger.info(f"Rescaling RGB values: dividing by {max_value}")
-    #for key in spectral_color_maps:
-    #    spectral_color_maps[key] = spectral_color_maps[key] / max_value
+    #Convert RGB values from [0,1] to [0,255]
+    for thiskey in ['red','green','blue']:
+        spectral_color_maps[thiskey] = spectral_color_maps[thiskey] * 255.0
 
     rgb_filenames = []
     for thekey in spectral_color_maps.keys():
@@ -1443,16 +1455,19 @@ if __name__ == "__main__":
         logger.info(f"Saving {filename}...")
         spectral_color_maps[thekey].to_netcdf(filename)
     logger.info("Finished saving.")
-     
+
+    for thekey in spectral_color_maps.keys():
+        img = plt.imshow(spectral_color_maps[thekey], origin='lower')
+        plt.colorbar(img, orientation='horizontal')
+        plt.title(thekey)
+        plt.savefig(os.path.join(outputfolder, f'output_{thekey}.png'), dpi=300)
+        plt.close()
+
     # Stack into an RGB image
     image = np.dstack((spectral_color_maps['red'].values, spectral_color_maps['green'].values, spectral_color_maps['blue'].values))
 
-    # Display the image
     plt.imshow(image, origin='lower')
-
-    # Save the image to disk as a png
     plt.savefig(os.path.join(outputfolder, 'image_matplotlib.png'), dpi=300)
-
     plt.close()
 
     write_gmt_scripts(plot_options, grid, results)
