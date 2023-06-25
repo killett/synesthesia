@@ -335,7 +335,7 @@ def xyz2rgb_old(xyz) -> xr.Dataset:
     rgb = {'red': rgb[0], 'green': rgb[1], 'blue': rgb[2]}
     # Merge the original and new datasets
     result = xr.merge([xyz, rgb])
-    logger.info(f"xyz2rgb_old: {result = }")
+    #logger.info(f"xyz2rgb_old: {result = }")
     return result
 
 def xyz2rgb_new(xyz) -> xr.Dataset:
@@ -352,7 +352,7 @@ def xyz2rgb_new(xyz) -> xr.Dataset:
 
     # Merge the original and new datasets
     result = xr.merge([xyz, rgb])
-    logger.info(f"xyz2rgb_new: {result = }")
+    #logger.info(f"xyz2rgb_new: {result = }")
     return result
 
 def fix_gamut(rgb) -> xr.Dataset:
@@ -362,6 +362,9 @@ def fix_gamut(rgb) -> xr.Dataset:
     B = rgb['blue'].values
     # Combine RGB into a numpy array
     rgb_values = np.array([R, G, B])
+    
+    if np.any(np.isnan(rgb_values)):
+        return rgb
     
     # If any values are < 0, add enough white light to make them all positive
     min_val = rgb_values.min()
@@ -373,8 +376,8 @@ def fix_gamut(rgb) -> xr.Dataset:
         rgb_values = (rgb_values + min_val) * factor
     
     # Normalize to [0, 1]
-    max_value = rgb_values.max()
-    rgb_values /= max_value
+    #max_value = rgb_values.max()
+    #rgb_values /= max_value
 
     # Create a new xarray Dataset with the corrected RGB values
     result =  xr.Dataset({'x': rgb['x'],
@@ -383,7 +386,7 @@ def fix_gamut(rgb) -> xr.Dataset:
                           'red': rgb_values[0],
                           'green': rgb_values[1],
                           'blue': rgb_values[2]})
-    logger.info(f"fix_gamut: {result = }")
+    #logger.info(f"fix_gamut: {result = }")
     return result
     
 def gamma_correct_rgb(rgb) -> xr.Dataset:
@@ -1345,35 +1348,41 @@ if __name__ == "__main__":
         test_length = 100
         test_min = 0
         test_max = 1.0
-        
-        if 0:
-            # Generate random x and z values between 0 and 1
-            x_values = np.random.uniform(0, 1, size=test_length)
-            y_values = np.random.uniform(0, 1, size=test_length)
-            z_values = np.random.uniform(0, 1, size=test_length)
-        else:
-            # Generate zero arrays for x and z values
-            testval = 0.0
-            x_values = np.full(test_length,testval)
-            y_values = np.full(test_length,testval)
-            z_values = np.full(test_length,testval)
+
+        # D65 normalized white point
+        x_wp = 0.3127
+        z_wp = 0.3583
+
+        # Create an array of y_values from test_min to test_max
+        y_values = np.linspace(test_min, test_max, test_length)
+
+        # The x_values and z_values are proportional to the y_values:
+        #x_values = y_values * x_wp
+        #z_values = y_values * z_wp
+        # The x_values and z_values are IDENTICAL to the y_values:
+        x_values = np.linspace(test_min, test_max, test_length)
+        z_values = np.linspace(test_min, test_max, test_length)
 
         # Create an empty dataset to store the results
         result_dataset = xr.Dataset()
 
+        # Define the number of decimal points
+        num_digits = 1
+        # Add header for the table
+        print(f"{'X':<10}{'Y':<10}{'Z':<10}{'R':<10}{'G':<10}{'B':<10}")
+
         # Iterate over the test values
         for i in range(test_length):
-            # Calculate the y value based on the index and the test range
-            y_value = test_min + (i / (test_length - 1)) * (test_max - test_min)
-
             # Create the input dataset for xyz2rgb
-            xyz = xr.Dataset({'x': x_values[i], 'y': y_value, 'z': z_values[i]})
-            #xyz = xr.Dataset({'x': x_values[i], 'y': y_values[i], 'z': z_values[i]})
+            xyz = xr.Dataset({'x': x_values[i], 'y': y_values[i], 'z': z_values[i]})
 
             result = xyz2rgb(xyz)
             result = fix_gamut(result)
-            result = gamma_correct_rgb(result)
+            #result = gamma_correct_rgb(result)
             result_dataset = xr.concat([result_dataset, result], dim='index')
+            # Print the input and output values
+            # round() function is used to limit the decimal points
+            print(f"{round(x_values[i], num_digits):<10}{round(y_values[i], num_digits):<10}{round(z_values[i], num_digits):<10}{round(float(result['red'].values), num_digits):<10}{round(float(result['green'].values), num_digits):<10}{round(float(result['blue'].values), num_digits):<10}")
 
         # Plot the results
         plt.figure(figsize=(10, 6))
@@ -1385,7 +1394,7 @@ if __name__ == "__main__":
         plt.scatter(result_dataset['y'], result_dataset['blue'], marker='s', color='blue', s=10)
         # Determine the highest value on the plot
         highest_value = float(result_dataset[['red', 'green', 'blue']].to_array().max().values)
-        print(f"{highest_value = }")
+        #print(f"{highest_value = }")
 
         # Iterate over the test points and plot squares
         for i in range(test_length):
@@ -1395,6 +1404,7 @@ if __name__ == "__main__":
                 print(f"!!!WARNING!!! NaN at {i = }")
                 continue
             color = result_dataset[['red', 'green', 'blue']].isel(index=i).to_array().values
+            color = np.clip(color, 0, 1)
             print(f"{color = }")
             if np.any(np.isnan(color)):
                 print(f"!!!WARNING!!! NaN color at {i = }")
