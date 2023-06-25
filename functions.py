@@ -392,14 +392,13 @@ def gamma_correct_rgb(rgb) -> xr.Dataset:
     h = 4.506813168
     g = -0.09914989
     f = 1.09914989
-    for key in rgb.data_vars:
+    for key in ['red','green','blue']:
         # Typo in Hughes and Williams 2010 equation A7, compared to Charles Poynton's GammaFAQ:
         # http://www.poynton.com/GammaFAQ.html
         if rgb[key] <= crit:
             rgb[key] *= h
         else:
             rgb[key] = f * pow(rgb[key], gamma_inv) + g
-    breakpoint()
     return rgb
 
 def synthetic_timeseries(signal='annual', signal_amplitude=1, noise='white', noise_level=0.1, 
@@ -1311,12 +1310,15 @@ if __name__ == "__main__":
 
     make_plots = 0
 
-    if 1:
+    funcs_desc = ""
+    if 0:
         spectrum2xyz = spectrum2xyz_old
         xyz2rgb      = xyz2rgb_old
+        funcs_desc  += " OLD functions"
     else:
         spectrum2xyz = spectrum2xyz_new
         xyz2rgb      = xyz2rgb_new
+        funcs_desc  += " NEW functions"
         
     x_key = 'Time'
     y_key = 'SLA'
@@ -1336,6 +1338,78 @@ if __name__ == "__main__":
         logger.info(f"BEFORE fix_gamut: {rgb = }")
         rgb = fix_gamut(rgb)
         logger.info(f"AFTER fix_gamut: {rgb = }")
+        crashnow
+
+    if 1:
+        # Define the test parameters
+        test_length = 100
+        test_min = 0
+        test_max = 1.0
+        
+        if 0:
+            # Generate random x and z values between 0 and 1
+            x_values = np.random.uniform(0, 1, size=test_length)
+            y_values = np.random.uniform(0, 1, size=test_length)
+            z_values = np.random.uniform(0, 1, size=test_length)
+        else:
+            # Generate zero arrays for x and z values
+            testval = 0.0
+            x_values = np.full(test_length,testval)
+            y_values = np.full(test_length,testval)
+            z_values = np.full(test_length,testval)
+
+        # Create an empty dataset to store the results
+        result_dataset = xr.Dataset()
+
+        # Iterate over the test values
+        for i in range(test_length):
+            # Calculate the y value based on the index and the test range
+            y_value = test_min + (i / (test_length - 1)) * (test_max - test_min)
+
+            # Create the input dataset for xyz2rgb
+            xyz = xr.Dataset({'x': x_values[i], 'y': y_value, 'z': z_values[i]})
+            #xyz = xr.Dataset({'x': x_values[i], 'y': y_values[i], 'z': z_values[i]})
+
+            result = xyz2rgb(xyz)
+            result = fix_gamut(result)
+            result = gamma_correct_rgb(result)
+            result_dataset = xr.concat([result_dataset, result], dim='index')
+
+        # Plot the results
+        plt.figure(figsize=(10, 6))
+        plt.plot(result_dataset['y'], result_dataset['red'], label='Red', color='red')
+        plt.plot(result_dataset['y'], result_dataset['green'], label='Green', color='green')
+        plt.plot(result_dataset['y'], result_dataset['blue'], label='Blue', color='blue')
+        plt.scatter(result_dataset['y'], result_dataset['red'], marker='s', color='red', s=10)
+        plt.scatter(result_dataset['y'], result_dataset['green'], marker='s', color='green', s=10)
+        plt.scatter(result_dataset['y'], result_dataset['blue'], marker='s', color='blue', s=10)
+        # Determine the highest value on the plot
+        highest_value = float(result_dataset[['red', 'green', 'blue']].to_array().max().values)
+        print(f"{highest_value = }")
+
+        # Iterate over the test points and plot squares
+        for i in range(test_length):
+            this_y = float(result_dataset['y'][i].values)
+            print(f"{this_y = }")
+            if np.isnan(this_y):
+                print(f"!!!WARNING!!! NaN at {i = }")
+                continue
+            color = result_dataset[['red', 'green', 'blue']].isel(index=i).to_array().values
+            print(f"{color = }")
+            if np.any(np.isnan(color)):
+                print(f"!!!WARNING!!! NaN color at {i = }")
+                continue
+            plt.scatter(this_y, highest_value*1.1, marker='s', color=color, s=15)
+        plt.title(f'RGB vs. Y{funcs_desc}', color='white')
+        plt.legend()
+        plt.xlabel('Y Input')
+        plt.ylabel('RGB Value')
+        # Create filename with the current date
+        date_str = datetime.datetime.now().strftime('%Y%m%d-%H%M%S')
+        filename = os.path.join(outputfolder, f"{date_str}_rgb_values.png")
+        # Save the figure with the desired options
+        plt.savefig(filename, dpi=300, format='png', transparent=False, bbox_inches='tight', facecolor='black')
+        plt.show()
         crashnow
 
     # Calculate the wavelength ratio
@@ -1435,14 +1509,14 @@ if __name__ == "__main__":
         img = plt.imshow(spectral_color_maps[thekey], origin='lower')
         plt.colorbar(img, orientation='horizontal')
         plt.title(thekey)
-        plt.savefig(os.path.join(outputfolder, f'output_{thekey}.png'), dpi=300)
+        plt.savefig(os.path.join(outputfolder, f'output_{thekey}.png'), dpi=dpi_choice)
         plt.close()
 
     # Stack into an RGB image
     image = np.dstack((spectral_color_maps['red'].values, spectral_color_maps['green'].values, spectral_color_maps['blue'].values))
 
     plt.imshow(image, origin='lower')
-    plt.savefig(os.path.join(outputfolder, 'image_matplotlib.png'), dpi=300)
+    plt.savefig(os.path.join(outputfolder, 'image_matplotlib.png'), dpi=dpi_choice)
     plt.close()
 
     write_gmt_scripts(plot_options, grid, results)
