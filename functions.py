@@ -1305,6 +1305,10 @@ def run_gmt_scripts():
     # Start an interactive shell
     os.system('cmd')
 
+def normalize_data(data, max_value):
+    # data is an array like object (numpy array, list, etc.)
+    return [i/max_value for i in data]
+
 if __name__ == "__main__":
     plt.style.use('dark_background')
     plt.rcParams['font.size'] = 14  # Change the global font size
@@ -1360,8 +1364,8 @@ if __name__ == "__main__":
         #x_values = y_values * x_wp
         #z_values = y_values * z_wp
         # The x_values and z_values are IDENTICAL to the y_values:
-        x_values = np.linspace(test_min, test_max, test_length)
-        z_values = np.linspace(test_min, test_max, test_length)
+        x_values = y_values
+        z_values = y_values
 
         # Create an empty dataset to store the results
         result_dataset = xr.Dataset()
@@ -1377,7 +1381,7 @@ if __name__ == "__main__":
             xyz = xr.Dataset({'x': x_values[i], 'y': y_values[i], 'z': z_values[i]})
 
             result = xyz2rgb(xyz)
-            result = fix_gamut(result)
+            #result = fix_gamut(result)
             #result = gamma_correct_rgb(result)
             result_dataset = xr.concat([result_dataset, result], dim='index')
             # Print the input and output values
@@ -1404,7 +1408,7 @@ if __name__ == "__main__":
                 print(f"!!!WARNING!!! NaN at {i = }")
                 continue
             color = result_dataset[['red', 'green', 'blue']].isel(index=i).to_array().values
-            color = np.clip(color, 0, 1)
+            color = normalize_data(color, highest_value)
             print(f"{color = }")
             if np.any(np.isnan(color)):
                 print(f"!!!WARNING!!! NaN color at {i = }")
