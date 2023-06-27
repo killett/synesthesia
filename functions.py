@@ -25,6 +25,11 @@ from colour.colorimetry import MSDS_CMFS_STANDARD_OBSERVER
 from colour import SpectralDistribution, sd_to_XYZ
 from colour import XYZ_to_sRGB
 
+
+days_in_year = 365.25
+
+
+
 outputfolder = os.path.join('.', 'output')
 # Create output folder with current date
 date_str = datetime.datetime.now().strftime('%Y%m%d-%H%M%S')
@@ -437,7 +442,6 @@ def synthetic_timeseries(signal='annual', signal_amplitude=1, noise='white', noi
     )
 
 def fancy_detrend(timeseries, x_key, y_key, terms=['constant', 'trend']):
-    #logger.error("!!!WARNING!!! Next line assumes these units are originally in ns and you want the units to be days!!!")
     x = (timeseries[x_key] - timeseries[x_key][0]).values.astype(float) / (24*3600*1e9)
     y = timeseries[y_key].values
 
@@ -452,6 +456,14 @@ def fancy_detrend(timeseries, x_key, y_key, terms=['constant', 'trend']):
     if 'accel' in terms:
         design_matrix.append(x ** 2)
 
+    if 'annual' in terms:
+        design_matrix.append(np.sin(2 * np.pi * x / days_in_year))
+        design_matrix.append(np.cos(2 * np.pi * x / days_in_year))
+
+    if 'semiannual' in terms:
+        design_matrix.append(np.sin(2 * np.pi * x / days_in_year/2.))
+        design_matrix.append(np.cos(2 * np.pi * x / days_in_year/2.))
+
     design_matrix = np.column_stack(design_matrix)
 
     model = sm.OLS(y, design_matrix)
@@ -464,12 +476,18 @@ def fancy_detrend(timeseries, x_key, y_key, terms=['constant', 'trend']):
 
     fits = {}
     for i, term in enumerate(terms):
-        fits[term] = result.params[i]
+        if term == 'annual':
+            fits['annual_sin'] = result.params[i]
+            fits['annual_cos'] = result.params[i+1]
+        elif term == 'semiannual':
+            fits['semiannual_sin'] = result.params[i]
+            fits['semiannual_cos'] = result.params[i+1]
+        else:
+            fits[term] = result.params[i]
 
     return detrended_timeseries, fits
 
 def turn_fits_into_timeseries(timeseries, x_key, y_key, fits) -> xr.Dataset:
-    #logger.error("!!!WARNING!!! Next line assumes these units are originally in ns and you want the units to be days!!!")
     x = (timeseries[x_key] - timeseries[x_key][0]).values.astype(float) / (24*3600*1e9)
     fitted_values = np.zeros_like(x)
 
@@ -480,6 +498,14 @@ def turn_fits_into_timeseries(timeseries, x_key, y_key, fits) -> xr.Dataset:
             fitted_values += fit_value * x
         elif term == 'accel':
             fitted_values += fit_value * x**2
+        elif term == 'annual_sin':
+            fitted_values += fit_value * np.sin(2 * np.pi * x / days_in_year)
+        elif term == 'annual_cos':
+            fitted_values += fit_value * np.cos(2 * np.pi * x / days_in_year)
+        elif term == 'semiannual_sin':
+            fitted_values += fit_value * np.sin(2 * np.pi * x / days_in_year/2.)
+        elif term == 'semiannual_cos':
+            fitted_values += fit_value * np.cos(2 * np.pi * x / days_in_year/2.)
 
     fitted_timeseries = timeseries.copy()
     fitted_timeseries[y_key].values = fitted_values
@@ -676,7 +702,7 @@ def extract_ssha_timeseries(ds, lat = 30, lon = 135) -> xr.Dataset:
     return ds
 
 def timeseries_to_xyz(timeseries: xr.Dataset, x_key: str, y_key: str, min_period: float, max_period: float, cie: xr.Dataset) -> xr.Dataset:
-    if 1:
+    if 0:
         global lat_key, lon_key
         lat = timeseries[lat_key].values
         lon = timeseries[lon_key].values
@@ -687,6 +713,7 @@ def timeseries_to_xyz(timeseries: xr.Dataset, x_key: str, y_key: str, min_period
         xyz['y'] = lon*lon*lon*lon
         return xyz
 
+    #timeseries, fits = fancy_detrend(timeseries, x_key, y_key, terms=['constant', 'trend', 'accel', 'annual', 'semiannual'])
     timeseries, fits = fancy_detrend(timeseries, x_key, y_key, terms=['constant', 'trend', 'accel'])
 
     # Perform non-uniform FFT to get power spectrum.
@@ -1315,8 +1342,6 @@ if __name__ == "__main__":
     plt.rcParams['axes.linewidth'] = 2  # Change the global linewidth
     myfigsize=(10,5)
 
-    make_plots = 0
-
     funcs_desc = ""
     if 0:
         spectrum2xyz = spectrum2xyz_old
@@ -1331,100 +1356,8 @@ if __name__ == "__main__":
     y_key = 'SLA'
     lat_key = 'Latitude'
     lon_key = 'Longitude'
-    min_period = 220
-    max_period = 2000
-
-    if 0:
-        cie = load_cie_functions()
-        spectrum = synthetic_spectrum(cie, 550, 5)
-        if make_plots: plot_light_spectrum(spectrum,title="Synthetic spectrum")
-        logger.info(f"{spectrum = }")
-        xyz = spectrum2xyz(spectrum, cie)
-        logger.info(f"{xyz = }")
-        rgb = xyz2rgb(xyz)
-        logger.info(f"BEFORE fix_gamut: {rgb = }")
-        rgb = fix_gamut(rgb)
-        logger.info(f"AFTER fix_gamut: {rgb = }")
-        crashnow
-
-    if 1:
-        # Define the test parameters
-        test_length = 100
-        test_min = 0
-        test_max = 1.0
-
-        # D65 normalized white point
-        x_wp = 0.3127
-        z_wp = 0.3583
-
-        # Create an array of y_values from test_min to test_max
-        y_values = np.linspace(test_min, test_max, test_length)
-
-        # The x_values and z_values are proportional to the y_values:
-        #x_values = y_values * x_wp
-        #z_values = y_values * z_wp
-        # The x_values and z_values are IDENTICAL to the y_values:
-        x_values = y_values
-        z_values = y_values
-
-        # Create an empty dataset to store the results
-        result_dataset = xr.Dataset()
-
-        # Define the number of decimal points
-        num_digits = 1
-        # Add header for the table
-        print(f"{'X':<10}{'Y':<10}{'Z':<10}{'R':<10}{'G':<10}{'B':<10}")
-
-        # Iterate over the test values
-        for i in range(test_length):
-            # Create the input dataset for xyz2rgb
-            xyz = xr.Dataset({'x': x_values[i], 'y': y_values[i], 'z': z_values[i]})
-
-            result = xyz2rgb(xyz)
-            #result = fix_gamut(result)
-            #result = gamma_correct_rgb(result)
-            result_dataset = xr.concat([result_dataset, result], dim='index')
-            # Print the input and output values
-            # round() function is used to limit the decimal points
-            print(f"{round(x_values[i], num_digits):<10}{round(y_values[i], num_digits):<10}{round(z_values[i], num_digits):<10}{round(float(result['red'].values), num_digits):<10}{round(float(result['green'].values), num_digits):<10}{round(float(result['blue'].values), num_digits):<10}")
-
-        # Plot the results
-        plt.figure(figsize=(10, 6))
-        plt.plot(result_dataset['y'], result_dataset['red'], label='Red', color='red')
-        plt.plot(result_dataset['y'], result_dataset['green'], label='Green', color='green')
-        plt.plot(result_dataset['y'], result_dataset['blue'], label='Blue', color='blue')
-        plt.scatter(result_dataset['y'], result_dataset['red'], marker='s', color='red', s=10)
-        plt.scatter(result_dataset['y'], result_dataset['green'], marker='s', color='green', s=10)
-        plt.scatter(result_dataset['y'], result_dataset['blue'], marker='s', color='blue', s=10)
-        # Determine the highest value on the plot
-        highest_value = float(result_dataset[['red', 'green', 'blue']].to_array().max().values)
-        #print(f"{highest_value = }")
-
-        # Iterate over the test points and plot squares
-        for i in range(test_length):
-            this_y = float(result_dataset['y'][i].values)
-            print(f"{this_y = }")
-            if np.isnan(this_y):
-                print(f"!!!WARNING!!! NaN at {i = }")
-                continue
-            color = result_dataset[['red', 'green', 'blue']].isel(index=i).to_array().values
-            color = normalize_data(color, highest_value)
-            print(f"{color = }")
-            if np.any(np.isnan(color)):
-                print(f"!!!WARNING!!! NaN color at {i = }")
-                continue
-            plt.scatter(this_y, highest_value*1.1, marker='s', color=color, s=15)
-        plt.title(f'RGB vs. Y{funcs_desc}', color='white')
-        plt.legend()
-        plt.xlabel('Y Input')
-        plt.ylabel('RGB Value')
-        # Create filename with the current date
-        date_str = datetime.datetime.now().strftime('%Y%m%d-%H%M%S')
-        filename = os.path.join(outputfolder, f"{date_str}_rgb_values.png")
-        # Save the figure with the desired options
-        plt.savefig(filename, dpi=300, format='png', transparent=False, bbox_inches='tight', facecolor='black')
-        plt.show()
-        crashnow
+    min_period = 2*7
+    max_period = 24*7
 
     # Calculate the wavelength ratio
     #wavelength_ratio = cie['wavelength'].max() / cie['wavelength'].min()
@@ -1432,14 +1365,13 @@ if __name__ == "__main__":
     #max_period = min_period * wavelength_ratio
 
     input_data = load_ssha_files(tskip=1)
-    xskip = 192
+    xskip = 3#12#96#192
     logger.info(f"Grabbing one lat/lon point in every {xskip**2} points...")
     input_data = input_data.isel({lat_key: slice(None, None, xskip), lon_key: slice(None, None, xskip)})
     logger.info(" done.")
     # Check if the size of x_key dimension is odd
     if input_data.dims[x_key] % 2 == 1:
-        logger.error(f"!!! WARNING!!! LENGTH NEEDS TO BE EVEN FOR NFFT, BUT: {input_data.dims[x_key] = }")
-        logger.error(f"!!! DELETING LAST DATA POINT!")
+        logger.info(f"Deleting last data point because number of time stamps needs to be even for NFFT. Before deletion: {input_data.dims[x_key] = }")
         # If it is, select all elements up to the second last one
         input_data = input_data.isel({x_key: slice(None, -1)})
 
@@ -1451,7 +1383,7 @@ if __name__ == "__main__":
 
     power_spectrum = convert_spectrum_from_frequency_to_period(power_spectrum)
     
-    logger.info(f"{min_period = } and {np.max(power_spectrum.period.values) = }")
+    logger.info(f"{min_period = } and {np.min(power_spectrum.period.values) = }")
     if min_period < np.min(power_spectrum.period.values) or min_period >= np.max(power_spectrum.period.values):
         logger.error(f"!!! WARNING!!! originally {min_period = } but {np.min(power_spectrum.period.values) = } and {np.max(power_spectrum.period.values) = }")
         min_period = np.min(power_spectrum.period.values)
@@ -1466,7 +1398,7 @@ if __name__ == "__main__":
 
     # Time the code
     start_time = timeit.default_timer()
-    logger.info("Starting map operation WITHOUT dask...")
+    logger.info("Starting timeseries_to_xyz WITHOUT dask...")
 
     # Stack latitude and longitude into a new single dimension latlon
     stacked = input_data.stack(latlon=[lat_key, lon_key])
@@ -1475,32 +1407,39 @@ if __name__ == "__main__":
     timeseries_to_xyz_partial = functools.partial(timeseries_to_xyz, x_key=x_key, y_key=y_key, min_period=min_period, max_period=max_period, cie=cie)
 
     # Apply the function to the 'y_key' variable of the stacked dataset
-    result = stacked.groupby('latlon').map(timeseries_to_xyz_partial)
+    xyz = stacked.groupby('latlon').map(timeseries_to_xyz_partial)
 
     # Find the maximum 'y' value
-    max_y = result['y'].max()
+    max_y = xyz['y'].max()
 
     # Print the maximum 'y' value
     logger.info(f"The highest value of 'y' is: {max_y.item()}")
 
-    # Divide all 'y' values by the maximum 'y' value
-    result['y'] = result['y'] / max_y
+    # Divide all XYZ values by the maximum 'y' value
+    xyz['x'] = xyz['x'] / max_y
+    xyz['y'] = xyz['y'] / max_y
+    xyz['z'] = xyz['z'] / max_y
+    
+    thepower = 0.8
+    logger.info(f"Raising y to power {thepower} while keeping chromaticity constant. (This brightens dark areas.)")
+    xyz = raise_y_to_power(xyz, thepower)
 
     #Convert to RGB, but keep XYZ values around.
     logger.info("Converting to RGB...")
-    result = result.groupby('latlon').map(xyz2rgb)
+    rgb = xyz.groupby('latlon').map(xyz2rgb)
     logger.info("Fixing RGB out-of-gamut values and normalizing...")
-    result = result.groupby('latlon').map(fix_gamut)
+    rgb = rgb.groupby('latlon').map(fix_gamut)
+    highest_value = float(rgb[['red', 'green', 'blue']].to_array().max().values)
+    rgb['red']   = rgb['red']   / highest_value
+    rgb['green'] = rgb['green'] / highest_value
+    rgb['blue']  = rgb['blue']  / highest_value
 
     # Unstack all variables and keep as a dataset
-    spectral_color_maps = xr.Dataset({key: result[key].unstack('latlon') for key in result.data_vars})
+    spectral_color_maps = xr.Dataset({key: rgb[key].unstack('latlon') for key in rgb.data_vars})
 
     # Stop the timer
     end_time = timeit.default_timer()
-
-    # Calculate the time taken
     time_taken = end_time - start_time
-
     logger.info(f"Time taken WITHOUT DASK: {time_taken:.2f} seconds")
 
     #Convert RGB values from [0,1] to [0,255]
@@ -1533,8 +1472,9 @@ if __name__ == "__main__":
     plt.savefig(os.path.join(outputfolder, 'image_matplotlib.png'), dpi=dpi_choice)
     plt.close()
 
-    write_gmt_scripts(plot_options, grid, results)
-    run_gmt_scripts()
+    #write_gmt_scripts(plot_options, grid, results)
+    #run_gmt_scripts()
 
     logger.error("!!!WARNING!!! Next line assumes these units are originally in ns and you want the units to be days!!!")
+    logger.info("I SHOULD REALLY BE REMOVING ANNUAL AND SEMI-ANNUAL SIGNALS AS WELL!")
     logger.info("All finished!")
