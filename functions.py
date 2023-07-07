@@ -4,6 +4,7 @@ import subprocess
 import shutil
 import glob
 import xarray as xr
+import h5py
 import numpy as np
 import pandas as pd
 import zipfile
@@ -25,10 +26,7 @@ from colour.colorimetry import MSDS_CMFS_STANDARD_OBSERVER
 from colour import SpectralDistribution, sd_to_XYZ
 from colour import XYZ_to_sRGB
 
-
 days_in_year = 365.25
-
-
 
 outputfolder = os.path.join('.', 'output')
 # Create output folder with current date
@@ -48,7 +46,16 @@ if not os.path.exists(outputfolder):
 elif not os.path.isdir(outputfolder):
     raise ValueError(f"{outputfolder} exists but is not a directory.")
 
-sshafolder = os.path.join('.', 'sealevel_spectra','newest_full_grids','netCDF4')
+#sshafolder = os.path.join('.', 'sealevel_spectra','newest_full_grids','netCDF4')
+sshafolder = os.path.join('.', 'sealevel_spectra','fast_202306','fast_netCDF4')
+
+argofolder = os.path.join('.', 'sealevel_spectra','Argo')
+
+mur_sst_folder = os.path.join('.', 'sealevel_spectra','MUR_SST', 'MUR25-JPL-L4-GLOB-v04.2')
+
+aqua_modis_folder = os.path.join('.', 'sealevel_spectra','AQUA_MODIS')
+
+gracefolder = os.path.join('.', 'sealevel_spectra','JPL_GRACE_mascons')
 
 dpi_choice = 300
 
@@ -329,6 +336,7 @@ def raise_y_to_power(xyz, power) -> xr.Dataset:
     return xyz
 
 def xyz2rgb_old(xyz) -> xr.Dataset:
+    #See similar matrix here: https://archive.ph/Twlme https://en.wikipedia.org/wiki/SRGB 
     A = np.array([[3.2409699, -1.5373832, -0.49861079],
                   [-0.96924375, 1.8759676, 0.041555082],
                   [0.055630032, -0.20397685, 1.0569714]])
@@ -683,6 +691,42 @@ def load_ssha_files(tskip=1) -> xr.Dataset:
     input_data = xr.open_mfdataset(tskip_files, combine='by_coords')
     return input_data
 
+def load_argo_file() -> xr.Dataset:
+    thefiles = sorted(glob.glob(os.path.join(argofolder,'*.nc')))
+    thefile = thefiles[0]
+    input_data = xr.open_dataset(thefile)
+    return input_data
+
+def load_grace_file() -> xr.Dataset:
+    thefiles = sorted(glob.glob(os.path.join(gracefolder,'*.nc')))
+    thefile = thefiles[0]
+    input_data = xr.open_dataset(thefile)
+    return input_data
+
+def load_mur_sst_files(tskip=1) -> xr.Dataset:
+    # Get the list of files
+    thefiles = sorted(glob.glob(os.path.join(mur_sst_folder,'*2003*.nc')))
+
+    # Get every tskip file
+    tskip_files = thefiles[::tskip]
+
+    # Load all files into the same dataset
+    logger.info(f"Loading {len(tskip_files)} MUR SST files...")
+    input_data = xr.open_mfdataset(tskip_files, combine='by_coords')
+    return input_data
+
+def load_aqua_modis_files(tskip=1) -> xr.Dataset:
+    # Get the list of files
+    thefiles = sorted(glob.glob(os.path.join(aqua_modis_folder,'*2003*.nc')))
+
+    # Get every tskip file
+    tskip_files = thefiles[::tskip]
+
+    # Load all files into the same dataset
+    logger.info(f"Loading {len(tskip_files)} AQUA_MODIS files...")
+    input_data = xr.open_mfdataset(tskip_files, combine='by_coords')
+    return input_data
+
 def extract_ssha_timeseries(ds, lat = 30, lon = 135) -> xr.Dataset:
     logger.info(f"Extracting SSHA timeseries at {lat = } and {lon = }")
 
@@ -713,8 +757,12 @@ def timeseries_to_xyz(timeseries: xr.Dataset, x_key: str, y_key: str, min_period
         xyz['y'] = lon*lon*lon*lon
         return xyz
 
-    #timeseries, fits = fancy_detrend(timeseries, x_key, y_key, terms=['constant', 'trend', 'accel', 'annual', 'semiannual'])
-    timeseries, fits = fancy_detrend(timeseries, x_key, y_key, terms=['constant', 'trend', 'accel'])
+    fit_terms = []
+    fit_terms +=['constant', 'trend', 'accel']
+    #fit_terms += ['annual']
+    #fit_terms += ['semiannual']
+    #fit_terms += ['annual','semiannual']
+    timeseries, fits = fancy_detrend(timeseries, x_key, y_key, terms=fit_terms)
 
     # Perform non-uniform FFT to get power spectrum.
     power_spectrum = nfft_power(timeseries)
@@ -1351,21 +1399,73 @@ if __name__ == "__main__":
         spectrum2xyz = spectrum2xyz_new
         xyz2rgb      = xyz2rgb_new
         funcs_desc  += " NEW functions"
-        
-    x_key = 'Time'
-    y_key = 'SLA'
-    lat_key = 'Latitude'
-    lon_key = 'Longitude'
-    min_period = 2*7
-    max_period = 24*7
-
-    # Calculate the wavelength ratio
-    #wavelength_ratio = cie['wavelength'].max() / cie['wavelength'].min()
-    # Calculate the max_period
-    #max_period = min_period * wavelength_ratio
-
-    input_data = load_ssha_files(tskip=1)
-    xskip = 3#12#96#192
+    
+    input_choice = 'SSHA'
+    #input_choice = 'Argo'
+    #input_choice = 'MUR_SST'
+    #input_choice = 'AQUA_MODIS' #chlorophyll
+    #input_choice = 'GRACE'
+    logger.info(f"Loading {input_choice}")
+    if input_choice == 'SSHA':
+        x_key = 'Time' #Name of time coordinate
+        y_key = 'SLA' #Name of variable used
+        lat_key = 'Latitude'
+        lon_key = 'Longitude'
+        #min_period, max_period = 2*7, 24*7 #Days
+        #min_period, max_period = 14, 20 #Tropical Instability Waves (TIWs): In the Pacific, TIWs often have periods of around 14-20 days, although this can vary.
+        min_period, max_period = 30, 60 #Madden-Julian Oscillation (MJO): The MJO is often associated with a period of around 45 days (approximately 6.5 weeks), but it can vary between 30-60 days.
+        #min_period, max_period = 8*7, 12*7 #Kelvin Waves: Equatorial Kelvin waves often have periods of approximately 2-3 months (8-12 weeks). Again, this is an average, and actual periods can vary.
+        xskip = 6#96#192 # Skip 'xskip' points in lat/lon
+        input_data = load_ssha_files(tskip=1)
+    elif input_choice == 'Argo':
+        x_key = 'time' #Name of time coordinate
+        #ohc_2d, thermosteric_2d, halosteric_2d, totalsteric_2d
+        #Can also add '_300m' or '_700m'
+        #And: ohc_2d_lt_700m = ohc_2d - ohc_2d_700m
+        y_key = 'ohc_2d_lt_700m' #Name of variable used
+        lat_key = 'latitude'
+        lon_key = 'longitude'
+        #min_period, max_period = 9*7, 24*7 #Days
+        #min_period, max_period = 24*7, 70*7 #Days
+        min_period, max_period = 55*7, 150*7 #Days
+        xskip = 1 # Skip 'xskip' points in lat/lon
+        input_data = load_argo_file()
+        input_data['ohc_2d_lt_700m'] = input_data['ohc_2d'] - input_data['ohc_2d_700m']
+    elif input_choice == 'MUR_SST':
+        x_key = 'time' #Name of time coordinate
+        #sst_anomaly, analysed_sst
+        y_key = 'sst_anomaly' #Name of variable used
+        lat_key = 'lat'
+        lon_key = 'lon'
+        min_period, max_period = 2*7, 24*7 #Days
+        #min_period, max_period = 24*7, 70*7 #Days
+        #min_period, max_period = 55*7, 150*7 #Days
+        xskip = 40 # Skip 'xskip' points in lat/lon
+        input_data = load_mur_sst_files(tskip=1)
+    elif input_choice == 'AQUA_MODIS':
+        x_key = 'time' #Name of time coordinate
+        #
+        y_key = 'sst_anomaly' #Name of variable used
+        lat_key = 'lat'
+        lon_key = 'lon'
+        min_period, max_period = 2*7, 24*7 #Days
+        #min_period, max_period = 24*7, 70*7 #Days
+        #min_period, max_period = 55*7, 150*7 #Days
+        xskip = 40 # Skip 'xskip' points in lat/lon
+        input_data = load_aqua_modis_files(tskip=1)
+        print(input_data)
+    elif input_choice == 'GRACE':
+        x_key = 'time' #Name of time coordinate
+        #
+        y_key = 'lwe_thickness' #Name of variable used
+        lat_key = 'lat'
+        lon_key = 'lon'
+        #min_period, max_period = 9*7, 24*7 #Days
+        min_period, max_period = 24*7, 70*7 #Days
+        #min_period, max_period = 55*7, 150*7 #Days
+        xskip = 1 # Skip 'xskip' points in lat/lon
+        input_data = load_grace_file()
+    else: logger.error(f"DID NOT RECOGNIZE {input_choice = }")
     logger.info(f"Grabbing one lat/lon point in every {xskip**2} points...")
     input_data = input_data.isel({lat_key: slice(None, None, xskip), lon_key: slice(None, None, xskip)})
     logger.info(" done.")
@@ -1410,10 +1510,10 @@ if __name__ == "__main__":
     xyz = stacked.groupby('latlon').map(timeseries_to_xyz_partial)
 
     # Find the maximum 'y' value
-    max_y = xyz['y'].max()
+    max_y = xyz['y'].max().item()
 
     # Print the maximum 'y' value
-    logger.info(f"The highest value of 'y' is: {max_y.item()}")
+    logger.info(f"The highest value of 'y' is: {max_y}")
 
     # Divide all XYZ values by the maximum 'y' value
     xyz['x'] = xyz['x'] / max_y
@@ -1469,6 +1569,7 @@ if __name__ == "__main__":
     image = np.dstack((spectral_color_maps['red'].values, spectral_color_maps['green'].values, spectral_color_maps['blue'].values))
 
     plt.imshow(image, origin='lower')
+    plt.title(f"{y_key}, periods {min_period/7.:.0f}-{max_period/7.:.0f} weeks, {funcs_desc}")
     plt.savefig(os.path.join(outputfolder, 'image_matplotlib.png'), dpi=dpi_choice)
     plt.close()
 
@@ -1476,5 +1577,5 @@ if __name__ == "__main__":
     #run_gmt_scripts()
 
     logger.error("!!!WARNING!!! Next line assumes these units are originally in ns and you want the units to be days!!!")
-    logger.info("I SHOULD REALLY BE REMOVING ANNUAL AND SEMI-ANNUAL SIGNALS AS WELL!")
     logger.info("All finished!")
+    logger.info("Download and analyze chlorophyll data, as well as sea surface salinity data!")
