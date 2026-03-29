@@ -351,7 +351,7 @@ def xyz2rgb_old(xyz) -> xr.Dataset:
 
 def xyz2rgb_new(xyz) -> xr.Dataset:
     # Extract the XYZ tristimulus values from the xyz dataset
-    XYZ = [xyz['x'].values, xyz['y'].values, xyz['z'].values]
+    XYZ = np.array([xyz['x'].values.squeeze(), xyz['y'].values.squeeze(), xyz['z'].values.squeeze()])
 
     # Convert the XYZ tristimulus values to sRGB values
     RGB = XYZ_to_sRGB(XYZ)
@@ -368,22 +368,22 @@ def xyz2rgb_new(xyz) -> xr.Dataset:
 
 def fix_gamut(rgb) -> xr.Dataset:
     # Extract the RGB values
-    R = rgb['red'].values
-    G = rgb['green'].values
-    B = rgb['blue'].values
+    R = rgb['red'].values.squeeze()
+    G = rgb['green'].values.squeeze()
+    B = rgb['blue'].values.squeeze()
     # Combine RGB into a numpy array
     rgb_values = np.array([R, G, B])
-    
+
     if np.any(np.isnan(rgb_values)):
         return rgb
-    
+
     # If any values are < 0, add enough white light to make them all positive
     min_val = rgb_values.min()
     if min_val < 0:
         #Make "min" positive as in paper's appendix, and add 1/255 so the rescale value isn't 0.
         min_val = -min_val + 1.0/255.0
         #This factor rescales the luminance back to its original value.
-        factor = rgb['y'].values / (rgb['y'].values + min_val)
+        factor = rgb['y'].values.squeeze() / (rgb['y'].values.squeeze() + min_val)
         rgb_values = (rgb_values + min_val) * factor
     
     # Normalize to [0, 1]
@@ -582,7 +582,7 @@ def convert_spectrum_from_frequency_to_period(spectrum) -> xr.Dataset:
     new_spectrum = spectrum.assign_coords(period=('frequency', period.data))  # use .data to get the underlying numpy array
 
     # Drop the 'frequency' dimension and coordinate
-    new_spectrum = new_spectrum.swap_dims({'frequency': 'period'}).drop('frequency')
+    new_spectrum = new_spectrum.swap_dims({'frequency': 'period'}).drop_vars('frequency')
 
     # Reorder the dataset so that period is increasing
     new_spectrum = new_spectrum.sortby('period')
@@ -686,7 +686,7 @@ def load_ssha_files(tskip=1) -> xr.Dataset:
 
     # Load all files into the same dataset
     logger.info(f"Loading {len(tskip_files)} SSHA files...")
-    input_data = xr.open_mfdataset(tskip_files, combine='by_coords')
+    input_data = xr.open_mfdataset(tskip_files, data_vars = 'all', combine='by_coords')
     return input_data
 
 def load_argo_file() -> xr.Dataset:
@@ -710,7 +710,7 @@ def load_mur_sst_files(tskip=1) -> xr.Dataset:
 
     # Load all files into the same dataset
     logger.info(f"Loading {len(tskip_files)} MUR SST files...")
-    input_data = xr.open_mfdataset(tskip_files, combine='by_coords')
+    input_data = xr.open_mfdataset(tskip_files, data_vars='all', combine='by_coords')
     return input_data
 
 def load_aqua_modis_files(tskip=1) -> xr.Dataset:
@@ -722,7 +722,7 @@ def load_aqua_modis_files(tskip=1) -> xr.Dataset:
 
     # Load all files into the same dataset
     logger.info(f"Loading {len(tskip_files)} AQUA_MODIS files...")
-    input_data = xr.open_mfdataset(tskip_files, combine='by_coords')
+    input_data = xr.open_mfdataset(tskip_files, data_vars='all', combine='by_coords')
     return input_data
 
 def extract_ssha_timeseries(ds, lat = 30, lon = 135) -> xr.Dataset:
@@ -1413,7 +1413,7 @@ if __name__ == "__main__":
         #min_period, max_period = 14, 20 #Tropical Instability Waves (TIWs): In the Pacific, TIWs often have periods of around 14-20 days, although this can vary.
         min_period, max_period = 30, 60 #Madden-Julian Oscillation (MJO): The MJO is often associated with a period of around 45 days (approximately 6.5 weeks), but it can vary between 30-60 days.
         #min_period, max_period = 8*7, 12*7 #Kelvin Waves: Equatorial Kelvin waves often have periods of approximately 2-3 months (8-12 weeks). Again, this is an average, and actual periods can vary.
-        xskip = 6#96#192 # Skip 'xskip' points in lat/lon
+        xskip = 192#96#192 # Skip 'xskip' points in lat/lon
         input_data = load_ssha_files(tskip=1)
     elif input_choice == 'Argo':
         x_key = 'time' #Name of time coordinate
@@ -1468,8 +1468,8 @@ if __name__ == "__main__":
     input_data = input_data.isel({lat_key: slice(None, None, xskip), lon_key: slice(None, None, xskip)})
     logger.info(" done.")
     # Check if the size of x_key dimension is odd
-    if input_data.dims[x_key] % 2 == 1:
-        logger.info(f"Deleting last data point because number of time stamps needs to be even for NFFT. Before deletion: {input_data.dims[x_key] = }")
+    if input_data.sizes[x_key] % 2 == 1:
+        logger.info(f"Deleting last data point because number of time stamps needs to be even for NFFT. Before deletion: {input_data.sizes[x_key] = }")
         # If it is, select all elements up to the second last one
         input_data = input_data.isel({x_key: slice(None, -1)})
 
@@ -1514,9 +1514,9 @@ if __name__ == "__main__":
     logger.info(f"The highest value of 'y' is: {max_y}")
 
     # Divide all XYZ values by the maximum 'y' value
-    xyz['x'] = xyz['x'] / max_y
-    xyz['y'] = xyz['y'] / max_y
-    xyz['z'] = xyz['z'] / max_y
+    xyz['x'].values /= max_y
+    xyz['y'].values /= max_y
+    xyz['z'].values /= max_y
     
     thepower = 0.8
     logger.info(f"Raising y to power {thepower} while keeping chromaticity constant. (This brightens dark areas.)")
@@ -1528,9 +1528,9 @@ if __name__ == "__main__":
     logger.info("Fixing RGB out-of-gamut values and normalizing...")
     rgb = rgb.groupby('latlon').map(fix_gamut)
     highest_value = float(rgb[['red', 'green', 'blue']].to_array().max().values)
-    rgb['red']   = rgb['red']   / highest_value
-    rgb['green'] = rgb['green'] / highest_value
-    rgb['blue']  = rgb['blue']  / highest_value
+    rgb['red'].values   /= highest_value
+    rgb['green'].values /= highest_value
+    rgb['blue'].values  /= highest_value
 
     # Unstack all variables and keep as a dataset
     spectral_color_maps = xr.Dataset({key: rgb[key].unstack('latlon') for key in rgb.data_vars})
