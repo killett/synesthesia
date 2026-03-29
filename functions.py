@@ -1413,7 +1413,7 @@ if __name__ == "__main__":
         #min_period, max_period = 14, 20 #Tropical Instability Waves (TIWs): In the Pacific, TIWs often have periods of around 14-20 days, although this can vary.
         min_period, max_period = 30, 60 #Madden-Julian Oscillation (MJO): The MJO is often associated with a period of around 45 days (approximately 6.5 weeks), but it can vary between 30-60 days.
         #min_period, max_period = 8*7, 12*7 #Kelvin Waves: Equatorial Kelvin waves often have periods of approximately 2-3 months (8-12 weeks). Again, this is an average, and actual periods can vary.
-        xskip = 192#96#192 # Skip 'xskip' points in lat/lon
+        xskip = 6  #96#192 # Skip 'xskip' points in lat/lon
         input_data = load_ssha_files(tskip=1)
     elif input_choice == 'Argo':
         x_key = 'time' #Name of time coordinate
@@ -1496,44 +1496,143 @@ if __name__ == "__main__":
 
     # Time the code
     start_time = timeit.default_timer()
-    logger.info("Starting timeseries_to_xyz WITHOUT dask...")
+    logger.info("Starting timeseries_to_xyz WITHOUT dask (optimized)...")
 
-    # Stack latitude and longitude into a new single dimension latlon
+    # === PRE-COMPUTATION (outside loop) ===
     stacked = input_data.stack(latlon=[lat_key, lon_key])
+    latlon_coord = stacked['latlon']
 
-    # Create a new function with min_period and max_period filled
-    timeseries_to_xyz_partial = functools.partial(timeseries_to_xyz, x_key=x_key, y_key=y_key, min_period=min_period, max_period=max_period, cie=cie)
+    # Extract raw numpy arrays once
+    times = stacked[x_key].values
+    data_2d = stacked[y_key].values  # shape (n_times, n_points)
+    n_times, n_points = data_2d.shape
 
-    # Apply the function to the 'y_key' variable of the stacked dataset
-    xyz = stacked.groupby('latlon').map(timeseries_to_xyz_partial)
+    # Time axis in days (shared across all grid points)
+    x_days = (times - times[0]).astype(float) / (24*3600*1e9)
 
-    # Find the maximum 'y' value
-    max_y = xyz['y'].max().item()
+    # Ensure even length for NFFT
+    N = len(x_days)
+    if N % 2:
+        logger.info(f"Trimming last time step for even NFFT length: {N} -> {N-1}")
+        x_days = x_days[:-1]
+        data_2d = data_2d[:-1, :]
+        N -= 1
 
-    # Print the maximum 'y' value
+    # Detrending design matrix: [constant, trend, accel] (shared)
+    design_matrix = np.column_stack([np.ones(N), x_days, x_days**2])
+
+    # NFFT parameters (shared)
+    x_min = x_days.min()
+    x_range = x_days.max() - x_min
+    x_norm = (x_days - x_min) / x_range - 0.5
+    k = -(N // 2) + np.arange(N)
+    xf = k / x_range
+    xf_half = xf[N//2+1:]  # positive frequencies, ascending
+
+    # Period array (ascending) for mapping power spectrum to wavelength
+    periods_ascending = (1.0 / xf_half)[::-1]
+    cie_wavelengths = cie['wavelength'].values
+    n_wl = len(cie_wavelengths)
+    wavelength_targets = np.linspace(min_period, max_period, n_wl)
+
+    # Pre-compute boundary handling for map_power_spectrum (replicates original reindex+nearest)
+    periods_extended = periods_ascending.copy()
+    if min_period not in periods_ascending:
+        periods_extended = np.append(periods_extended, min_period)
+    if max_period not in periods_ascending:
+        periods_extended = np.append(periods_extended, max_period)
+    periods_extended = np.sort(periods_extended)
+    # For each extended period, find nearest original period index (for nearest-fill)
+    nearest_indices = np.array([np.argmin(np.abs(periods_ascending - p)) for p in periods_extended])
+    # Filter to [min_period, max_period]
+    period_mask = (periods_extended >= min_period) & (periods_extended <= max_period)
+    interp_periods = periods_extended[period_mask]
+    interp_nearest_idx = nearest_indices[period_mask]
+
+    # CIE color matching functions for sd_to_XYZ
+    cmfs = MSDS_CMFS_STANDARD_OBSERVER['CIE 1931 2 Degree Standard Observer']
+
+    # Pre-filter all-NaN grid points (land)
+    valid_mask = ~np.all(np.isnan(data_2d), axis=0)
+    n_valid = valid_mask.sum()
+    logger.info(f"Processing {n_valid} valid grid points out of {n_points} total...")
+
+    # === MAIN LOOP (pure numpy, no xarray overhead) ===
+    xyz_results = np.full((n_points, 3), np.nan)
+
+    for i in range(n_points):
+        if not valid_mask[i]:
+            continue
+
+        y = data_2d[:, i]
+
+        # 1. Detrend with numpy lstsq (replaces statsmodels OLS)
+        params, _, _, _ = np.linalg.lstsq(design_matrix, y, rcond=None)
+        detrended = y - design_matrix @ params
+
+        # 2. NFFT
+        f_k = nfft.nfft(x_norm, detrended)
+        power = np.abs(f_k)**2
+
+        # 3. Take positive frequencies, reverse to ascending period order
+        power_half = power[N//2+1:]
+        power_ascending = power_half[::-1]
+
+        # 4. Map power spectrum to wavelength grid (replicates map_power_spectrum boundary handling)
+        power_interp_src = power_ascending[interp_nearest_idx]
+        mapped_power = np.interp(wavelength_targets, interp_periods, power_interp_src)
+
+        # 5. Spectrum to XYZ using colour-science sd_to_XYZ
+        spd = SpectralDistribution(mapped_power, cie_wavelengths)
+        xyz_results[i] = sd_to_XYZ(spd, cmfs)
+
+    logger.info("Main loop complete.")
+
+    # === POST-LOOP: Normalize XYZ ===
+    max_y = np.nanmax(xyz_results[:, 1])
     logger.info(f"The highest value of 'y' is: {max_y}")
+    xyz_results /= max_y
 
-    # Divide all XYZ values by the maximum 'y' value
-    xyz['x'].values /= max_y
-    xyz['y'].values /= max_y
-    xyz['z'].values /= max_y
-    
+    # Raise Y to power (brightens dark areas)
     thepower = 0.8
     logger.info(f"Raising y to power {thepower} while keeping chromaticity constant. (This brightens dark areas.)")
-    xyz = raise_y_to_power(xyz, thepower)
+    factor = np.power(xyz_results[:, 1], 1.0 - thepower)
+    xyz_results /= factor[:, np.newaxis]
 
-    #Convert to RGB, but keep XYZ values around.
+    # === POST-LOOP: Vectorized XYZ -> sRGB (single call, replaces groupby.map) ===
     logger.info("Converting to RGB...")
-    rgb = xyz.groupby('latlon').map(xyz2rgb)
-    logger.info("Fixing RGB out-of-gamut values and normalizing...")
-    rgb = rgb.groupby('latlon').map(fix_gamut)
-    highest_value = float(rgb[['red', 'green', 'blue']].to_array().max().values)
-    rgb['red'].values   /= highest_value
-    rgb['green'].values /= highest_value
-    rgb['blue'].values  /= highest_value
+    RGB_results = XYZ_to_sRGB(xyz_results)  # shape (n_points, 3)
 
-    # Unstack all variables and keep as a dataset
-    spectral_color_maps = xr.Dataset({key: rgb[key].unstack('latlon') for key in rgb.data_vars})
+    # === POST-LOOP: Vectorized fix_gamut (replaces groupby.map) ===
+    logger.info("Fixing RGB out-of-gamut values and normalizing...")
+    rgb_arr = RGB_results.T.copy()  # shape (3, n_points) for easier per-channel access
+
+    nan_mask = np.any(np.isnan(rgb_arr), axis=0)
+    min_vals = np.full(n_points, 0.0)
+    min_vals[~nan_mask] = rgb_arr[:, ~nan_mask].min(axis=0)
+    needs_fix = (~nan_mask) & (min_vals < 0)
+
+    if np.any(needs_fix):
+        offset = -min_vals[needs_fix] + 1.0/255.0
+        y_vals = xyz_results[needs_fix, 1]
+        fix_factor = y_vals / (y_vals + offset)
+        rgb_arr[:, needs_fix] = (rgb_arr[:, needs_fix] + offset) * fix_factor
+
+    # Normalize RGB
+    highest_value = np.nanmax(rgb_arr)
+    rgb_arr /= highest_value
+
+    # === Assemble xarray Dataset and unstack ===
+    rgb_ds = xr.Dataset({
+        'x': ('latlon', xyz_results[:, 0]),
+        'y': ('latlon', xyz_results[:, 1]),
+        'z': ('latlon', xyz_results[:, 2]),
+        'red': ('latlon', rgb_arr[0]),
+        'green': ('latlon', rgb_arr[1]),
+        'blue': ('latlon', rgb_arr[2]),
+    }, coords={'latlon': latlon_coord})
+
+    spectral_color_maps = xr.Dataset({key: rgb_ds[key].unstack('latlon') for key in rgb_ds.data_vars})
 
     # Stop the timer
     end_time = timeit.default_timer()
