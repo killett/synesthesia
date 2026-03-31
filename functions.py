@@ -10,6 +10,7 @@ import sys
 import timeit
 import zipfile
 import datetime as dt
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, BinaryIO, Callable, Final
 
@@ -24,8 +25,109 @@ import xarray as xr
 from colour import SpectralDistribution, sd_to_XYZ, XYZ_to_sRGB
 from colour.colorimetry import MSDS_CMFS_STANDARD_OBSERVER
 
-__version__ = "0.1.3"
+__version__ = "0.1.4"
 DAYS_IN_YEAR: Final[float] = 365.25
+
+# XYZ-to-linear-sRGB matrix (Hughes & Williams 2010, no gamma correction)
+A_OLD_XYZ_TO_SRGB: Final[np.ndarray] = np.array(
+    [[ 3.2409699,   -1.5373832,  -0.49861079 ],
+     [-0.96924375,   1.8759676,   0.041555082],
+     [ 0.055630032, -0.20397685,  1.0569714  ]]
+)
+
+
+# ---------------------------------------------------------------------------
+# Data structures (mirrors C++ structs from abridged-definitions.hpp)
+# ---------------------------------------------------------------------------
+
+@dataclass
+class LatLonData:
+    """Equal-grid latlon data (mirrors C++ latlon_s, definitions.hpp:238-256).
+
+    Holds coordinates and output data for a 2D lat/lon grid.
+    """
+    lat:         list[float]             = field(default_factory=list)
+    lon:         list[float]             = field(default_factory=list)
+    outputs:     list[list[list[float]]] = field(default_factory=list)  # [param][lat][lon]
+    elev:        list[list[float]]       = field(default_factory=list)
+    mascon_lats: list[float]             = field(default_factory=list)
+    mascon_lons: list[float]             = field(default_factory=list)
+    mask:        float                   = float("nan")
+
+
+@dataclass
+class AnalysisOptions:
+    """Analysis options (subset of C++ analysis_options_s used by GMT path).
+
+    Controls which output format and parameter types are used.
+    """
+    output_choice: int       = 5                        # 1=unstructured, 5=latlon grid
+    output_type:   list[int] = field(default_factory=list)  # per-parameter (e.g. 104=phase)
+
+
+@dataclass
+class PlotOptions:
+    """Plotting/visualization options (mirrors C++ plot_options_s, definitions.hpp:443-490).
+
+    Controls GMT script generation, projection, color scheme, and matplotlib output.
+    """
+    outputfolder:       str             = ""
+    just_the_filenames: list[str]       = field(default_factory=list)
+    output_base:        str             = "map_parameter"
+    projection:         int             = 2       # 2=Winkel Tripel (matches C++ default)
+    coastlines:         int             = 1       # 1=coast, 2=coast+InSAR
+    symmetric_limit:    float           = -1.0    # <=0 disables (matches C++)
+    scale_digits:       int             = 2
+    color_scheme:       int             = 2       # 1=white BG, 2=black BG
+    montage:            int             = 0
+    blurb_disabled:     int             = 1
+    phase_mask:         int             = 12      # 1/2=abrupt, 11/12=gradual (matches C++)
+    plot_mascons:       int             = 0
+    no_gmt_plots:       int             = 0       # 1=skip GMT
+    # Matplotlib-only fields:
+    dpi:                int             = 300
+    show_fig:           bool            = False
+    save_fig:           bool            = True
+    figsize:            tuple[int, int] = (10, 10)
+
+
+@dataclass
+class GridData:
+    """Grid point data (simplified from C++ grid_s, definitions.hpp:258-319).
+
+    Holds grid coordinates and boundaries.
+    """
+    lat:    list[float]       = field(default_factory=list)
+    lon:    list[float]       = field(default_factory=list)
+    maxlat: float             = 90.0
+    minlat: float             = -90.0
+    maxlon: float             = 360.0
+    minlon: float             = 0.0
+    latlon: LatLonData | None = None
+
+
+@dataclass
+class Results:
+    """Computation results (mirrors C++ results_s, definitions.hpp:338-441).
+
+    Holds output data, metadata, spatial extent, and RGB color mapping state.
+    """
+    titles:      list[str]         = field(default_factory=list)
+    units:       list[str]         = field(default_factory=list)
+    base_unit:   str               = "cm"
+    latlon:      LatLonData        = field(default_factory=LatLonData)
+    error_bars:  list[float]       = field(default_factory=list)
+    marker_lats: list[list[float]] = field(default_factory=list)
+    marker_lons: list[list[float]] = field(default_factory=list)
+    minlat:      float             = -90.0
+    maxlat:      float             = 90.0
+    minlon:      float             = 0.0
+    maxlon:      float             = 360.0
+    rgb:         list[float]       = field(default_factory=list)
+    rgb_choice:  int               = 2    # C++ default: 0=non-uniform, 1=uniform, 2=multi-width
+    max_labels:  int               = 10   # C++ default
+    max_widths:  int               = 1
+    options:     AnalysisOptions   = field(default_factory=AnalysisOptions)
 
 
 # ---------------------------------------------------------------------------
@@ -73,10 +175,10 @@ class Options:
         # Files to copy into output
         self.files_to_copy: list[str] = ["projections.sh", "overflow.sh", "notation.sh"]
 
-        # Large dicts (initialized by helpers in main)
-        self.plot_options:  dict[str, Any] = {}
-        self.grid:          dict[str, Any] = {}
-        self.results:       dict[str, Any] = {}
+        # Data structures (initialized by populate_results after hot path)
+        self.plot_options:  PlotOptions = PlotOptions()
+        self.grid:          GridData    = GridData()
+        self.results:       Results     = Results()
 
 
 # ---------------------------------------------------------------------------
@@ -114,12 +216,24 @@ def parse_arguments(options: Options) -> None:
                         help=f"DPI for output images (default: {options.dpi}).")
     parser.add_argument("-d", "--debug", action="store_true",
                         help="Enable debug logging.")
+    parser.add_argument("--no-gmt", action="store_true",
+                        help="Skip GMT plot generation.")
+    parser.add_argument("--projection", type=int, choices=[1, 2, 3, 4], default=None,
+                        help="Map projection: 1=Robinson, 2=Winkel Tripel, 3=Mollweide, 4=Miller.")
+    parser.add_argument("--use-old-funcs", action="store_true",
+                        help="Use Hughes & Williams 2010 functions instead of colour-science.")
     options.args = parser.parse_args()
     assert options.args is not None  # For mypy
     if options.args.debug:
         options.log_mode = logging.DEBUG
     if options.args.input_choice is not None:
         options.input_choice = options.args.input_choice
+    if options.args.no_gmt:
+        options.plot_options.no_gmt_plots = 1
+    if options.args.projection is not None:
+        options.plot_options.projection = options.args.projection
+    if options.args.use_old_funcs:
+        options.use_new_funcs = False
     options.dpi = options.args.dpi
 
 
@@ -156,11 +270,6 @@ def main() -> None:
 
     # Zip the current script into the output folder
     zip_script(options)
-
-    # Initialize plot_options, grid, results dicts
-    init_plot_options(options)
-    init_grid(options)
-    init_results(options)
 
     # Matplotlib setup
     plt.style.use("dark_background")
@@ -289,10 +398,7 @@ def main() -> None:
     cie_z_vals      = cie["z"].values
     wavelength_step = np.diff(cie_wavelengths).mean()
 
-    # Old XYZ-to-linear-sRGB matrix (Hughes & Williams 2010, no gamma)
-    A_old = np.array([[ 3.2409699,  -1.5373832,  -0.49861079],
-                      [-0.96924375,  1.8759676,   0.041555082],
-                      [ 0.055630032, -0.20397685,  1.0569714]])
+    A_old = A_OLD_XYZ_TO_SRGB
 
     # Pre-filter all-NaN grid points (land)
     valid_mask = ~np.all(np.isnan(data_2d), axis=0)
@@ -390,23 +496,47 @@ def main() -> None:
     time_taken = hot_end - hot_start
     logging.info(f"Time taken WITHOUT DASK: {time_taken:.2f} seconds")
 
-    # Convert RGB values from [0,1] to [0,255]
-    #for thiskey in ['red','green','blue']:
-    #    spectral_color_maps[thiskey] = spectral_color_maps[thiskey] * 255.0
+    # Populate dataclasses from actual computed data
+    populate_results(options, spectral_color_maps)
 
     # ===================================================================
     # Save outputs and plot
     # ===================================================================
-    rgb_filenames = []
-    for thekey in spectral_color_maps.keys():
-        date_str = dt.datetime.now().strftime("%Y%m%d-%H%M%S")
-        filename = options.output_folder / f"{thekey.replace(' ', '_')}.nc"
-        rgb_filenames.append(filename)
-
+    # Save XYZ tristimulus NetCDFs
+    for thekey in ["x", "y", "z"]:
+        da       = spectral_color_maps[thekey]
+        filename = options.output_folder / f"{thekey}.nc"
+        da.coords[options.lat_key].attrs = {"units": "degrees_north", "long_name": "Latitude"}
+        da.coords[options.lon_key].attrs = {"units": "degrees_east",  "long_name": "Longitude"}
+        da.attrs["long_name"]            = f"Spectral color {thekey}"
+        da.attrs["units"]                = "dimensionless"
         logging.info(f"Saving {os.fspath(filename)}...")
-        spectral_color_maps[thekey].to_netcdf(filename)
-    logging.info("Finished saving.")
+        da.to_netcdf(filename)
 
+    # Save RGB NetCDFs at [0, 1] range (matches reference output)
+    for thekey in ["red", "green", "blue"]:
+        da       = spectral_color_maps[thekey]
+        filename = options.output_folder / f"{thekey}.nc"
+        da.coords[options.lat_key].attrs = {"units": "degrees_north", "long_name": "Latitude"}
+        da.coords[options.lon_key].attrs = {"units": "degrees_east",  "long_name": "Longitude"}
+        da.attrs["long_name"]            = f"Spectral color {thekey}"
+        da.attrs["units"]                = "dimensionless"
+        logging.info(f"Saving {os.fspath(filename)}...")
+        da.to_netcdf(filename)
+
+    # Save RGB NetCDFs scaled to [0, 255] for GMT (grdimage expects byte range)
+    for thekey in ["red", "green", "blue"]:
+        scaled   = spectral_color_maps[thekey] * 255.0
+        gmt_file = options.output_folder / f"{thekey}_gmt.nc"
+        scaled.coords[options.lat_key].attrs = {"units": "degrees_north", "long_name": "Latitude"}
+        scaled.coords[options.lon_key].attrs = {"units": "degrees_east",  "long_name": "Longitude"}
+        scaled.attrs["long_name"]            = f"Spectral color {thekey} (scaled 0-255)"
+        scaled.attrs["units"]                = "dimensionless"
+        logging.info(f"Saving {os.fspath(gmt_file)} (scaled to [0,255] for GMT)...")
+        scaled.to_netcdf(gmt_file)
+    logging.info("Finished saving NetCDFs.")
+
+    # Plot individual variables
     for thekey in spectral_color_maps.keys():
         img = plt.imshow(spectral_color_maps[thekey], origin="lower")
         plt.colorbar(img, orientation="horizontal")
@@ -426,17 +556,12 @@ def main() -> None:
     plt.savefig(options.output_folder / "image_matplotlib.png", dpi=options.dpi)
     plt.close()
 
-    # Scale RGB NetCDF files to [0, 255] for GMT (grdimage expects byte range)
-    for thekey in ["red", "green", "blue"]:
-        scaled = spectral_color_maps[thekey] * 255.0
-        scaled.to_netcdf(options.output_folder / f"{thekey}.nc")
-    logging.info("Re-saved red/green/blue.nc scaled to [0, 255] for GMT.")
+    if not options.plot_options.no_gmt_plots:
+        write_rgb_colorscale(options, cie)
+        write_gmt_scripts(options)
+        run_gmt_scripts(options)
 
-    write_rgb_colorscale(options, cie)
-    write_gmt_scripts(options)
-    run_gmt_scripts(options)
-
-    logging.error("!!!WARNING!!! Next line assumes these units are originally in ns and you want the units to be days!!!")
+    logging.debug("Next line assumes these units are originally in ns and you want the units to be days.")
     logging.info("All finished!")
     logging.info("Download and analyze chlorophyll data, as well as sea surface salinity data!")
 
@@ -571,6 +696,61 @@ def rms_and_mean(x: xr.DataArray) -> xr.Dataset:
 def normalize_data(data: Any, max_value: float) -> list[float]:
     """Normalize data by dividing by max_value."""
     return [i / max_value for i in data]
+
+
+# ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# Populate dataclasses from computed results
+# ---------------------------------------------------------------------------
+
+def populate_results(options: Options, spectral_color_maps: xr.Dataset) -> None:
+    """Populate options.results and options.plot_options from actual computed data.
+
+    Called after the hot path completes and spectral_color_maps is assembled.
+    Replaces the old init_results/init_plot_options dummy values with real
+    lat/lon coordinates, titles, units, and spatial extent.
+
+    Args:
+        options:              Options object (results, plot_options, grid mutated).
+        spectral_color_maps:  xarray Dataset with x, y, z, red, green, blue
+                              variables on (lat_key, lon_key) coordinates.
+    """
+    results = options.results
+    lats    = spectral_color_maps.coords[options.lat_key].values
+    lons    = spectral_color_maps.coords[options.lon_key].values
+
+    # Populate latlon from actual computed grid
+    results.latlon.lat = lats.tolist()
+    results.latlon.lon = lons.tolist()
+    results.latlon.outputs = [
+        spectral_color_maps["red"].values.tolist(),
+        spectral_color_maps["green"].values.tolist(),
+        spectral_color_maps["blue"].values.tolist(),
+    ]
+
+    # Spatial extent from actual data
+    results.minlat = float(lats.min())
+    results.maxlat = float(lats.max())
+    results.minlon = float(lons.min())
+    results.maxlon = float(lons.max())
+
+    # Real metadata
+    results.titles = ["Spectral Colors"]
+    results.units  = ["days"]
+    results.rgb    = [1.0, 1.0, 1.0]  # 3 elements signals RGB mode
+
+    # Populate grid
+    options.grid.lat    = lats.tolist()
+    options.grid.lon    = lons.tolist()
+    options.grid.maxlat = results.maxlat
+    options.grid.minlat = results.minlat
+    options.grid.maxlon = results.maxlon
+    options.grid.minlon = results.minlon
+
+    # Plot options
+    options.plot_options.outputfolder       = os.fspath(options.output_folder) + os.sep
+    options.plot_options.just_the_filenames = ["red_gmt.nc", "green_gmt.nc", "blue_gmt.nc"]
+    options.plot_options.dpi                = options.dpi
 
 
 # ---------------------------------------------------------------------------
@@ -1175,13 +1355,108 @@ def timeseries_to_xyz(options: Options, timeseries: xr.Dataset, x_key: str, y_ke
 # GMT high-level functions
 # ---------------------------------------------------------------------------
 
+def write_gmt_cpt(options: Options, new_fp: BinaryIO, i: int) -> None:
+    """Write GMT commands for creating the CPT (color palette) file.
+
+    Ported from C++ write_gmt_cpt() (abridged-functions.cpp lines 3-98).
+    Only called for non-RGB maps (single-parameter: trend, amplitude, phase).
+    For RGB spectral-color maps, this function is not invoked.
+
+    Args:
+        options: Options object. Contains:
+                     - results:      Results with options.output_choice, rgb, etc.
+                     - plot_options: PlotOptions with symmetric_limit, scale_digits.
+        new_fp:  Binary file handle for the GMT script being written.
+        i:       Index of the parameter being scaled.
+    """
+    results      = options.results
+    plot_options = options.plot_options
+    numlevels    = 10
+    digits       = plot_options.scale_digits
+
+    palette_guide  = "#0-360phase=cyclic,amps=wysiwyg,trend=polar,topo=relief,pts=rainbow"
+    overflow_guide = "#-E=both,-Ef=top,-Eb=bottom"
+
+    if results.options.output_choice == 1:
+        # Unstructured output
+        if results.options.output_type[i] == 104:
+            # Phase map: cyclic palette, fixed [-180, 180] range
+            new_fp.write(f'palette=" -Ccyclic " {palette_guide}\n'.encode())
+            new_fp.write(f'upper_limit="{180.0:.6f}"\n'.encode())
+            new_fp.write(f'lower_limit="{-180.0:.6f}"\n'.encode())
+        else:
+            new_fp.write(f'palette=" -Crainbow " {palette_guide}\n'.encode())
+            new_fp.write(f'upper_limit="{results.max:.6f}"\n'.encode())
+            new_fp.write(f'lower_limit="{results.min:.6f}"\n'.encode())
+        new_fp.write(f'overflow="" {overflow_guide}\n'.encode())
+        new_fp.write(f'numlevels="{numlevels}"\n'.encode())
+        new_fp.write(b'# The "| bc -l" helps bash deal with floating point numbers.\n')
+        new_fp.write(b'interval="$(echo "($upper_limit - $lower_limit) / $numlevels" | bc -l)"\n')
+        new_fp.write(b'$gmt_prefix makecpt $palette -T$lower_limit/$upper_limit/$interval -Z > map.cpt\n')
+
+    elif results.options.output_choice == 5:
+        # Latlon grid output — check RGB first since output_type may be empty
+        if len(results.rgb) == 3:
+            # RGB map: just set coast color
+            new_fp.write(b'  coast_color="gray82"\n')
+
+        elif i < len(results.options.output_type) and results.options.output_type[i] == 104:
+            # Phase map: cyclic palette
+            logging.info("NOTE: Phases should only use the cyclic colorscale if the min/max span [-180,180] or [0,360]!")
+            new_fp.write(f'palette=" -Ccyclic -I " {palette_guide}\n'.encode())
+            new_fp.write(f'limits="" #Default limits include all values (not just in subset), aren\'t always symmetric.\n'.encode())
+            new_fp.write(f'overflow="" {overflow_guide}\n'.encode())
+            numlevels = 13  # 360 degrees / 12 (+1 for value 0.0) divides nicely
+            new_fp.write(f'numlevels="{numlevels}"\n'.encode())
+            new_fp.write(b'$gmt_prefix grd2cpt $data_name $palette $limits -E$numlevels -Z > map.cpt\n')
+
+        else:
+            # Non-RGB single-parameter map: WYSIWYG palette with data-driven limits
+            new_fp.write(b'subset_name=$data_name"_subset" #Weird to append, but works with ../pl..\n')
+            new_fp.write(b'$gmt_prefix grdcut $data_name -G$subset_name $actual_range #Only use subset values for scale.\n')
+            new_fp.write(b'$gmt_prefix grdinfo -L0 $subset_name > subset_grdinfo #Extract data range from subset.\n')
+            new_fp.write(f"data_min_e=$(awk '/z_min: /{{printf \"%.{digits}e\\n\", $3}}' subset_grdinfo)\n".encode())
+            new_fp.write(f"data_max_e=$(awk '/z_max: /{{printf \"%.{digits}e\\n\", $5}}' subset_grdinfo)\n".encode())
+            new_fp.write(f"data_min_f=$(awk '/z_min: /{{printf \"%.{digits}f\\n\", $3}}' subset_grdinfo)\n".encode())
+            new_fp.write(f"data_max_f=$(awk '/z_max: /{{printf \"%.{digits}f\\n\", $5}}' subset_grdinfo)\n".encode())
+            new_fp.write(b'notation="f" #By default, numbers appear in floating point format.\n')
+            new_fp.write(b'data_min_print=$data_min_f #By default, numbers appear in floating point format.\n')
+            new_fp.write(b'data_max_print=$data_max_f #By default, numbers appear in floating point format.\n')
+            new_fp.write(f'palette=" -Cwysiwyg " {palette_guide}\n'.encode())
+            new_fp.write(f'symmetric_limit="{plot_options.symmetric_limit:.6f}"\n'.encode())
+            new_fp.write(b'if [[ $(bc <<< "$symmetric_limit <= 0.0") == 1 || $(bc <<< "$data_min_f >= 0.0") == 1 || $(bc <<< "$data_max_f <= 0.0 ") == 1 ]]\n')
+            new_fp.write(b'then\n')
+            new_fp.write(b'  upper_limit=$data_max_f\n')
+            new_fp.write(b'  lower_limit=$data_min_f\n')
+            new_fp.write(b'else\n')
+            new_fp.write(b'  upper_limit=$symmetric_limit\n')
+            new_fp.write(b'  lower_limit=-$upper_limit\n')
+            new_fp.write(b'fi\n')
+            new_fp.write(b'limits=" -L$lower_limit/$upper_limit "\n')
+            new_fp.write(b'. ./overflow.sh\n')
+            # Coastline color: off-white if all non-negative, dark if mixed signs
+            new_fp.write(b'if [[ $(bc <<< "$data_min_f >= 0.0") == 1 ]]\n')
+            new_fp.write(b'then\n')
+            new_fp.write(b'  coast_color="gray82"\n')
+            new_fp.write(b'else\n')
+            new_fp.write(b'  coast_color="gray10"\n')
+            new_fp.write(b'fi\n')
+            new_fp.write(f'numlevels="{numlevels}"\n'.encode())
+            new_fp.write(b'$gmt_prefix grd2cpt $data_name $palette $limits -E$numlevels -Z > map.cpt\n')
+
+    else:
+        logging.error(f"!!!!WARNING!!!!!! results.options.output_choice {results.options.output_choice} isn't recognized.")
+
+    plot_options.blurb_disabled = 0  # Better to always see the blurb
+
+
 def is_polar(options: Options) -> int:
     """Determine if the data is global, north-polar, or south-polar.
 
     Args:
         options: Options object. Contains:
-                     - results: Results dict (mutated with min/maxlat/lon).
-                     - grid:    Grid dict.
+                     - results: Results (mutated with min/maxlat/lon).
+                     - grid:    GridData.
 
     Returns:
         0 for global, 1 for north pole, 2 for south pole.
@@ -1190,24 +1465,24 @@ def is_polar(options: Options) -> int:
     grid    = options.grid
     polar   = 0
 
-    if results["options"]["output_choice"] == 1 or results["options"]["output_choice"] == 4:
-        results["minlat"] = min(grid["lat"])
-        results["maxlat"] = max(grid["lat"])
-        results["minlon"] = min(grid["lon"])
-        results["maxlon"] = max(grid["lon"])
-    elif results["options"]["output_choice"] == 5:
-        results["minlat"] = min(results["latlon"]["lat"])
-        results["maxlat"] = max(results["latlon"]["lat"])
-        results["minlon"] = min(results["latlon"]["lon"])
-        results["maxlon"] = max(results["latlon"]["lon"])
+    if results.options.output_choice in (1, 4):
+        results.minlat = min(grid.lat)
+        results.maxlat = max(grid.lat)
+        results.minlon = min(grid.lon)
+        results.maxlon = max(grid.lon)
+    elif results.options.output_choice == 5:
+        results.minlat = min(results.latlon.lat)
+        results.maxlat = max(results.latlon.lat)
+        results.minlon = min(results.latlon.lon)
+        results.maxlon = max(results.latlon.lon)
     else:
-        logging.error(f"!!!!WARNING!!!!!! results['options']['output_choice'] {results['options']['output_choice']} isn't recognized.")
+        logging.error(f"!!!!WARNING!!!!!! results.options.output_choice {results.options.output_choice} isn't recognized.")
 
-    if results["minlat"] < 0 and results["maxlat"] > 0:
+    if results.minlat < 0 and results.maxlat > 0:
         polar = 0
-    elif results["minlat"] > 0 and results["maxlat"] > 0:
+    elif results.minlat > 0 and results.maxlat > 0:
         polar = 1
-    elif results["minlat"] < 0 and results["maxlat"] < 0:
+    elif results.minlat < 0 and results.maxlat < 0:
         polar = 2
 
     return polar
@@ -1222,14 +1497,13 @@ def write_gmt_colorscale(options: Options, new_fp: BinaryIO, kml_output: int) ->
         kml_output: 0 for GMT scale next to plot, 1 for KMZ by itself.
     """
     results = options.results
-    rgb     = {}  # Just to init choice and maxes.
 
-    if len(results["rgb"]) != 3:
+    if len(results.rgb) != 3:
         new_fp.write(b"cpt_name=\"-Cmap.cpt \"\n")
     else:
         new_fp.write(b"cpt_name=\"-Crgb00001.cpt \"\n")
 
-    if len(results["rgb"]) != 3 or results["rgb_choice"] < 2:
+    if len(results.rgb) != 3 or results.rgb_choice < 2:
         if kml_output:
             new_fp.write(b"gmt psscale $cpt_name -L $scale_format $overflow $scale_pos -A $start > scale_$plot_base.ps\n")
             new_fp.write(b"# Print units manually, otherwise they're too close to numbers on scale.\n")
@@ -1239,7 +1513,7 @@ def write_gmt_colorscale(options: Options, new_fp: BinaryIO, kml_output: int) ->
             new_fp.write(b"# Print units manually, otherwise they're too close to numbers on scale.\n")
             new_fp.write(b"echo $units_format $scale_units | gmt pstext -N $units_pos $misc_range $middle >> $plot_base.ps\n")
     else:
-        new_fp.write(f"numwidths={results['max_widths']}\n".encode())
+        new_fp.write(f"numwidths={results.max_widths}\n".encode())
         new_fp.write(b"gmt set TICK_LENGTH 0.3c\n")
         new_fp.write(b"scale_width=$(bc <<< \"scale=5; $scale_width / $numwidths\")\n")
         new_fp.write(b"for (( j=1; j <= $numwidths; j++ ))\n")
@@ -1322,10 +1596,7 @@ def write_rgb_colorscale(options: Options, cie: xr.Dataset) -> None:
     if options.use_new_funcs:
         rgb_cpt = XYZ_to_sRGB(xyz_cpt)
     else:
-        A_old   = np.array([[ 3.2409699,  -1.5373832,  -0.49861079],
-                            [-0.96924375,  1.8759676,   0.041555082],
-                            [ 0.055630032, -0.20397685,  1.0569714]])
-        rgb_cpt = (A_old @ xyz_cpt.T).T
+        rgb_cpt = (A_OLD_XYZ_TO_SRGB @ xyz_cpt.T).T
 
     # Fix gamut (vectorized)
     rgb_arr   = rgb_cpt.T.copy()  # shape (3, n_steps)
@@ -1371,16 +1642,16 @@ def write_gmt_map_data(options: Options, new_fp: BinaryIO, title: str, i: int) -
     plot_options = options.plot_options
 
     polar      = is_polar(options)
-    coastlines = plot_options["coastlines"]  # Default; overridden below for polar == 1
+    coastlines = plot_options.coastlines  # Default; overridden below for polar == 1
 
     if i == 0:
         new_fp.write(b"#Set resolution, coast_file, coast_thickness, and coastlines\n")
         new_fp.write(b"#on first map only because they should be universal.\n")
-        coast_file = plot_options["outputfolder"] + "data/ancillary/Rignot/InSAR_GL_Antarctica.txt"
+        coast_file = plot_options.outputfolder + "data/ancillary/Rignot/InSAR_GL_Antarctica.txt"
         new_fp.write(f'coast_file="{coast_file}"\n'.encode())
 
-        if results["options"]["output_choice"] == 5:
-            delta_lat = abs(results["latlon"]["lat"][1] - results["latlon"]["lat"][0])
+        if results.options.output_choice == 5:
+            delta_lat = abs(results.latlon.lat[1] - results.latlon.lat[0])
             if delta_lat < 0.4:
                 new_fp.write(b'resolution=" -E50 " #50/2000 is low/high quality.\n')
                 new_fp.write(b'coast_res=" -Df+ "\n')
@@ -1390,11 +1661,11 @@ def write_gmt_map_data(options: Options, new_fp: BinaryIO, title: str, i: int) -
             else:
                 new_fp.write(b'resolution=" -E50 " #50/2000 is low/high quality.\n')
                 new_fp.write(b'coast_res=" -Di+ "\n')
-        elif results["options"]["output_choice"] in [1, 4]:
+        elif results.options.output_choice in (1, 4):
             new_fp.write(b'resolution=" -E50 " #50/2000 is low/high quality.\n')
             new_fp.write(b'coast_res=" -Di+ "\n')
         else:
-            logging.error(f"!!!!WARNING!!!!!! results['options']['output_choice'] {results['options']['output_choice']} isn't recognized.")
+            logging.error(f"!!!!WARNING!!!!!! results.options.output_choice {results.options.output_choice} isn't recognized.")
 
         new_fp.write(b'coast_res_orig=$coast_res #Don\'t want USA maps to repeatedly add -N2.\n')
         new_fp.write(b'coast_thk="0.6"\n')
@@ -1406,17 +1677,17 @@ def write_gmt_map_data(options: Options, new_fp: BinaryIO, title: str, i: int) -
     new_fp.write(b"#coast_color is gray82 for off-white, or gray10 for dark coastlines.\n")
 
     # Adjust max/min latitudes for mapping points
-    if results["options"]["output_choice"] in [1, 4]:
+    if results.options.output_choice in (1, 4):
         buffer = 5
-        if results["maxlat"] <= 90 - buffer:
-            results["maxlat"] += buffer
-        if results["minlat"] >= -90 + buffer:
-            results["minlat"] -= buffer
+        if results.maxlat <= 90 - buffer:
+            results.maxlat += buffer
+        if results.minlat >= -90 + buffer:
+            results.minlat -= buffer
 
     new_fp.write(b'title_format="0 0 30 0 0 MC"\n')
     new_fp.write(b'blurb_format="0 0 15 0 1 ML"\n')
     new_fp.write(b'units_format="0 0 13 0 0 MC"\n')
-    new_fp.write(f"scale_units=\"{results['units'][i]}\"\n".encode())
+    new_fp.write(f"scale_units=\"{results.units[i]}\"\n".encode())
 
     new_fp.write(b'misc_range=" -R0/1/0/1 -JX1c "\n')
     new_fp.write(b"#grdcut requires actual limits, but if grdimage uses them: GMT Fatal Error: grdimage could not allocate memory [21.69 Gb, n_items = 5823567396]\n")
@@ -1447,7 +1718,7 @@ def write_gmt_map_data(options: Options, new_fp: BinaryIO, title: str, i: int) -
             new_fp.write(b"# 1102 - California\n")
 
         if polar == 0:
-            new_fp.write(f"{'#' if i > 0 else ''}projection_choice={plot_options['projection']}\n".encode())
+            new_fp.write(f"{'#' if i > 0 else ''}projection_choice={plot_options.projection}\n".encode())
         else:
             if polar == 1:
                 new_fp.write(f"{'#' if i > 0 else ''}projection_choice=101\n".encode())
@@ -1460,7 +1731,7 @@ def write_gmt_map_data(options: Options, new_fp: BinaryIO, title: str, i: int) -
         new_fp.write(b"if [ $projection_choice == 101 ]\n")
         new_fp.write(b"then\n")
 
-        minlat = results["minlat"] if polar == 1 else 0.0
+        minlat = results.minlat if polar == 1 else 0.0
         new_fp.write(f"  minlat={minlat:.3f}\n".encode())
         new_fp.write(b"  actual_range=\" -R0.0/360.0/$minlat/90.0 \"\n")
         polar_radius = 90 - minlat
@@ -1469,7 +1740,7 @@ def write_gmt_map_data(options: Options, new_fp: BinaryIO, title: str, i: int) -
         new_fp.write(b"elif [ $projection_choice == 102 ]\n")
         new_fp.write(b"then\n")
 
-        maxlat = results["maxlat"] if polar == 2 else 0.0
+        maxlat = results.maxlat if polar == 2 else 0.0
         new_fp.write(f"  maxlat={maxlat:.3f}\n".encode())
         new_fp.write(b"  actual_range=\" -R0.0/360.0/-90.0/$maxlat \"\n")
         polar_radius = 90 + maxlat
@@ -1480,7 +1751,7 @@ def write_gmt_map_data(options: Options, new_fp: BinaryIO, title: str, i: int) -
         new_fp.write(b"range=\" -R${minlon}/${maxlon}/${minlat}/${maxlat} \"\n")
         new_fp.write(b"map_pos=\" -Xa${map_x}c -Ya${map_y}c \"\n")
 
-        if len(results["rgb"]) == 3 and results["rgb_choice"] >= 2:
+        if len(results.rgb) == 3 and results.rgb_choice >= 2:
             new_fp.write(b"scale_width=1.2 #Override for RGB maps.\n")
 
         new_fp.write(b"scale_pos=\" -D${scale_x}c/${scale_y}c/${scale_length}c/${scale_width}c \"\n")
@@ -1492,25 +1763,28 @@ def write_gmt_map_data(options: Options, new_fp: BinaryIO, title: str, i: int) -
     else:
         logging.error("!!!WARNING!!! NO TITLE!")
 
+    # Create CPT file for coloring map (non-RGB maps only).
+    write_gmt_cpt(options, new_fp, i)
+
     # Plot data, with title on top.
     new_fp.write(f"title=\"{title}\"\n".encode())
-    if len(results["rgb"]) == 3 and len(results["latlon"]["outputs"]) == 3:
-        new_fp.write(b"gmt grdimage red.nc green.nc blue.nc $boundary $resolution $range $projection $map_pos $start > $plot_base.ps\n")
+    if len(results.rgb) == 3 and len(results.latlon.outputs) == 3:
+        new_fp.write(b"gmt grdimage red_gmt.nc green_gmt.nc blue_gmt.nc $boundary $resolution $range $projection $map_pos $start > $plot_base.ps\n")
     else:
         new_fp.write(b"gmt grdimage $data_name $boundary $resolution $range $projection $map_pos -Cmap.cpt $start > $plot_base.ps\n")
 
     write_gmt_coastlines(new_fp)
 
-    if (len(results["marker_lats"]) == len(results["latlon"]["outputs"])
-            and len(results["marker_lons"]) == len(results["latlon"]["outputs"])
-            and results["latlon"]["outputs"]):
-        if results["marker_lats"][i] and results["marker_lons"][i]:
+    if (len(results.marker_lats) == len(results.latlon.outputs)
+            and len(results.marker_lons) == len(results.latlon.outputs)
+            and results.latlon.outputs):
+        if results.marker_lats[i] and results.marker_lons[i]:
             new_fp.write(b"gmt psxy -N $data_name -bcmarker_lons/marker_lats -S+0.5c -W5/244/164/96 -G244/164/96 $range $projection $map_pos $middle >> $plot_base.ps\n")
 
     new_fp.write(b"#Uncomment to put a marker at echoed coords, given as lon lat:\n")
     new_fp.write(b"#echo -85.19 -77.36 | gmt psxy -N -S+0.5c -W5/244/164/96 -G244/164/96 $range $projection $map_pos $middle >> $plot_base.ps\n")
 
-    if plot_options["plot_mascons"] != 0 and results["latlon"]["mascon_lats"]:
+    if plot_options.plot_mascons != 0 and results.latlon.mascon_lats:
         new_fp.write(b"gmt psxy $data_name -bcmascon_lons/mascon_lats -Sc0.01c -G139/69/19 $range $projection $map_pos $middle >> $plot_base.ps\n")
 
     new_fp.write(b"if [ $montage != 0 ]\n")
@@ -1528,18 +1802,18 @@ def write_gmt_map_data(options: Options, new_fp: BinaryIO, title: str, i: int) -
     write_gmt_colorscale(options, new_fp, 0)
 
     # Print blurb about data range, or masked amplitudes for phase plots.
-    if len(results["rgb"]) == 3 and len(results["latlon"]["outputs"]) == 3:
-        plot_options["blurb_disabled"] = 1
-    if plot_options["blurb_disabled"]:
+    if len(results.rgb) == 3 and len(results.latlon.outputs) == 3:
+        plot_options.blurb_disabled = 1
+    if plot_options.blurb_disabled:
         new_fp.write(b"blurb_contents=\"\"\n")
 
     new_fp.write(b"echo $blurb_format $blurb_contents | gmt pstext -N $blurb_pos $misc_range $middle >> $plot_base.ps\n")
 
     blurb2_written = 0
-    if len(results["latlon"]["outputs"]) == len(results["error_bars"]) and results["latlon"]["outputs"]:
-        if results["error_bars"][i] > 0.0:
+    if len(results.latlon.outputs) == len(results.error_bars) and results.latlon.outputs:
+        if results.error_bars[i] > 0.0:
             blurb2_written = 1
-            new_fp.write(f"blurb2_contents=\"Error bar: {results['error_bars'][i]:.1f} $scale_units\"\n".encode())
+            new_fp.write(f"blurb2_contents=\"Error bar: {results.error_bars[i]:.1f} $scale_units\"\n".encode())
 
     if not blurb2_written:
         new_fp.write(b"blurb2_contents=\"\" #Error bar: N/A $scale_units\n")
@@ -1557,7 +1831,7 @@ def write_gmt_scripts(options: Options) -> None:
     grid         = options.grid
     results      = options.results
 
-    new_file = Path(plot_options["outputfolder"]) / "create_plots.sh"
+    new_file = Path(plot_options.outputfolder) / "create_plots.sh"
     try:
         new_fp = new_file.open("wb")
     except IOError:
@@ -1566,7 +1840,7 @@ def write_gmt_scripts(options: Options) -> None:
     new_fp.write(b"#!/bin/bash\n")
     new_fp.write(b"#set -x #Uncomment to echo these commands.\n")
 
-    flip_file = Path(plot_options["outputfolder"]) / "flip_backgrounds.sh"
+    flip_file = Path(plot_options.outputfolder) / "flip_backgrounds.sh"
     try:
         flip_fp = flip_file.open("wb")
     except IOError:
@@ -1575,7 +1849,7 @@ def write_gmt_scripts(options: Options) -> None:
     flip_fp.write(b"#!/bin/bash\n")
     flip_fp.write(b"set -x\n")
 
-    trim_file = Path(plot_options["outputfolder"]) / "trim.sh"
+    trim_file = Path(plot_options.outputfolder) / "trim.sh"
     try:
         trim_fp = trim_file.open("wb")
     except IOError:
@@ -1584,26 +1858,28 @@ def write_gmt_scripts(options: Options) -> None:
     trim_fp.write(b"#!/bin/bash\n")
     trim_fp.write(b"set -x\n")
 
-    if 1:  #len(results['rgb']) == 3 and len(results['latlon']['outputs']) == 3:
-        just_the_filenames = plot_options["just_the_filenames"][:1]
+    if len(results.rgb) == 3 and len(results.latlon.outputs) == 3:
+        just_the_filenames = plot_options.just_the_filenames[:1]
+    else:
+        just_the_filenames = plot_options.just_the_filenames
 
     for i in range(len(just_the_filenames)):
         if i == 0:
             write_gmt_defs(new_fp)
-            new_fp.write(f"color_scheme={plot_options['color_scheme']} #1/2=white/black background\n".encode())
-            new_fp.write(f"montage={plot_options['montage']} #1=left-justify titles, add (a),(b), run montage.sh.\n".encode())
+            new_fp.write(f"color_scheme={plot_options.color_scheme} #1/2=white/black background\n".encode())
+            new_fp.write(f"montage={plot_options.montage} #1=left-justify titles, add (a),(b), run montage.sh.\n".encode())
             new_fp.write(b"prefixes=('(a)' '(b)' '(c)' '(d)' '(e)' '(f)' '(g)' '(h)' '(i)' '(j)' '(k)' '(l)' '(m)' '(n)' '(o)' '(p)' '(q)' '(r)' '(s)' '(t)' '(u)' '(v)' '(w)' '(x)' '(y)' '(z)')\n")
             new_fp.write(b"index=-1 #Increments on each map, accesses prefixes above for montage.\n")
             new_fp.write(b'png_options=" -P -Tg " #PDF default: -E720, else 300 dpi.\n')
             new_fp.write(b"if [ $montage != 0 ]\nthen\n  png_options=\" -A\"$png_options\nfi\n")
             new_fp.write(b"#Force off-white(dark gray) fore(back)ground color because\n#flip_backgrounds.sh can change the maps' text from\n#black to white, and their backgrounds from white to black.\n")
             new_fp.write(b"gmt set COLOR_BACKGROUND=2/2/2 COLOR_FOREGROUND=253/253/253\n")
-            new_fp.write(f"digits={plot_options['scale_digits']}\n".encode())
+            new_fp.write(f"digits={plot_options.scale_digits}\n".encode())
             new_fp.write(b"gmt set D_FORMAT=%.${digits}f\n")
 
-        s = f"{plot_options['output_base']}_{i + 1:04d}"
+        s = f"{plot_options.output_base}_{i + 1:04d}"
         new_fp.write(b"#######################################################\n")
-        if 1:  #len(results['rgb']) == 3 and len(results['latlon']['outputs']) == 3:
+        if len(results.rgb) == 3 and len(results.latlon.outputs) == 3:
             new_fp.write(b"data_name=redgreenblue\n")
         else:
             new_fp.write(f'data_name="{just_the_filenames[i]}"\n'.encode())
@@ -1625,13 +1901,13 @@ def write_gmt_scripts(options: Options) -> None:
             flip_fp.write(f'{s}"\n'.encode())
             trim_fp.write(f'{s}"\n'.encode())
 
-        write_gmt_map_data(options, new_fp, results["titles"][i], i)
+        write_gmt_map_data(options, new_fp, results.titles[i], i)
 
         new_fp.write(b"gmt psconvert $png_options $plot_base.ps #Convert PS to PNG format.\n")
         new_fp.write(b"#convert -P -Tf $plot_base.ps #Convert PS to PDF, if uncommented.\n")
         new_fp.write(b"rm -f $plot_base.ps\n")
 
-        if len(results["rgb"]) != 3:
+        if len(results.rgb) != 3:
             new_fp.write(b"mv map.cpt Zbackup_cpt_$plot_base.cpt\n")
 
         new_fp.write(b"previous_data_name=$data_name\n")
@@ -1659,7 +1935,7 @@ def write_gmt_scripts(options: Options) -> None:
     trim_fp.close()
 
     # Create animate script
-    extra_file = Path(plot_options["outputfolder"]) / "animate.sh"
+    extra_file = Path(plot_options.outputfolder) / "animate.sh"
     try:
         extra_fp = extra_file.open("wb")
     except IOError:
@@ -1671,7 +1947,7 @@ def write_gmt_scripts(options: Options) -> None:
     extra_fp.write(b"#size=\"640x480\"\n")
     extra_fp.write(b"#size=\"800x600\"\n")
     extra_fp.write(b"size=\"1024x768\"\n")
-    extra_fp.write(f"output_base=\"{plot_options['output_base']}\"\n".encode())
+    extra_fp.write(f"output_base=\"{plot_options.output_base}\"\n".encode())
     extra_fp.write(b"#Imagemagick can also output .mng (animated PNG, not well-supported), but ffmpeg is needed as a delegate for .mp4.\n")
     extra_fp.write(b"#convert -verbose -delay $delay -loop 0 $output_base* -resize $size animation.gif\n")
     extra_fp.write(b"#Or ffmpeg can output .mp4 directly.\n")
@@ -1679,7 +1955,7 @@ def write_gmt_scripts(options: Options) -> None:
     extra_fp.close()
 
     # Create montage script
-    extra_file = Path(plot_options["outputfolder"]) / "montage.sh"
+    extra_file = Path(plot_options.outputfolder) / "montage.sh"
     try:
         extra_fp = extra_file.open("wb")
     except IOError:
@@ -1687,7 +1963,7 @@ def write_gmt_scripts(options: Options) -> None:
 
     extra_fp.write(b"#!/bin/bash\n")
     extra_fp.write(b"set -x\n")
-    extra_fp.write(f"output_base=\"{plot_options['output_base']}\"\n".encode())
+    extra_fp.write(f"output_base=\"{plot_options.output_base}\"\n".encode())
     extra_fp.write(b"montage $output_base* -geometry +2+2 montage.png\n")
     extra_fp.close()
 
@@ -1734,143 +2010,6 @@ def zip_script(options: Options) -> None:
     with zipfile.ZipFile(zip_file_path, "w") as zipf:
         zipf.write(current_script_path, arcname=current_script_path.name)
     logging.info(f"Successfully zipped {os.fspath(current_script_path)} to {os.fspath(zip_file_path)}")
-
-
-def init_plot_options(options: Options) -> None:
-    """Initialize the plot_options dict on options.
-
-    Args:
-        options: Options object (output_folder, dpi).
-    """
-    options.plot_options = {
-        "outputfolder"      : os.fspath(options.output_folder) + os.sep,
-        "just_the_filenames" : ["r.nc", "g.nc", "b.nc"],
-        "output_base"       : "map_parameter",
-        "projection"        : 1,   # 1 = Robinson projection
-        "plot_mascons"      : 0,
-        "coastlines"        : 1,   # 1:coast, 2:coast+InSAR
-        "blurb_disabled"    : 1,
-        "montage"           : 0,   # 1=left-justify titles, add (a),(b), run montage.sh
-        "region"            : "global",
-        "frame"             : "a",
-        "color_scheme"      : 2,   # 1/2=white/black background
-        "land_color"        : "white",
-        "sea_color"         : "blue",
-        "scale_digits"      : 2,
-        "show_fig"          : False,
-        "save_fig"          : True,
-        "figsize"           : (10, 10),
-        "dpi"               : options.dpi,
-        "linewidth"         : 2.0,
-        "linestyle"         : "-",
-        "color"             : "black",
-        "marker"            : "o",
-        "markersize"        : 5,
-        "markerfacecolor"   : "blue",
-        "markeredgewidth"   : 1.5,
-        "markeredgecolor"   : "black",
-        "font_size"         : 14,
-        "font_weight"       : "bold",
-        "x_label"           : "X-axis",
-        "y_label"           : "Y-axis",
-        "title"             : "My Plot",
-        "grid"              : True,
-        "grid_linestyle"    : "--",
-        "grid_linewidth"    : 0.5,
-        "grid_alpha"        : 0.7,
-    }
-
-
-def init_grid(options: Options) -> None:
-    """Initialize the grid dict on options.
-
-    Args:
-        options: Options object.
-    """
-    options.grid = {
-        "add_on" : {
-            "write_gmt_defs"             : None,
-            "just_the_filenames"         : [],
-            "color_scheme"               : 1,   # 1/2=white/black background
-            "montage"                    : 0,   # 1=left-justify titles, add (a),(b), run montage.sh
-            "prefixes"                   : ["(a)", "(b)", "(c)", "(d)", "(e)", "(f)", "(g)", "(h)",
-                                            "(i)", "(j)", "(k)", "(l)", "(m)", "(n)", "(o)", "(p)",
-                                            "(q)", "(r)", "(s)", "(t)", "(u)", "(v)", "(w)", "(x)",
-                                            "(y)", "(z)"],
-            "index"                      : -1,
-            "png_options"                : " -P -Tg ",
-            "digits"                     : 2,
-            "output_base"                : "",
-            "data_name"                  : "",
-            "write_gmt_map_data"         : None,
-            "convert"                    : None,
-            "finish_flip_backgrounds"    : None,
-            "finish_trim"                : None,
-            "outputfolder"               : "",
-            "animate.sh"                 : None,
-            "montage.sh"                 : None,
-            "write_gmt_colorscale"       : None,
-            "write_rgb_colorscale"       : None,
-        }
-    }
-
-
-def init_results(options: Options) -> None:
-    """Initialize the results dict on options.
-
-    Args:
-        options: Options object (grid, plot_options, output_folder).
-    """
-    options.results = {
-        "max_widths"         : 1,
-        "options"            : {"output_choice": 5},
-        "latlon"             : {
-            "lat"        : [10.0, 20.0, 30.0, 40.0, 50.0],
-            "lon"        : [10.0, 20.0, 30.0, 40.0, 50.0],
-            "outputs"    : ["output1", "output2", "output3"],
-            "mascon_lats" : [10.0, 20.0, 30.0],
-        },
-        "marker_lats"        : ["output1", "output2", "output3"],
-        "marker_lons"        : ["output1", "output2", "output3"],
-        "rgb"                : [1, 2, 3],
-        "rgb_choice"         : 2,
-        "units"              : ["unit1", "unit2", "unit3"],
-        "maxlat"             : 90.0,
-        "minlat"             : -90.0,
-        "maxlon"             : 180.0,
-        "minlon"             : -180.0,
-        "error_bars"         : [0.1, 0.2, 0.3],
-        "just_the_filenames" : ["example_filename"],
-        "color_scheme"       : 1,
-        "montage"            : 1,
-        "scale_digits"       : 2,
-        "output_base"        : "output",
-        "titles"             : ["example_title"],
-        "grid"               : options.grid,
-        "plot_options"       : options.plot_options,
-        "outputfolder"       : os.fspath(options.output_folder),
-        "date"               : dt.datetime.now(),
-        "config"             : {"x": 0.0, "y": 0.0, "width": 0.0, "height": 0.0},
-        "xy"                 : {"x_values": [[0.0]], "y_values": [[0.0]]},
-        "xyz"                : {"x_values": [], "y_values": [], "z_values": []},
-        "min_max"            : {"x": [0.0, 0.0], "y": [0.0, 0.0], "z": [0.0, 0.0]},
-        "misc"               : {
-            "scale_format" : "",
-            "overflow"     : "",
-            "scale_pos"    : "",
-            "units_format" : "",
-            "units_pos"    : "",
-            "misc_range"   : "",
-            "start"        : "",
-            "middle"       : "",
-            "end"          : "",
-            "scale_width"  : 0.0,
-            "scale_x"      : 0.0,
-            "scale_y"      : 0.0,
-            "scale_length" : 0.0,
-            "plot_base"    : "",
-        },
-    }
 
 
 def configure_keys_for_input(options: Options) -> None:
