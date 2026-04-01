@@ -5,6 +5,7 @@ import csv
 import logging
 import os
 import shutil
+import subprocess
 import sys
 import timeit
 import zipfile
@@ -23,7 +24,7 @@ import xarray as xr
 from colour import SpectralDistribution, sd_to_XYZ, XYZ_to_sRGB
 from colour.colorimetry import MSDS_CMFS_STANDARD_OBSERVER
 
-__version__ = "0.1.2"
+__version__ = "0.1.3"
 DAYS_IN_YEAR: Final[float] = 365.25
 
 
@@ -425,8 +426,15 @@ def main() -> None:
     plt.savefig(options.output_folder / "image_matplotlib.png", dpi=options.dpi)
     plt.close()
 
-    #write_gmt_scripts(options)
-    #run_gmt_scripts(options)
+    # Scale RGB NetCDF files to [0, 255] for GMT (grdimage expects byte range)
+    for thekey in ["red", "green", "blue"]:
+        scaled = spectral_color_maps[thekey] * 255.0
+        scaled.to_netcdf(options.output_folder / f"{thekey}.nc")
+    logging.info("Re-saved red/green/blue.nc scaled to [0, 255] for GMT.")
+
+    write_rgb_colorscale(options, cie)
+    write_gmt_scripts(options)
+    run_gmt_scripts(options)
 
     logging.error("!!!WARNING!!! Next line assumes these units are originally in ns and you want the units to be days!!!")
     logging.info("All finished!")
@@ -581,10 +589,10 @@ def write_gmt_defs(new_fp: BinaryIO) -> None:
 
 def write_gmt_coastlines(new_fp: BinaryIO) -> None:
     """Write GMT coastlines commands to the script file."""
-    new_fp.write(b"gmt coast -W$coast_thk/$coast_color $coast_res $range $projection $map_pos $middle >> $plot_base.ps\n")
+    new_fp.write(b"gmt pscoast -W$coast_thk/$coast_color $coast_res $range $projection $map_pos $middle >> $plot_base.ps\n")
     new_fp.write(b"if [ $coastlines == 2 ]\n")
     new_fp.write(b"then\n")
-    new_fp.write(b"  gmt plot -N $coast_file -: -Sc$coast_thk -W$coast_thk/$coast_color $range $projection $map_pos $middle >> $plot_base.ps\n")
+    new_fp.write(b"  gmt psxy -N $coast_file -: -Sc$coast_thk -W$coast_thk/$coast_color $range $projection $map_pos $middle >> $plot_base.ps\n")
     new_fp.write(b"fi\n")
 
 
@@ -1219,15 +1227,15 @@ def write_gmt_colorscale(options: Options, new_fp: BinaryIO, kml_output: int) ->
     if len(results["rgb"]) != 3:
         new_fp.write(b"cpt_name=\"-Cmap.cpt \"\n")
     else:
-        new_fp.write(b"cpt_name=\"-C../../rgb00001.cpt \"\n")
+        new_fp.write(b"cpt_name=\"-Crgb00001.cpt \"\n")
 
     if len(results["rgb"]) != 3 or results["rgb_choice"] < 2:
         if kml_output:
-            new_fp.write(b"gmt colorbar $cpt_name -L $scale_format $overflow $scale_pos -A $start > scale_$plot_base.ps\n")
+            new_fp.write(b"gmt psscale $cpt_name -L $scale_format $overflow $scale_pos -A $start > scale_$plot_base.ps\n")
             new_fp.write(b"# Print units manually, otherwise they're too close to numbers on scale.\n")
             new_fp.write(b"echo $units_format $scale_units | gmt pstext -N $units_pos $misc_range $end >> scale_$plot_base.ps\n")
         else:
-            new_fp.write(b"gmt colorbar $cpt_name -L $scale_format $overflow $scale_pos -A $middle >> $plot_base.ps\n")
+            new_fp.write(b"gmt psscale $cpt_name -L $scale_format $overflow $scale_pos -A $middle >> $plot_base.ps\n")
             new_fp.write(b"# Print units manually, otherwise they're too close to numbers on scale.\n")
             new_fp.write(b"echo $units_format $scale_units | gmt pstext -N $units_pos $misc_range $middle >> $plot_base.ps\n")
     else:
@@ -1237,8 +1245,8 @@ def write_gmt_colorscale(options: Options, new_fp: BinaryIO, kml_output: int) ->
         new_fp.write(b"for (( j=1; j <= $numwidths; j++ ))\n")
         new_fp.write(b"do\n")
         new_fp.write(b"  j_string=$(printf '%%05d' $j)\n")
-        new_fp.write(b"  cpt_name=\"-C../rgb$j_string.cpt\"\n")
-        new_fp.write(b"  gmt colorbar $cpt_name -L $scale_format $overflow $scale_pos -S -A $middle >> $plot_base.ps\n")
+        new_fp.write(b"  cpt_name=\"-Crgb$j_string.cpt\"\n")
+        new_fp.write(b"  gmt psscale $cpt_name -L $scale_format $overflow $scale_pos -S -A $middle >> $plot_base.ps\n")
         new_fp.write(b"  # Print units manually, otherwise they're too close to numbers on scale.\n")
         new_fp.write(b"  echo $units_format $scale_units | gmt pstext -N $units_pos $misc_range $middle >> $plot_base.ps\n")
         new_fp.write(b"  # Move next scale to the right and get rid of the tick marks.\n")
@@ -1246,6 +1254,107 @@ def write_gmt_colorscale(options: Options, new_fp: BinaryIO, kml_output: int) ->
         new_fp.write(b"  scale_pos=\" -D${scale_x}c/${scale_y}c/${scale_length}c/${scale_width}c \"\n")
         new_fp.write(b"  gmt set TICK_LENGTH 0.0\n")
         new_fp.write(b"done\n")
+
+
+def write_rgb_colorscale(options: Options, cie: xr.Dataset) -> None:
+    """Generate a GMT CPT file mapping period values to spectral RGB colors.
+
+    For each evenly-spaced period in [min_period, max_period], computes the
+    spectral color that a pure sinusoid at that period would produce using
+    the same CIE color-matching pipeline as the main hot path.  Writes the
+    result as a GMT-format CPT file (rgb00001.cpt).
+
+    Args:
+        options: Options object. Contains:
+                     - min_period:    Minimum period in days.
+                     - max_period:    Maximum period in days.
+                     - thepower:      Y-brightening exponent.
+                     - use_new_funcs: True for colour-science, False for Riemann sum.
+                     - output_folder: Output directory Path.
+        cie:     CIE 1931 color matching functions Dataset with 'x', 'y', 'z'
+                 variables and 'wavelength' coordinate.
+    """
+    n_steps         = 256
+    cie_wavelengths = cie["wavelength"].values
+    n_wl            = len(cie_wavelengths)
+    wl_min          = cie_wavelengths[0]
+    wl_range        = cie_wavelengths[-1] - wl_min
+
+    # Sample periods and their corresponding CIE wavelengths
+    periods            = np.linspace(options.min_period, options.max_period, n_steps)
+    target_wavelengths = wl_min + (periods - options.min_period) / (options.max_period - options.min_period) * wl_range
+
+    # Build power matrix: each row is a narrow Gaussian centered at the target wavelength
+    sigma        = 1.0  # nm — narrow enough to approximate a delta function
+    power_matrix = np.exp(
+        -np.power(cie_wavelengths[np.newaxis, :] - target_wavelengths[:, np.newaxis], 2.0)
+        / (2.0 * sigma**2)
+    )
+
+    # Compute XYZ for each sample period
+    xyz_cpt = np.zeros((n_steps, 3))
+
+    if options.use_new_funcs:
+        cmfs = MSDS_CMFS_STANDARD_OBSERVER["CIE 1931 2 Degree Standard Observer"]
+        for i in range(n_steps):
+            spd        = SpectralDistribution(power_matrix[i], cie_wavelengths)
+            xyz_cpt[i] = sd_to_XYZ(spd, cmfs)
+    else:
+        cie_x_vals      = cie["x"].values
+        cie_y_vals      = cie["y"].values
+        cie_z_vals      = cie["z"].values
+        wavelength_step = np.diff(cie_wavelengths).mean()
+        xyz_cpt[:, 0]   = (power_matrix * cie_x_vals[np.newaxis, :]).sum(axis=1) * wavelength_step
+        xyz_cpt[:, 1]   = (power_matrix * cie_y_vals[np.newaxis, :]).sum(axis=1) * wavelength_step
+        xyz_cpt[:, 2]   = (power_matrix * cie_z_vals[np.newaxis, :]).sum(axis=1) * wavelength_step
+
+    # --- Post-processing (same as hot path lines 338-373) ---
+
+    # Normalize by max Y
+    max_y    = xyz_cpt[:, 1].max()
+    xyz_cpt /= max_y
+
+    # Raise Y to power while keeping chromaticity constant
+    factor   = np.power(xyz_cpt[:, 1], 1.0 - options.thepower)
+    xyz_cpt /= factor[:, np.newaxis]
+
+    # XYZ to sRGB
+    if options.use_new_funcs:
+        rgb_cpt = XYZ_to_sRGB(xyz_cpt)
+    else:
+        A_old   = np.array([[ 3.2409699,  -1.5373832,  -0.49861079],
+                            [-0.96924375,  1.8759676,   0.041555082],
+                            [ 0.055630032, -0.20397685,  1.0569714]])
+        rgb_cpt = (A_old @ xyz_cpt.T).T
+
+    # Fix gamut (vectorized)
+    rgb_arr   = rgb_cpt.T.copy()  # shape (3, n_steps)
+    min_vals  = rgb_arr.min(axis=0)
+    needs_fix = min_vals < 0
+
+    if np.any(needs_fix):
+        offset     = -min_vals[needs_fix] + 1.0 / 255.0
+        y_vals     = xyz_cpt[needs_fix, 1]
+        fix_factor = y_vals / (y_vals + offset)
+        rgb_arr[:, needs_fix] = (rgb_arr[:, needs_fix] + offset) * fix_factor
+
+    # Normalize to [0, 1] then scale to [0, 255]
+    rgb_arr /= np.max(rgb_arr)
+    rgb_arr *= 255.0
+    rgb_arr  = np.clip(rgb_arr, 0.0, 255.0).astype(int)
+
+    # Write CPT file
+    cpt_path = options.output_folder / "rgb00001.cpt"
+    logging.info(f"Writing RGB colorscale to {os.fspath(cpt_path)}")
+    with cpt_path.open("w") as fp:
+        fp.write("# COLOR_MODEL = RGB\n")
+        for i in range(1, n_steps):
+            fp.write(
+                f"{periods[i - 1]:12.6e} {rgb_arr[0, i - 1]:3d} {rgb_arr[1, i - 1]:3d} {rgb_arr[2, i - 1]:3d} "
+                f"{periods[i]:12.6e} {rgb_arr[0, i]:3d} {rgb_arr[1, i]:3d} {rgb_arr[2, i]:3d}\n"
+            )
+
+    logging.info("Finished writing RGB colorscale.")
 
 
 def write_gmt_map_data(options: Options, new_fp: BinaryIO, title: str, i: int) -> None:
@@ -1396,13 +1505,13 @@ def write_gmt_map_data(options: Options, new_fp: BinaryIO, title: str, i: int) -
             and len(results["marker_lons"]) == len(results["latlon"]["outputs"])
             and results["latlon"]["outputs"]):
         if results["marker_lats"][i] and results["marker_lons"][i]:
-            new_fp.write(b"gmt plot -N $data_name -bcmarker_lons/marker_lats -S+0.5c -W5/244/164/96 -G244/164/96 $range $projection $map_pos $middle >> $plot_base.ps\n")
+            new_fp.write(b"gmt psxy -N $data_name -bcmarker_lons/marker_lats -S+0.5c -W5/244/164/96 -G244/164/96 $range $projection $map_pos $middle >> $plot_base.ps\n")
 
     new_fp.write(b"#Uncomment to put a marker at echoed coords, given as lon lat:\n")
-    new_fp.write(b"#echo -85.19 -77.36 | gmt plot -N -S+0.5c -W5/244/164/96 -G244/164/96 $range $projection $map_pos $middle >> $plot_base.ps\n")
+    new_fp.write(b"#echo -85.19 -77.36 | gmt psxy -N -S+0.5c -W5/244/164/96 -G244/164/96 $range $projection $map_pos $middle >> $plot_base.ps\n")
 
     if plot_options["plot_mascons"] != 0 and results["latlon"]["mascon_lats"]:
-        new_fp.write(b"gmt plot $data_name -bcmascon_lons/mascon_lats -Sc0.01c -G139/69/19 $range $projection $map_pos $middle >> $plot_base.ps\n")
+        new_fp.write(b"gmt psxy $data_name -bcmascon_lons/mascon_lats -Sc0.01c -G139/69/19 $range $projection $map_pos $middle >> $plot_base.ps\n")
 
     new_fp.write(b"if [ $montage != 0 ]\n")
     new_fp.write(b"then\n")
@@ -1518,7 +1627,7 @@ def write_gmt_scripts(options: Options) -> None:
 
         write_gmt_map_data(options, new_fp, results["titles"][i], i)
 
-        new_fp.write(b"convert $png_options $plot_base.ps #Convert PS to PNG format.\n")
+        new_fp.write(b"gmt psconvert $png_options $plot_base.ps #Convert PS to PNG format.\n")
         new_fp.write(b"#convert -P -Tf $plot_base.ps #Convert PS to PDF, if uncommented.\n")
         new_fp.write(b"rm -f $plot_base.ps\n")
 
@@ -1584,53 +1693,30 @@ def write_gmt_scripts(options: Options) -> None:
 
 
 def run_gmt_scripts(options: Options) -> None:
-    """Set up and run GMT scripts via Docker.
+    """Run GMT plotting scripts.
+
+    On Linux, runs create_plots.sh directly via bash.
 
     Args:
-        options: Options object (output_folder).
+        options: Options object. Contains:
+                     - output_folder: Path to the output directory.
     """
-    docker_internal_folder   = "/home/jovyan"
-    docker_internal_filename = "docker_internal.sh"
-    docker_internal_script   = ("#!/bin/bash\n"
-                                "gmt grdmix red.nc green.nc blue.nc -C -Gcombined.tif:GTiff\n"
-                                "echo '----- Environment Variables -----'\n"
-                                "echo 'PATH: '\n"
-                                "echo $PATH\n"
-                                "echo 'LD_LIBRARY_PATH: '\n"
-                                "echo $LD_LIBRARY_PATH\n"
-                                "echo '----- Conda Environments -----'\n"
-                                "/opt/conda/bin/conda env list\n"
-                                "echo '----- Working Directory -----'\n"
-                                "pwd\n"
-                                "cp create_plots.sh Zbackup_create_plots.sh\n"
-                                "cp projections.sh Zbackup_projections.sh\n"
-                                "./create_plots.sh\n")
+    script_path = options.output_folder / "create_plots.sh"
+    script_path.chmod(0o755)
 
-    docker_command = (f"docker run -it -e TZ=America/Los_Angeles "
-                      f"-v .:{docker_internal_folder} "
-                      f"-w {docker_internal_folder} "
-                      f"grace/testing-bpr-grace2 /bin/bash")
-
-    docker_external_filename = "docker_external.bat"
-    docker_external_script   = f"\n    {docker_command}\n    "
-
-    # Write Docker internal script
-    internal_path = options.output_folder / docker_internal_filename
-    with internal_path.open("wb") as file:
-        file.write(docker_internal_script.encode())
-
-    # Write Docker external script
-    external_path = options.output_folder / docker_external_filename
-    with external_path.open("w") as file:
-        file.write(docker_external_script)
-
-    # Change permissions of the Docker internal script
-    os.chmod(internal_path, 0o755)
-
-    # Run Docker external script
-    logging.info(f"Opening an interactive shell. Run {docker_external_filename}, then run {docker_internal_filename}")
-    os.chdir(options.output_folder)
-    os.system("cmd")
+    logging.info(f"Running {os.fspath(script_path)}...")
+    result = subprocess.run(
+        ["bash", script_path.name],
+        cwd=os.fspath(script_path.parent),
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        logging.error(f"GMT script failed (exit {result.returncode}):\n{result.stderr}")
+    else:
+        logging.info("GMT scripts completed successfully.")
+    if result.stdout:
+        logging.debug(f"GMT stdout:\n{result.stdout}")
 
 
 # ---------------------------------------------------------------------------
@@ -1736,7 +1822,7 @@ def init_results(options: Options) -> None:
         options: Options object (grid, plot_options, output_folder).
     """
     options.results = {
-        "max_widths"         : 2,
+        "max_widths"         : 1,
         "options"            : {"output_choice": 5},
         "latlon"             : {
             "lat"        : [10.0, 20.0, 30.0, 40.0, 50.0],
