@@ -23,7 +23,7 @@ import xarray as xr
 from colour import SpectralDistribution, sd_to_XYZ, XYZ_to_sRGB
 from colour.colorimetry import MSDS_CMFS_STANDARD_OBSERVER
 
-__version__ = "0.1.1"
+__version__ = "0.1.2"
 DAYS_IN_YEAR: Final[float] = 365.25
 
 
@@ -54,7 +54,7 @@ class Options:
         # Numerical knobs
         self.dpi:               int   = 300
         self.input_choice:      str   = "SSHA"
-        self.xskip:             int   = 6
+        self.xskip:             int   = 192
         self.min_period:        float = 30.0
         self.max_period:        float = 60.0
         self.thepower:          float = 0.8
@@ -167,14 +167,14 @@ def main() -> None:
     plt.rcParams["axes.linewidth"] = 2
 
     # Function variant selection
-    if 0:
-        spectrum2xyz_fn = spectrum2xyz_old
-        xyz2rgb_fn      = xyz2rgb_old
-        funcs_desc      = " OLD functions"
-    else:
+    if options.use_new_funcs:
         spectrum2xyz_fn = spectrum2xyz_new
         xyz2rgb_fn      = xyz2rgb_new
         funcs_desc      = " NEW functions"
+    else:
+        spectrum2xyz_fn = spectrum2xyz_old
+        xyz2rgb_fn      = xyz2rgb_old
+        funcs_desc      = " OLD functions"
 
     # Configure data keys per input_choice
     configure_keys_for_input(options)
@@ -282,6 +282,17 @@ def main() -> None:
     # CIE color matching functions for sd_to_XYZ
     cmfs = MSDS_CMFS_STANDARD_OBSERVER["CIE 1931 2 Degree Standard Observer"]
 
+    # Pre-compute for old (Riemann sum) path
+    cie_x_vals      = cie["x"].values       # shape (n_wl,)
+    cie_y_vals      = cie["y"].values
+    cie_z_vals      = cie["z"].values
+    wavelength_step = np.diff(cie_wavelengths).mean()
+
+    # Old XYZ-to-linear-sRGB matrix (Hughes & Williams 2010, no gamma)
+    A_old = np.array([[ 3.2409699,  -1.5373832,  -0.49861079],
+                      [-0.96924375,  1.8759676,   0.041555082],
+                      [ 0.055630032, -0.20397685,  1.0569714]])
+
     # Pre-filter all-NaN grid points (land)
     valid_mask = ~np.all(np.isnan(data_2d), axis=0)
     n_valid    = valid_mask.sum()
@@ -312,9 +323,15 @@ def main() -> None:
         power_interp_src = power_ascending[interp_nearest_idx]
         mapped_power     = np.interp(wavelength_targets, interp_periods, power_interp_src)
 
-        # 5. Spectrum to XYZ using colour-science sd_to_XYZ
-        spd             = SpectralDistribution(mapped_power, cie_wavelengths)
-        xyz_results[i]  = sd_to_XYZ(spd, cmfs)
+        # 5. Spectrum to XYZ
+        if options.use_new_funcs:
+            spd             = SpectralDistribution(mapped_power, cie_wavelengths)
+            xyz_results[i]  = sd_to_XYZ(spd, cmfs)
+        else:
+            # Riemann sum integration (Hughes & Williams 2010)
+            xyz_results[i, 0] = (mapped_power * cie_x_vals).sum() * wavelength_step
+            xyz_results[i, 1] = (mapped_power * cie_y_vals).sum() * wavelength_step
+            xyz_results[i, 2] = (mapped_power * cie_z_vals).sum() * wavelength_step
 
     logging.info("Main loop complete.")
 
@@ -330,7 +347,11 @@ def main() -> None:
 
     # === POST-LOOP: Vectorized XYZ -> sRGB (single call, replaces groupby.map) ===
     logging.info("Converting to RGB...")
-    RGB_results = XYZ_to_sRGB(xyz_results)  # shape (n_points, 3)
+    if options.use_new_funcs:
+        RGB_results = XYZ_to_sRGB(xyz_results)  # shape (n_points, 3), includes gamma
+    else:
+        # Linear matrix multiply, no gamma correction (Hughes & Williams 2010)
+        RGB_results = (A_old @ xyz_results.T).T  # shape (n_points, 3)
 
     # === POST-LOOP: Vectorized fix_gamut (replaces groupby.map) ===
     logging.info("Fixing RGB out-of-gamut values and normalizing...")
@@ -462,15 +483,17 @@ def raise_y_to_power(xyz: xr.Dataset, power: float) -> xr.Dataset:
 
 
 def xyz2rgb_old(xyz: xr.Dataset) -> xr.Dataset:
-    """Convert XYZ to sRGB using a manual matrix multiply."""
+    """Convert XYZ to linear sRGB using a manual matrix multiply (no gamma)."""
     A = np.array([[3.2409699, -1.5373832, -0.49861079],
                   [-0.96924375, 1.8759676, 0.041555082],
                   [0.055630032, -0.20397685, 1.0569714]])
 
-    xyz_vector = np.array([xyz["x"], xyz["y"], xyz["z"]])
-    rgb        = np.dot(A, xyz_vector)
-    rgb        = {"red": rgb[0], "green": rgb[1], "blue": rgb[2]}
-    result     = xr.merge([xyz, rgb])
+    xyz_vector = np.array([xyz["x"].values.squeeze(),
+                           xyz["y"].values.squeeze(),
+                           xyz["z"].values.squeeze()])
+    rgb_vals   = np.dot(A, xyz_vector)
+    rgb_ds     = xr.Dataset({"red": rgb_vals[0], "green": rgb_vals[1], "blue": rgb_vals[2]})
+    result     = xr.merge([xyz, rgb_ds])
     return result
 
 
@@ -513,7 +536,7 @@ def fix_gamut(rgb: xr.Dataset) -> xr.Dataset:
 
 
 def gamma_correct_rgb(rgb: xr.Dataset) -> xr.Dataset:
-    """Apply gamma correction to RGB values."""
+    """Apply BT.709 gamma correction to RGB values."""
     gamma_inv = 0.45
     crit      = 0.018  # RGB values are gamma corrected differently below and above crit.
     h         = 4.506813168
@@ -522,10 +545,11 @@ def gamma_correct_rgb(rgb: xr.Dataset) -> xr.Dataset:
     for key in ["red", "green", "blue"]:
         # Typo in Hughes and Williams 2010 equation A7, compared to Charles Poynton's GammaFAQ:
         # http://www.poynton.com/GammaFAQ.html
-        if rgb[key] <= crit:
-            rgb[key] *= h
-        else:
-            rgb[key] = f * pow(rgb[key], gamma_inv) + g
+        vals       = rgb[key].values.copy()
+        low        = vals <= crit
+        vals[low]  *= h
+        vals[~low]  = f * np.power(vals[~low], gamma_inv) + g
+        rgb[key]    = (rgb[key].dims, vals)
     return rgb
 
 
