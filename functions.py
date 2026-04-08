@@ -25,7 +25,7 @@ import xarray as xr
 from colour import SpectralDistribution, sd_to_XYZ, XYZ_to_sRGB
 from colour.colorimetry import MSDS_CMFS_STANDARD_OBSERVER
 
-__version__ = "0.1.4"
+__version__ = "0.1.5"
 DAYS_IN_YEAR: Final[float] = 365.25
 
 # XYZ-to-linear-sRGB matrix (Hughes & Williams 2010, no gamma correction)
@@ -34,6 +34,119 @@ A_OLD_XYZ_TO_SRGB: Final[np.ndarray] = np.array(
      [-0.96924375,   1.8759676,   0.041555082],
      [ 0.055630032, -0.20397685,  1.0569714  ]]
 )
+
+# ---------------------------------------------------------------------------
+# Options
+# ---------------------------------------------------------------------------
+
+class Options:
+    """All global options in one place."""
+
+    def __init__(self) -> None:
+        """Initialize Options with default values."""
+        # Identity
+        self.my_name:             str = Path(sys.argv[0]).stem
+        self.cwd:                Path = Path.cwd().expanduser().resolve(strict=True)
+        self.log_mode:            int = logging.INFO
+        self.args: argparse.Namespace = argparse.Namespace()
+
+        # Paths
+        self.output_base:        Path = self.cwd / "output"
+        self.ssha_folder:        Path = self.cwd / "sealevel_spectra" / "fast_202306" / "fast_netCDF4"
+        self.simple_folder:      Path = self.cwd / "sealevel_spectra" / "simple_grids"
+        self.argo_folder:        Path = self.cwd / "sealevel_spectra" / "Argo"
+        self.mur_sst_folder:     Path = self.cwd / "sealevel_spectra" / "MUR_SST" / "MUR25-JPL-L4-GLOB-v04.2"
+        self.aqua_modis_folder:  Path = self.cwd / "sealevel_spectra" / "AQUA_MODIS"
+        self.grace_folder:       Path = self.cwd / "sealevel_spectra" / "JPL_GRACE_mascons"
+        self.cie_file:           Path = self.cwd / "sealevel_spectra" / "ciexyz31_1_trimmed_400nm_700nm.csv"
+        self.output_folder:      Path = Path()  # set in main()
+
+        # Numerical knobs
+        self.dpi:               int   = 300
+        self.input_choice:      str   = "SSHA"  # "SSHA", "Argo", "MUR_SST", "AQUA_MODIS", "GRACE", "simple_grids"
+        self.xskip:             int   = 1
+        self.min_period:        float = 30.0
+        self.max_period:        float = 60.0
+        self.thepower:          float = 0.8
+        self.figsize:     tuple[int, int] = (10, 5)
+
+        # Data key names (set per input_choice in configure_keys_for_input)
+        self.x_key:             str   = "Time"
+        self.y_key:             str   = "SLA"
+        self.lat_key:           str   = "Latitude"
+        self.lon_key:           str   = "Longitude"
+
+        # Function selection
+        self.use_new_funcs:     bool  = bool(0)
+
+        # Files to copy into output
+        self.files_to_copy: list[str] = ["projections.sh", "overflow.sh", "notation.sh"]
+
+        # Data structures (initialized by populate_results after hot path)
+        self.plot_options:  PlotOptions = PlotOptions()
+        self.grid:          GridData    = GridData()
+        self.results:       Results     = Results()
+
+
+
+
+def configure_keys_for_input(options: Options) -> None:
+    """Set data key names and per-dataset defaults based on input_choice.
+
+    Args:
+        options: Options object. Mutates x_key, y_key, lat_key, lon_key,
+                 min_period, max_period, xskip.
+    """
+    if options.input_choice == "SSHA":
+        options.x_key      = "Time"
+        options.y_key      = "SLA"
+        options.lat_key    = "Latitude"
+        options.lon_key    = "Longitude"
+        options.min_period =  2 * 7.0  # days
+        options.max_period = 24 * 7.0  # days
+        options.xskip      = 1
+    elif options.input_choice == "simple_grids":
+        options.x_key      = "time"
+        options.y_key      = "ssha"
+        options.lat_key    = "latitude"
+        options.lon_key    = "longitude"
+        options.min_period =  2 * 7.0  # days
+        options.max_period = 24 * 7.0  # days
+        options.xskip      = 1
+    elif options.input_choice == "Argo":
+        options.x_key      = "time"
+        options.y_key      = "ohc_2d_lt_700m"
+        options.lat_key    = "latitude"
+        options.lon_key    = "longitude"
+        options.min_period =  55 * 7.0  # days
+        options.max_period = 150 * 7.0  # days
+        options.xskip      = 1
+    elif options.input_choice == "MUR_SST":
+        options.x_key      = "time"
+        options.y_key      = "sst_anomaly"
+        options.lat_key    = "lat"
+        options.lon_key    = "lon"
+        options.min_period =  2 * 7.0  # days
+        options.max_period = 24 * 7.0  # days
+        options.xskip      = 40
+    elif options.input_choice == "AQUA_MODIS":
+        options.x_key      = "time"
+        options.y_key      = "sst_anomaly"
+        options.lat_key    = "lat"
+        options.lon_key    = "lon"
+        options.min_period =  2 * 7.0  # days
+        options.max_period = 24 * 7.0  # days
+        options.xskip      = 40
+    elif options.input_choice == "GRACE":
+        options.x_key      = "time"
+        options.y_key      = "lwe_thickness"
+        options.lat_key    = "lat"
+        options.lon_key    = "lon"
+        options.min_period = 24 * 7.0  # days
+        options.max_period = 70 * 7.0  # days
+        options.xskip      = 1
+    else:
+        logging.error(f"DID NOT RECOGNIZE {options.input_choice = }")
 
 
 # ---------------------------------------------------------------------------
@@ -131,57 +244,6 @@ class Results:
 
 
 # ---------------------------------------------------------------------------
-# Options
-# ---------------------------------------------------------------------------
-
-class Options:
-    """All global options in one place."""
-
-    def __init__(self) -> None:
-        """Initialize Options with default values."""
-        # Identity
-        self.my_name:           str  = Path(sys.argv[0]).stem
-        self.log_mode:          int  = logging.INFO
-        self.args: argparse.Namespace | None = None
-
-        # Paths
-        self.output_base:       Path = Path("./output")
-        self.ssha_folder:       Path = Path("./sealevel_spectra/fast_202306/fast_netCDF4")
-        self.argo_folder:       Path = Path("./sealevel_spectra/Argo")
-        self.mur_sst_folder:    Path = Path("./sealevel_spectra/MUR_SST/MUR25-JPL-L4-GLOB-v04.2")
-        self.aqua_modis_folder: Path = Path("./sealevel_spectra/AQUA_MODIS")
-        self.grace_folder:      Path = Path("./sealevel_spectra/JPL_GRACE_mascons")
-        self.cie_file:          Path = Path("./sealevel_spectra/ciexyz31_1_trimmed_400nm_700nm.csv")
-        self.output_folder:     Path = Path()  # set in main()
-
-        # Numerical knobs
-        self.dpi:               int   = 300
-        self.input_choice:      str   = "SSHA"
-        self.xskip:             int   = 192
-        self.min_period:        float = 30.0
-        self.max_period:        float = 60.0
-        self.thepower:          float = 0.8
-        self.figsize:     tuple[int, int] = (10, 5)
-
-        # Data key names (set per input_choice in configure_keys_for_input)
-        self.x_key:             str   = "Time"
-        self.y_key:             str   = "SLA"
-        self.lat_key:           str   = "Latitude"
-        self.lon_key:           str   = "Longitude"
-
-        # Function selection
-        self.use_new_funcs:     bool  = True
-
-        # Files to copy into output
-        self.files_to_copy: list[str] = ["projections.sh", "overflow.sh", "notation.sh"]
-
-        # Data structures (initialized by populate_results after hot path)
-        self.plot_options:  PlotOptions = PlotOptions()
-        self.grid:          GridData    = GridData()
-        self.results:       Results     = Results()
-
-
-# ---------------------------------------------------------------------------
 # Argument parsing
 # ---------------------------------------------------------------------------
 
@@ -204,7 +266,7 @@ def parse_arguments(options: Options) -> None:
     parser.add_argument("description", type=str, nargs="?", default="",
                         help="A description string encapsulated in quotes.")
     parser.add_argument("--input-choice", type=str, default=None,
-                        choices=["SSHA", "Argo", "MUR_SST", "AQUA_MODIS", "GRACE"],
+                        choices=["SSHA", "Argo", "MUR_SST", "AQUA_MODIS", "GRACE", "simple_grids"],
                         help=f"Data source (default: {options.input_choice}).")
     parser.add_argument("--xskip", type=int, default=None,
                         help="Skip every N points in lat/lon (default: per-dataset).")
@@ -223,7 +285,6 @@ def parse_arguments(options: Options) -> None:
     parser.add_argument("--use-old-funcs", action="store_true",
                         help="Use Hughes & Williams 2010 functions instead of colour-science.")
     options.args = parser.parse_args()
-    assert options.args is not None  # For mypy
     if options.args.debug:
         options.log_mode = logging.DEBUG
     if options.args.input_choice is not None:
@@ -247,7 +308,6 @@ def main() -> None:
 
     options = Options()
     parse_arguments(options)
-    assert options.args is not None  # For mypy
 
     # Logging setup (replaces deleted logging_setup function)
     logging.basicConfig(level=options.log_mode,
@@ -299,12 +359,15 @@ def main() -> None:
     # Load and decimate input data
     logging.info(f"Loading {options.input_choice}")
     input_data = load_input_data(options)
-    logging.info(f"Grabbing one lat/lon point in every {options.xskip ** 2} points...")
-    input_data = input_data.isel({
-        options.lat_key : slice(None, None, options.xskip),
-        options.lon_key : slice(None, None, options.xskip),
-    })
-    logging.info(" done.")
+    if options.xskip > 1:
+        logging.info(f"Selecting one lat/lon point in every {options.xskip ** 2} points...")
+        input_data = input_data.isel({
+            options.lat_key : slice(None, None, options.xskip),
+            options.lon_key : slice(None, None, options.xskip),
+        })
+        logging.info(" done.")
+    else:
+        logging.info("Using all lat/lon points.")
 
     # Ensure even number of time steps for NFFT
     if input_data.sizes[options.x_key] % 2 == 1:
@@ -1277,6 +1340,45 @@ def load_aqua_modis_files(options: Options, tskip: int = 1) -> xr.Dataset:
     return input_data
 
 
+def load_simple_grid_files(options: Options, tskip: int = 1) -> xr.Dataset:
+    """Load simple_grids weekly NetCDF files and concatenate along time.
+
+    Each file contains a single weekly snapshot of ssha(latitude, longitude)
+    with a scalar 'time' data variable.  Files are found recursively under
+    options.simple_folder (which contains year subfolders like 2025/, 2026/).
+
+    Args:
+        options: Options object. Contains:
+                     - simple_folder: Path to simple_grids data directory.
+        tskip:   Load every tskip-th file (temporal decimation).
+
+    Returns:
+        Combined dataset with dimensions (time, latitude, longitude).
+
+    Raises:
+        FileNotFoundError: If no NetCDF files are found in simple_folder.
+    """
+    all_files = sorted(options.simple_folder.rglob("*.nc"))
+    if not all_files:
+        raise FileNotFoundError(
+            f"No NetCDF files found in {os.fspath(options.simple_folder)}")
+    tskip_files = all_files[::tskip]
+    logging.info(f"Loading {len(tskip_files)} simple_grids files "
+                 f"(of {len(all_files)} total)...")
+
+    def _preprocess(ds: xr.Dataset) -> xr.Dataset:
+        """Promote scalar time variable to a dimension coordinate."""
+        return ds.set_coords("time").expand_dims("time")
+
+    input_data = xr.open_mfdataset(
+        tskip_files,
+        preprocess = _preprocess,
+        combine    = "nested",
+        concat_dim = "time",
+    )
+    return input_data
+
+
 # ---------------------------------------------------------------------------
 # Analysis functions
 # ---------------------------------------------------------------------------
@@ -1868,7 +1970,7 @@ def write_gmt_scripts(options: Options) -> None:
             write_gmt_defs(new_fp)
             new_fp.write(f"color_scheme={plot_options.color_scheme} #1/2=white/black background\n".encode())
             new_fp.write(f"montage={plot_options.montage} #1=left-justify titles, add (a),(b), run montage.sh.\n".encode())
-            new_fp.write(b"prefixes=('(a)' '(b)' '(c)' '(d)' '(e)' '(f)' '(g)' '(h)' '(i)' '(j)' '(k)' '(l)' '(m)' '(n)' '(o)' '(p)' '(q)' '(r)' '(s)' '(t)' '(u)' '(v)' '(w)' '(x)' '(y)' '(z)')\n")
+            new_fp.write(b'prefixes=("(a)" "(b)" "(c)" "(d)" "(e)" "(f)" "(g)" "(h)" "(i)" "(j)" "(k)" "(l)" "(m)" "(n)" "(o)" "(p)" "(q)" "(r)" "(s)" "(t)" "(u)" "(v)" "(w)" "(x)" "(y)" "(z)")\n')
             new_fp.write(b"index=-1 #Increments on each map, accesses prefixes above for montage.\n")
             new_fp.write(b'png_options=" -P -Tg " #PDF default: -E720, else 300 dpi.\n')
             new_fp.write(b"if [ $montage != 0 ]\nthen\n  png_options=\" -A\"$png_options\nfi\n")
@@ -2012,57 +2114,6 @@ def zip_script(options: Options) -> None:
     logging.info(f"Successfully zipped {os.fspath(current_script_path)} to {os.fspath(zip_file_path)}")
 
 
-def configure_keys_for_input(options: Options) -> None:
-    """Set data key names and per-dataset defaults based on input_choice.
-
-    Args:
-        options: Options object. Mutates x_key, y_key, lat_key, lon_key,
-                 min_period, max_period, xskip.
-    """
-    if options.input_choice == "SSHA":
-        options.x_key      = "Time"
-        options.y_key      = "SLA"
-        options.lat_key    = "Latitude"
-        options.lon_key    = "Longitude"
-        options.min_period = 30.0
-        options.max_period = 60.0
-        options.xskip      = 6
-    elif options.input_choice == "Argo":
-        options.x_key      = "time"
-        options.y_key      = "ohc_2d_lt_700m"
-        options.lat_key    = "latitude"
-        options.lon_key    = "longitude"
-        options.min_period = 55 * 7.0
-        options.max_period = 150 * 7.0
-        options.xskip      = 1
-    elif options.input_choice == "MUR_SST":
-        options.x_key      = "time"
-        options.y_key      = "sst_anomaly"
-        options.lat_key    = "lat"
-        options.lon_key    = "lon"
-        options.min_period = 2 * 7.0
-        options.max_period = 24 * 7.0
-        options.xskip      = 40
-    elif options.input_choice == "AQUA_MODIS":
-        options.x_key      = "time"
-        options.y_key      = "sst_anomaly"
-        options.lat_key    = "lat"
-        options.lon_key    = "lon"
-        options.min_period = 2 * 7.0
-        options.max_period = 24 * 7.0
-        options.xskip      = 40
-    elif options.input_choice == "GRACE":
-        options.x_key      = "time"
-        options.y_key      = "lwe_thickness"
-        options.lat_key    = "lat"
-        options.lon_key    = "lon"
-        options.min_period = 24 * 7.0
-        options.max_period = 70 * 7.0
-        options.xskip      = 1
-    else:
-        logging.error(f"DID NOT RECOGNIZE {options.input_choice = }")
-
-
 def load_input_data(options: Options) -> xr.Dataset:
     """Load input data based on the configured input_choice.
 
@@ -2084,6 +2135,8 @@ def load_input_data(options: Options) -> xr.Dataset:
         logging.info(input_data)
     elif options.input_choice == "GRACE":
         input_data = load_grace_file(options)
+    elif options.input_choice == "simple_grids":
+        input_data = load_simple_grid_files(options, tskip=1)
     else:
         logging.error(f"DID NOT RECOGNIZE {options.input_choice = }")
         raise ValueError(f"Unknown input_choice: {options.input_choice}")
