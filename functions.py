@@ -18,6 +18,7 @@ import h5py  # noqa: F401 — needed by xarray for NetCDF4 backend
 import matplotlib.pyplot as plt
 import nfft
 import numpy as np
+from tqdm import tqdm
 import pandas as pd
 import statsmodels.api as sm
 import xarray as xr
@@ -58,7 +59,7 @@ class Options:
         self.mur_sst_folder:     Path = self.cwd / "sealevel_spectra" / "MUR_SST" / "MUR25-JPL-L4-GLOB-v04.2"
         self.aqua_modis_folder:  Path = self.cwd / "sealevel_spectra" / "AQUA_MODIS"
         self.grace_folder:       Path = self.cwd / "sealevel_spectra" / "JPL_GRACE_mascons"
-        self.cie_file:           Path = self.cwd / "sealevel_spectra" / "ciexyz31_1_trimmed_400nm_700nm.csv"
+        self.cie_file:           Path = self.cwd / "sealevel_spectra" / "ciexyz31_1_trimmed_380nm_760nm.csv"
         self.output_folder:      Path = Path()  # set in main()
 
         # Numerical knobs
@@ -432,6 +433,8 @@ def main() -> None:
 
     # Period array (ascending) for mapping power spectrum to wavelength
     periods_ascending  = (1.0 / xf_half)[::-1]
+    # PSD-to-SPD conversion factor: sigma^2 (Hughes & Williams 2010, eq. A11)
+    freq_sq_ascending  = (1.0 / periods_ascending)**2
     cie_wavelengths    = cie["wavelength"].values
     n_wl               = len(cie_wavelengths)
     wavelength_targets = np.linspace(options.min_period, options.max_period, n_wl)
@@ -471,7 +474,7 @@ def main() -> None:
     # === MAIN LOOP (pure numpy, no xarray overhead) ===
     xyz_results = np.full((n_points, 3), np.nan)
 
-    for i in range(n_points):
+    for i in tqdm(range(n_points), desc="Grid points"):
         if not valid_mask[i]:
             continue
 
@@ -488,6 +491,9 @@ def main() -> None:
         # 3. Take positive frequencies, reverse to ascending period order
         power_half      = power[N // 2 + 1:]
         power_ascending = power_half[::-1]
+
+        # 3b. Convert PSD to SPD by multiplying by sigma^2 (Hughes & Williams 2010, eq. A11)
+        power_ascending = power_ascending * freq_sq_ascending
 
         # 4. Map power spectrum to wavelength grid (replicates map_power_spectrum boundary handling)
         power_interp_src = power_ascending[interp_nearest_idx]
@@ -520,7 +526,7 @@ def main() -> None:
     if options.use_new_funcs:
         RGB_results = XYZ_to_sRGB(xyz_results)  # shape (n_points, 3), includes gamma
     else:
-        # Linear matrix multiply, no gamma correction (Hughes & Williams 2010)
+        # Linear matrix multiply (Hughes & Williams 2010, eq. A2); gamma applied later
         RGB_results = (A_old @ xyz_results.T).T  # shape (n_points, 3)
 
     # === POST-LOOP: Vectorized fix_gamut (replaces groupby.map) ===
@@ -541,6 +547,20 @@ def main() -> None:
     # Normalize RGB
     highest_value = np.nanmax(rgb_arr)
     rgb_arr      /= highest_value
+
+    # === POST-LOOP: Apply BT.709 gamma correction (Hughes & Williams 2010, eqs. A7-A8) ===
+    if not options.use_new_funcs:
+        gamma_inv = 0.45
+        crit      = 0.018
+        h         = 4.506813168
+        g_coeff   = -0.09914989
+        f_coeff   = 1.09914989
+        for ch in range(3):
+            vals = rgb_arr[ch]
+            low  = (~np.isnan(vals)) & (vals <= crit)
+            high = (~np.isnan(vals)) & (vals > crit)
+            vals[low]  = vals[low] * h
+            vals[high] = f_coeff * np.power(vals[high], gamma_inv) + g_coeff
 
     # === Assemble xarray Dataset and unstack ===
     rgb_ds = xr.Dataset({
@@ -1446,6 +1466,11 @@ def timeseries_to_xyz(options: Options, timeseries: xr.Dataset, x_key: str, y_ke
 
     # Perform non-uniform FFT to get power spectrum.
     power_spectrum = nfft_power(options, timeseries)
+
+    # Convert PSD to SPD by multiplying by sigma^2 (Hughes & Williams 2010, eq. A11)
+    freqs = power_spectrum["frequency"].values
+    power_spectrum["power"] = power_spectrum["power"] * freqs**2
+
     power_spectrum = convert_spectrum_from_frequency_to_period(power_spectrum)
 
     mapped_spectrum = map_power_spectrum(cie, power_spectrum, min_period=min_period, max_period=max_period)
@@ -1711,8 +1736,24 @@ def write_rgb_colorscale(options: Options, cie: xr.Dataset) -> None:
         fix_factor = y_vals / (y_vals + offset)
         rgb_arr[:, needs_fix] = (rgb_arr[:, needs_fix] + offset) * fix_factor
 
-    # Normalize to [0, 1] then scale to [0, 255]
+    # Normalize to [0, 1]
     rgb_arr /= np.max(rgb_arr)
+
+    # Apply BT.709 gamma correction (Hughes & Williams 2010, eqs. A7-A8)
+    if not options.use_new_funcs:
+        gamma_inv = 0.45
+        crit      = 0.018
+        h         = 4.506813168
+        g_coeff   = -0.09914989
+        f_coeff   = 1.09914989
+        for ch in range(3):
+            vals = rgb_arr[ch]
+            low  = vals <= crit
+            high = vals > crit
+            vals[low]  = vals[low] * h
+            vals[high] = f_coeff * np.power(vals[high], gamma_inv) + g_coeff
+
+    # Scale to [0, 255]
     rgb_arr *= 255.0
     rgb_arr  = np.clip(rgb_arr, 0.0, 255.0).astype(int)
 
