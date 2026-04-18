@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import datetime as dt
 import logging
 import os
 import shutil
@@ -9,36 +10,40 @@ import subprocess
 import sys
 import timeit
 import zipfile
-import datetime as dt
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, BinaryIO, Callable, Final
+from typing import Any, BinaryIO, Final
 
+import cartopy.crs as ccrs
+import cartopy.feature as cfeature
 import h5py  # noqa: F401 — needed by xarray for NetCDF4 backend
 import matplotlib.pyplot as plt
 import nfft
 import numpy as np
-from tqdm import tqdm
 import pandas as pd
 import statsmodels.api as sm
 import xarray as xr
-
-from colour import SpectralDistribution, sd_to_XYZ, XYZ_to_sRGB
+from colour import SpectralDistribution, XYZ_to_sRGB, sd_to_XYZ
 from colour.colorimetry import MSDS_CMFS_STANDARD_OBSERVER
+from tqdm import tqdm
 
 __version__ = "0.1.5"
 DAYS_IN_YEAR: Final[float] = 365.25
 
 # XYZ-to-linear-sRGB matrix (Hughes & Williams 2010, no gamma correction)
 A_OLD_XYZ_TO_SRGB: Final[np.ndarray] = np.array(
-    [[ 3.2409699,   -1.5373832,  -0.49861079 ],
-     [-0.96924375,   1.8759676,   0.041555082],
-     [ 0.055630032, -0.20397685,  1.0569714  ]]
+    [
+        [3.2409699, -1.5373832, -0.49861079],
+        [-0.96924375, 1.8759676, 0.041555082],
+        [0.055630032, -0.20397685, 1.0569714],
+    ]
 )
 
 # ---------------------------------------------------------------------------
 # Options
 # ---------------------------------------------------------------------------
+
 
 class Options:
     """All global options in one place."""
@@ -46,49 +51,55 @@ class Options:
     def __init__(self) -> None:
         """Initialize Options with default values."""
         # Identity
-        self.my_name:             str = Path(sys.argv[0]).stem
-        self.cwd:                Path = Path.cwd().expanduser().resolve(strict=True)
-        self.log_mode:            int = logging.INFO
+        self.my_name: str = Path(sys.argv[0]).stem
+        self.cwd: Path = Path.cwd().expanduser().resolve(strict=True)
+        self.log_mode: int = logging.INFO
         self.args: argparse.Namespace = argparse.Namespace()
 
         # Paths
-        self.output_base:        Path = self.cwd / "output"
-        self.ssha_folder:        Path = self.cwd / "sealevel_spectra" / "fast_202306" / "fast_netCDF4"
-        self.simple_folder:      Path = self.cwd / "sealevel_spectra" / "simple_grids"
-        self.argo_folder:        Path = self.cwd / "sealevel_spectra" / "Argo"
-        self.mur_sst_folder:     Path = self.cwd / "sealevel_spectra" / "MUR_SST" / "MUR25-JPL-L4-GLOB-v04.2"
-        self.aqua_modis_folder:  Path = self.cwd / "sealevel_spectra" / "AQUA_MODIS"
-        self.grace_folder:       Path = self.cwd / "sealevel_spectra" / "JPL_GRACE_mascons"
-        self.cie_file:           Path = self.cwd / "sealevel_spectra" / "ciexyz31_1_trimmed_380nm_760nm.csv"
-        self.output_folder:      Path = Path()  # set in main()
+        self.output_base: Path = self.cwd / "output"
+        self.ssha_folder: Path = (
+            self.cwd / "sealevel_spectra" / "fast_202306" / "fast_netCDF4"
+        )
+        self.simple_folder: Path = self.cwd / "sealevel_spectra" / "simple_grids"
+        self.argo_folder: Path = self.cwd / "sealevel_spectra" / "Argo"
+        self.mur_sst_folder: Path = (
+            self.cwd / "sealevel_spectra" / "MUR_SST" / "MUR25-JPL-L4-GLOB-v04.2"
+        )
+        self.aqua_modis_folder: Path = self.cwd / "sealevel_spectra" / "AQUA_MODIS"
+        self.grace_folder: Path = self.cwd / "sealevel_spectra" / "JPL_GRACE_mascons"
+        self.cie_file: Path = (
+            self.cwd / "sealevel_spectra" / "ciexyz31_1_trimmed_380nm_760nm.csv"
+        )
+        self.output_folder: Path = Path()  # set in main()
 
         # Numerical knobs
-        self.dpi:               int   = 300
-        self.input_choice:      str   = "SSHA"  # "SSHA", "Argo", "MUR_SST", "AQUA_MODIS", "GRACE", "simple_grids"
-        self.xskip:             int   = 1
-        self.min_period:        float = 30.0
-        self.max_period:        float = 60.0
-        self.thepower:          float = 0.8
-        self.figsize:     tuple[int, int] = (10, 5)
+        self.dpi: int = 300
+        self.input_choice: str = (
+            "simple_grids"  # "SSHA", "Argo", "MUR_SST", "AQUA_MODIS", "GRACE", "simple_grids"
+        )
+        self.xskip: int = 1
+        self.min_period: float =  2 * 7.0  # days
+        self.max_period: float = 24 * 7.0  # days
+        self.thepower: float = 0.8
+        self.figsize: tuple[int, int] = (10, 5)
 
         # Data key names (set per input_choice in configure_keys_for_input)
-        self.x_key:             str   = "Time"
-        self.y_key:             str   = "SLA"
-        self.lat_key:           str   = "Latitude"
-        self.lon_key:           str   = "Longitude"
+        self.x_key: str = "Time"
+        self.y_key: str = "SLA"
+        self.lat_key: str = "Latitude"
+        self.lon_key: str = "Longitude"
 
         # Function selection
-        self.use_new_funcs:     bool  = bool(0)
+        self.use_new_funcs: bool = bool(0)
 
         # Files to copy into output
         self.files_to_copy: list[str] = ["projections.sh", "overflow.sh", "notation.sh"]
 
         # Data structures (initialized by populate_results after hot path)
-        self.plot_options:  PlotOptions = PlotOptions()
-        self.grid:          GridData    = GridData()
-        self.results:       Results     = Results()
-
-
+        self.plot_options: PlotOptions = PlotOptions()
+        self.grid: GridData = GridData()
+        self.results: Results = Results()
 
 
 def configure_keys_for_input(options: Options) -> None:
@@ -99,53 +110,47 @@ def configure_keys_for_input(options: Options) -> None:
                  min_period, max_period, xskip.
     """
     if options.input_choice == "SSHA":
-        options.x_key      = "Time"
-        options.y_key      = "SLA"
-        options.lat_key    = "Latitude"
-        options.lon_key    = "Longitude"
-        options.min_period =  2 * 7.0  # days
-        options.max_period = 24 * 7.0  # days
-        options.xskip      = 1
+        options.x_key = "Time"
+        options.y_key = "SLA"
+        options.lat_key = "Latitude"
+        options.lon_key = "Longitude"
+        # options.min_period = 2 * 7.0  # days
+        # options.max_period = 24 * 7.0  # days
     elif options.input_choice == "simple_grids":
-        options.x_key      = "time"
-        options.y_key      = "ssha"
-        options.lat_key    = "latitude"
-        options.lon_key    = "longitude"
-        options.min_period =  2 * 7.0  # days
-        options.max_period = 24 * 7.0  # days
-        options.xskip      = 1
+        options.x_key = "time"
+        options.y_key = "ssha"
+        options.lat_key = "latitude"
+        options.lon_key = "longitude"
+        # options.min_period = 2 * 7.0  # days
+        # options.max_period = 24 * 7.0  # days
     elif options.input_choice == "Argo":
-        options.x_key      = "time"
-        options.y_key      = "ohc_2d_lt_700m"
-        options.lat_key    = "latitude"
-        options.lon_key    = "longitude"
-        options.min_period =  55 * 7.0  # days
-        options.max_period = 150 * 7.0  # days
-        options.xskip      = 1
+        options.x_key = "time"
+        options.y_key = "ohc_2d_lt_700m"
+        options.lat_key = "latitude"
+        options.lon_key = "longitude"
+        # options.min_period = 55 * 7.0  # days
+        # options.max_period = 150 * 7.0  # days
     elif options.input_choice == "MUR_SST":
-        options.x_key      = "time"
-        options.y_key      = "sst_anomaly"
-        options.lat_key    = "lat"
-        options.lon_key    = "lon"
-        options.min_period =  2 * 7.0  # days
-        options.max_period = 24 * 7.0  # days
-        options.xskip      = 40
+        options.x_key = "time"
+        options.y_key = "sst_anomaly"
+        options.lat_key = "lat"
+        options.lon_key = "lon"
+        # options.min_period = 2 * 7.0  # days
+        # options.max_period = 24 * 7.0  # days
     elif options.input_choice == "AQUA_MODIS":
-        options.x_key      = "time"
-        options.y_key      = "sst_anomaly"
-        options.lat_key    = "lat"
-        options.lon_key    = "lon"
-        options.min_period =  2 * 7.0  # days
-        options.max_period = 24 * 7.0  # days
-        options.xskip      = 40
+        options.x_key = "time"
+        options.y_key = "sst_anomaly"
+        options.lat_key = "lat"
+        options.lon_key = "lon"
+        # options.min_period = 2 * 7.0  # days
+        # options.max_period = 24 * 7.0  # days
     elif options.input_choice == "GRACE":
-        options.x_key      = "time"
-        options.y_key      = "lwe_thickness"
-        options.lat_key    = "lat"
-        options.lon_key    = "lon"
-        options.min_period = 24 * 7.0  # days
-        options.max_period = 70 * 7.0  # days
-        options.xskip      = 1
+        options.x_key = "time"
+        options.y_key = "lwe_thickness"
+        options.lat_key = "lat"
+        options.lon_key = "lon"
+        # options.min_period = 24 * 7.0  # days
+        # options.max_period = 70 * 7.0  # days
     else:
         logging.error(f"DID NOT RECOGNIZE {options.input_choice = }")
 
@@ -154,19 +159,21 @@ def configure_keys_for_input(options: Options) -> None:
 # Data structures (mirrors C++ structs from abridged-definitions.hpp)
 # ---------------------------------------------------------------------------
 
+
 @dataclass
 class LatLonData:
     """Equal-grid latlon data (mirrors C++ latlon_s, definitions.hpp:238-256).
 
     Holds coordinates and output data for a 2D lat/lon grid.
     """
-    lat:         list[float]             = field(default_factory=list)
-    lon:         list[float]             = field(default_factory=list)
-    outputs:     list[list[list[float]]] = field(default_factory=list)  # [param][lat][lon]
-    elev:        list[list[float]]       = field(default_factory=list)
-    mascon_lats: list[float]             = field(default_factory=list)
-    mascon_lons: list[float]             = field(default_factory=list)
-    mask:        float                   = float("nan")
+
+    lat: list[float] = field(default_factory=list)
+    lon: list[float] = field(default_factory=list)
+    outputs: list[list[list[float]]] = field(default_factory=list)  # [param][lat][lon]
+    elev: list[list[float]] = field(default_factory=list)
+    mascon_lats: list[float] = field(default_factory=list)
+    mascon_lons: list[float] = field(default_factory=list)
+    mask: float = float("nan")
 
 
 @dataclass
@@ -175,8 +182,11 @@ class AnalysisOptions:
 
     Controls which output format and parameter types are used.
     """
-    output_choice: int       = 5                        # 1=unstructured, 5=latlon grid
-    output_type:   list[int] = field(default_factory=list)  # per-parameter (e.g. 104=phase)
+
+    output_choice: int = 5  # 1=unstructured, 5=latlon grid
+    output_type: list[int] = field(
+        default_factory=list
+    )  # per-parameter (e.g. 104=phase)
 
 
 @dataclass
@@ -185,24 +195,32 @@ class PlotOptions:
 
     Controls GMT script generation, projection, color scheme, and matplotlib output.
     """
-    outputfolder:       str             = ""
-    just_the_filenames: list[str]       = field(default_factory=list)
-    output_base:        str             = "map_parameter"
-    projection:         int             = 2       # 2=Winkel Tripel (matches C++ default)
-    coastlines:         int             = 1       # 1=coast, 2=coast+InSAR
-    symmetric_limit:    float           = -1.0    # <=0 disables (matches C++)
-    scale_digits:       int             = 2
-    color_scheme:       int             = 2       # 1=white BG, 2=black BG
-    montage:            int             = 0
-    blurb_disabled:     int             = 1
-    phase_mask:         int             = 12      # 1/2=abrupt, 11/12=gradual (matches C++)
-    plot_mascons:       int             = 0
-    no_gmt_plots:       int             = 0       # 1=skip GMT
+
+    outputfolder: str = ""
+    just_the_filenames: list[str] = field(default_factory=list)
+    output_base: str = "map_parameter"
+    projection: int = 2  # 2=Winkel Tripel (matches C++ default)
+    coastlines: int = 1  # 1=coast, 2=coast+InSAR
+    symmetric_limit: float = -1.0  # <=0 disables (matches C++)
+    scale_digits: int = 2
+    color_scheme: int = 2  # 1=white BG, 2=black BG
+    montage: int = 0
+    blurb_disabled: int = 1
+    phase_mask: int = 12  # 1/2=abrupt, 11/12=gradual (matches C++)
+    plot_mascons: int = 0
+    no_gmt_plots: int = 0  # 1=skip GMT
     # Matplotlib-only fields:
-    dpi:                int             = 300
-    show_fig:           bool            = False
-    save_fig:           bool            = True
-    figsize:            tuple[int, int] = (10, 10)
+    dpi: int = 300
+    show_fig: bool = False
+    save_fig: bool = True
+    figsize: tuple[int, int] = (14, 7)
+    # Disabled land and ocean fill because it only seems to happen near the poles.
+    # land_color: str = "#333333"  # Dark grey
+    # ocean_color: str = "black"  # Matches dark_background theme
+    dark_mode: bool = True  # False = light/white background
+    show_borders: bool = False  # Political boundaries
+    show_rivers: bool = False  # Major rivers
+    coastline_resolution: str = "110m"  # "110m" or "50m"
 
 
 @dataclass
@@ -211,12 +229,13 @@ class GridData:
 
     Holds grid coordinates and boundaries.
     """
-    lat:    list[float]       = field(default_factory=list)
-    lon:    list[float]       = field(default_factory=list)
-    maxlat: float             = 90.0
-    minlat: float             = -90.0
-    maxlon: float             = 360.0
-    minlon: float             = 0.0
+
+    lat: list[float] = field(default_factory=list)
+    lon: list[float] = field(default_factory=list)
+    maxlat: float = 90.0
+    minlat: float = -90.0
+    maxlon: float = 360.0
+    minlon: float = 0.0
     latlon: LatLonData | None = None
 
 
@@ -226,27 +245,29 @@ class Results:
 
     Holds output data, metadata, spatial extent, and RGB color mapping state.
     """
-    titles:      list[str]         = field(default_factory=list)
-    units:       list[str]         = field(default_factory=list)
-    base_unit:   str               = "cm"
-    latlon:      LatLonData        = field(default_factory=LatLonData)
-    error_bars:  list[float]       = field(default_factory=list)
+
+    titles: list[str] = field(default_factory=list)
+    units: list[str] = field(default_factory=list)
+    base_unit: str = "cm"
+    latlon: LatLonData = field(default_factory=LatLonData)
+    error_bars: list[float] = field(default_factory=list)
     marker_lats: list[list[float]] = field(default_factory=list)
     marker_lons: list[list[float]] = field(default_factory=list)
-    minlat:      float             = -90.0
-    maxlat:      float             = 90.0
-    minlon:      float             = 0.0
-    maxlon:      float             = 360.0
-    rgb:         list[float]       = field(default_factory=list)
-    rgb_choice:  int               = 2    # C++ default: 0=non-uniform, 1=uniform, 2=multi-width
-    max_labels:  int               = 10   # C++ default
-    max_widths:  int               = 1
-    options:     AnalysisOptions   = field(default_factory=AnalysisOptions)
+    minlat: float = -90.0
+    maxlat: float = 90.0
+    minlon: float = 0.0
+    maxlon: float = 360.0
+    rgb: list[float] = field(default_factory=list)
+    rgb_choice: int = 2  # C++ default: 0=non-uniform, 1=uniform, 2=multi-width
+    max_labels: int = 10  # C++ default
+    max_widths: int = 1
+    options: AnalysisOptions = field(default_factory=AnalysisOptions)
 
 
 # ---------------------------------------------------------------------------
 # Argument parsing
 # ---------------------------------------------------------------------------
+
 
 def parse_arguments(options: Options) -> None:
     """Parse command-line arguments.
@@ -261,30 +282,97 @@ def parse_arguments(options: Options) -> None:
         None, but updates options.args with parsed arguments.
     """
     parser = argparse.ArgumentParser(
-        description=f"Spectral color mapping. {options.my_name} version {__version__}")
-    parser.add_argument("-v", "--version",
-                        action="version", version=f"%(prog)s {__version__}")
-    parser.add_argument("description", type=str, nargs="?", default="",
-                        help="A description string encapsulated in quotes.")
-    parser.add_argument("--input-choice", type=str, default=None,
-                        choices=["SSHA", "Argo", "MUR_SST", "AQUA_MODIS", "GRACE", "simple_grids"],
-                        help=f"Data source (default: {options.input_choice}).")
-    parser.add_argument("--xskip", type=int, default=None,
-                        help="Skip every N points in lat/lon (default: per-dataset).")
-    parser.add_argument("--min-period", type=float, default=None,
-                        help="Minimum period in days (default: per-dataset).")
-    parser.add_argument("--max-period", type=float, default=None,
-                        help="Maximum period in days (default: per-dataset).")
-    parser.add_argument("--dpi", type=int, default=options.dpi,
-                        help=f"DPI for output images (default: {options.dpi}).")
-    parser.add_argument("-d", "--debug", action="store_true",
-                        help="Enable debug logging.")
-    parser.add_argument("--no-gmt", action="store_true",
-                        help="Skip GMT plot generation.")
-    parser.add_argument("--projection", type=int, choices=[1, 2, 3, 4], default=None,
-                        help="Map projection: 1=Robinson, 2=Winkel Tripel, 3=Mollweide, 4=Miller.")
-    parser.add_argument("--use-old-funcs", action="store_true",
-                        help="Use Hughes & Williams 2010 functions instead of colour-science.")
+        description=f"Spectral color mapping. {options.my_name} version {__version__}"
+    )
+    parser.add_argument(
+        "-v", "--version", action="version", version=f"%(prog)s {__version__}"
+    )
+    parser.add_argument(
+        "description",
+        type=str,
+        nargs="?",
+        default="",
+        help="A description string encapsulated in quotes.",
+    )
+    parser.add_argument(
+        "--input-choice",
+        type=str,
+        default=None,
+        choices=["SSHA", "Argo", "MUR_SST", "AQUA_MODIS", "GRACE", "simple_grids"],
+        help=f"Data source (default: {options.input_choice}).",
+    )
+    parser.add_argument(
+        "--xskip",
+        type=int,
+        default=None,
+        help="Skip every N points in lat/lon (default: per-dataset).",
+    )
+    parser.add_argument(
+        "--min-period",
+        type=float,
+        default=None,
+        help="Minimum period in days (default: per-dataset).",
+    )
+    parser.add_argument(
+        "--max-period",
+        type=float,
+        default=None,
+        help="Maximum period in days (default: per-dataset).",
+    )
+    parser.add_argument(
+        "--dpi",
+        type=int,
+        default=options.dpi,
+        help=f"DPI for output images (default: {options.dpi}).",
+    )
+    parser.add_argument(
+        "-d", "--debug", action="store_true", help="Enable debug logging."
+    )
+    parser.add_argument(
+        "--no-gmt", action="store_true", help="Skip GMT plot generation."
+    )
+    parser.add_argument(
+        "--projection",
+        type=int,
+        choices=[1, 2, 3, 4],
+        default=None,
+        help="Map projection: 1=Robinson, 2=Winkel Tripel, 3=Mollweide, 4=Miller.",
+    )
+    parser.add_argument(
+        "--use-old-funcs",
+        action="store_true",
+        help="Use Hughes & Williams 2010 functions instead of colour-science.",
+    )
+    parser.add_argument(
+        "--land-color",
+        type=str,
+        default=None,
+        help="Land color for matplotlib maps (default: '#333333').",
+    )
+    parser.add_argument(
+        "--ocean-color",
+        type=str,
+        default=None,
+        help="Ocean color for matplotlib maps (default: 'black').",
+    )
+    parser.add_argument(
+        "--light-mode",
+        action="store_true",
+        help="Use light/white background instead of dark.",
+    )
+    parser.add_argument(
+        "--borders", action="store_true", help="Show political boundaries on maps."
+    )
+    parser.add_argument(
+        "--rivers", action="store_true", help="Show major rivers on maps."
+    )
+    parser.add_argument(
+        "--coastline-resolution",
+        type=str,
+        default=None,
+        choices=["110m", "50m"],
+        help="Coastline resolution (default: '110m').",
+    )
     options.args = parser.parse_args()
     if options.args.debug:
         options.log_mode = logging.DEBUG
@@ -296,12 +384,25 @@ def parse_arguments(options: Options) -> None:
         options.plot_options.projection = options.args.projection
     if options.args.use_old_funcs:
         options.use_new_funcs = False
+    if options.args.land_color is not None:
+        options.plot_options.land_color = options.args.land_color
+    if options.args.ocean_color is not None:
+        options.plot_options.ocean_color = options.args.ocean_color
+    if options.args.light_mode:
+        options.plot_options.dark_mode = False
+    if options.args.borders:
+        options.plot_options.show_borders = True
+    if options.args.rivers:
+        options.plot_options.show_rivers = True
+    if options.args.coastline_resolution is not None:
+        options.plot_options.coastline_resolution = options.args.coastline_resolution
     options.dpi = options.args.dpi
 
 
 # ---------------------------------------------------------------------------
 # main
 # ---------------------------------------------------------------------------
+
 
 def main() -> None:
     """Main function."""
@@ -311,16 +412,19 @@ def main() -> None:
     parse_arguments(options)
 
     # Logging setup (replaces deleted logging_setup function)
-    logging.basicConfig(level=options.log_mode,
-                        format="%(asctime)s - %(levelname)s - %(message)s",
-                        datefmt="%Y-%m-%d %H:%M:%S")
+    logging.basicConfig(
+        level=options.log_mode,
+        format="%(asctime)s - %(levelname)s - %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
 
     # Create output folder
     date_str = start_time.strftime("%Y%m%d-%H%M%S")
     options.output_folder = options.output_base / date_str
     if options.args.description:
         options.output_folder = options.output_folder.parent / (
-            options.output_folder.name + " - " + options.args.description)
+            options.output_folder.name + " - " + options.args.description
+        )
     options.output_folder.mkdir(parents=True, exist_ok=True)
     if not options.output_folder.is_dir():
         raise ValueError(f"!!! Problem creating {os.fspath(options.output_folder)}")
@@ -334,18 +438,18 @@ def main() -> None:
 
     # Matplotlib setup
     plt.style.use("dark_background")
-    plt.rcParams["font.size"]      = 14
+    plt.rcParams["font.size"] = 14
     plt.rcParams["axes.linewidth"] = 2
 
     # Function variant selection
     if options.use_new_funcs:
         spectrum2xyz_fn = spectrum2xyz_new
-        xyz2rgb_fn      = xyz2rgb_new
-        funcs_desc      = " NEW functions"
+        xyz2rgb_fn = xyz2rgb_new
+        funcs_desc = " NEW functions"
     else:
         spectrum2xyz_fn = spectrum2xyz_old
-        xyz2rgb_fn      = xyz2rgb_old
-        funcs_desc      = " OLD functions"
+        xyz2rgb_fn = xyz2rgb_old
+        funcs_desc = " OLD functions"
 
     # Configure data keys per input_choice
     configure_keys_for_input(options)
@@ -361,35 +465,57 @@ def main() -> None:
     logging.info(f"Loading {options.input_choice}")
     input_data = load_input_data(options)
     if options.xskip > 1:
-        logging.info(f"Selecting one lat/lon point in every {options.xskip ** 2} points...")
-        input_data = input_data.isel({
-            options.lat_key : slice(None, None, options.xskip),
-            options.lon_key : slice(None, None, options.xskip),
-        })
+        logging.info(
+            f"Selecting one lat/lon point in every {options.xskip**2} points..."
+        )
+        input_data = input_data.isel(
+            {
+                options.lat_key: slice(None, None, options.xskip),
+                options.lon_key: slice(None, None, options.xskip),
+            }
+        )
         logging.info(" done.")
     else:
         logging.info("Using all lat/lon points.")
 
     # Ensure even number of time steps for NFFT
     if input_data.sizes[options.x_key] % 2 == 1:
-        logging.info(f"Deleting last data point because number of time stamps needs to be even for NFFT. Before deletion: {input_data.sizes[options.x_key] = }")
+        logging.info(
+            f"Deleting last data point because number of time stamps needs to be even for NFFT. Before deletion: {input_data.sizes[options.x_key] = }"
+        )
         input_data = input_data.isel({options.x_key: slice(None, -1)})
 
     # Validate min/max period against available NFFT periods
-    sliced_data    = input_data.isel({options.lat_key: 0, options.lon_key: 0})
+    sliced_data = input_data.isel({options.lat_key: 0, options.lon_key: 0})
     power_spectrum = nfft_power(options, sliced_data)
     power_spectrum = convert_spectrum_from_frequency_to_period(power_spectrum)
 
-    logging.info(f"{options.min_period = } and {np.min(power_spectrum.period.values) = }")
-    if options.min_period < np.min(power_spectrum.period.values) or options.min_period >= np.max(power_spectrum.period.values):
-        logging.error(f"!!! WARNING!!! originally {options.min_period = } but {np.min(power_spectrum.period.values) = } and {np.max(power_spectrum.period.values) = }")
+    logging.info(
+        f"{options.min_period = } and {np.min(power_spectrum.period.values) = }"
+    )
+    if options.min_period < np.min(
+        power_spectrum.period.values
+    ) or options.min_period >= np.max(power_spectrum.period.values):
+        logging.error(
+            f"!!! WARNING!!! originally {options.min_period = } but {np.min(power_spectrum.period.values) = } and {np.max(power_spectrum.period.values) = }"
+        )
         options.min_period = np.min(power_spectrum.period.values)
-        logging.error(f"So now {options.min_period = } which equals {np.min(power_spectrum.period.values) = }")
-    logging.info(f"{options.max_period = } and {np.max(power_spectrum.period.values) = }")
-    if options.max_period <= np.min(power_spectrum.period.values) or options.max_period > np.max(power_spectrum.period.values):
-        logging.error(f"!!! WARNING!!! originally {options.max_period = } but {np.min(power_spectrum.period.values) = } and {np.max(power_spectrum.period.values) = }")
+        logging.error(
+            f"So now {options.min_period = } which equals {np.min(power_spectrum.period.values) = }"
+        )
+    logging.info(
+        f"{options.max_period = } and {np.max(power_spectrum.period.values) = }"
+    )
+    if options.max_period <= np.min(
+        power_spectrum.period.values
+    ) or options.max_period > np.max(power_spectrum.period.values):
+        logging.error(
+            f"!!! WARNING!!! originally {options.max_period = } but {np.min(power_spectrum.period.values) = } and {np.max(power_spectrum.period.values) = }"
+        )
         options.max_period = np.max(power_spectrum.period.values)
-        logging.error(f"So now {options.max_period = } which equals {np.max(power_spectrum.period.values) = }")
+        logging.error(
+            f"So now {options.max_period = } which equals {np.max(power_spectrum.period.values) = }"
+        )
 
     # Load CIE color matching functions
     cie = load_cie_functions(options)
@@ -401,13 +527,13 @@ def main() -> None:
     logging.info("Starting timeseries_to_xyz WITHOUT dask (optimized)...")
 
     # === PRE-COMPUTATION (outside loop) ===
-    stacked       = input_data.stack(latlon=[options.lat_key, options.lon_key])
-    latlon_coord  = stacked["latlon"]
+    stacked = input_data.stack(latlon=[options.lat_key, options.lon_key])
+    latlon_coord = stacked["latlon"]
 
     # Extract raw numpy arrays once
-    times                = stacked[options.x_key].values
-    data_2d              = stacked[options.y_key].values  # shape (n_times, n_points)
-    n_times, n_points    = data_2d.shape
+    times = stacked[options.x_key].values
+    data_2d = stacked[options.y_key].values  # shape (n_times, n_points)
+    n_times, n_points = data_2d.shape
 
     # Time axis in days (shared across all grid points)
     x_days = (times - times[0]).astype(float) / (24 * 3600 * 1e9)
@@ -416,27 +542,27 @@ def main() -> None:
     N = len(x_days)
     if N % 2:
         logging.info(f"Trimming last time step for even NFFT length: {N} -> {N - 1}")
-        x_days  = x_days[:-1]
+        x_days = x_days[:-1]
         data_2d = data_2d[:-1, :]
-        N      -= 1
+        N -= 1
 
     # Detrending design matrix: [constant, trend, accel] (shared)
     design_matrix = np.column_stack([np.ones(N), x_days, x_days**2])
 
     # NFFT parameters (shared)
-    x_min   = x_days.min()
+    x_min = x_days.min()
     x_range = x_days.max() - x_min
-    x_norm  = (x_days - x_min) / x_range - 0.5
-    k       = -(N // 2) + np.arange(N)
-    xf      = k / x_range
-    xf_half = xf[N // 2 + 1:]  # positive frequencies, ascending
+    x_norm = (x_days - x_min) / x_range - 0.5
+    k = -(N // 2) + np.arange(N)
+    xf = k / x_range
+    xf_half = xf[N // 2 + 1 :]  # positive frequencies, ascending
 
     # Period array (ascending) for mapping power spectrum to wavelength
-    periods_ascending  = (1.0 / xf_half)[::-1]
+    periods_ascending = (1.0 / xf_half)[::-1]
     # PSD-to-SPD conversion factor: sigma^2 (Hughes & Williams 2010, eq. A11)
-    freq_sq_ascending  = (1.0 / periods_ascending)**2
-    cie_wavelengths    = cie["wavelength"].values
-    n_wl               = len(cie_wavelengths)
+    freq_sq_ascending = (1.0 / periods_ascending) ** 2
+    cie_wavelengths = cie["wavelength"].values
+    n_wl = len(cie_wavelengths)
     wavelength_targets = np.linspace(options.min_period, options.max_period, n_wl)
 
     # Pre-compute boundary handling for map_power_spectrum (replicates original reindex+nearest)
@@ -448,27 +574,31 @@ def main() -> None:
     periods_extended = np.sort(periods_extended)
 
     # For each extended period, find nearest original period index (for nearest-fill)
-    nearest_indices = np.array([np.argmin(np.abs(periods_ascending - p)) for p in periods_extended])
+    nearest_indices = np.array(
+        [np.argmin(np.abs(periods_ascending - p)) for p in periods_extended]
+    )
 
     # Filter to [min_period, max_period]
-    period_mask        = (periods_extended >= options.min_period) & (periods_extended <= options.max_period)
-    interp_periods     = periods_extended[period_mask]
+    period_mask = (periods_extended >= options.min_period) & (
+        periods_extended <= options.max_period
+    )
+    interp_periods = periods_extended[period_mask]
     interp_nearest_idx = nearest_indices[period_mask]
 
     # CIE color matching functions for sd_to_XYZ
     cmfs = MSDS_CMFS_STANDARD_OBSERVER["CIE 1931 2 Degree Standard Observer"]
 
     # Pre-compute for old (Riemann sum) path
-    cie_x_vals      = cie["x"].values       # shape (n_wl,)
-    cie_y_vals      = cie["y"].values
-    cie_z_vals      = cie["z"].values
+    cie_x_vals = cie["x"].values  # shape (n_wl,)
+    cie_y_vals = cie["y"].values
+    cie_z_vals = cie["z"].values
     wavelength_step = np.diff(cie_wavelengths).mean()
 
     A_old = A_OLD_XYZ_TO_SRGB
 
     # Pre-filter all-NaN grid points (land)
     valid_mask = ~np.all(np.isnan(data_2d), axis=0)
-    n_valid    = valid_mask.sum()
+    n_valid = valid_mask.sum()
     logging.info(f"Processing {n_valid} valid grid points out of {n_points} total...")
 
     # === MAIN LOOP (pure numpy, no xarray overhead) ===
@@ -482,14 +612,14 @@ def main() -> None:
 
         # 1. Detrend with numpy lstsq (replaces statsmodels OLS)
         params, _, _, _ = np.linalg.lstsq(design_matrix, y, rcond=None)
-        detrended       = y - design_matrix @ params
+        detrended = y - design_matrix @ params
 
         # 2. NFFT
-        f_k   = nfft.nfft(x_norm, detrended)
-        power = np.abs(f_k)**2
+        f_k = nfft.nfft(x_norm, detrended)
+        power = np.abs(f_k) ** 2
 
         # 3. Take positive frequencies, reverse to ascending period order
-        power_half      = power[N // 2 + 1:]
+        power_half = power[N // 2 + 1 :]
         power_ascending = power_half[::-1]
 
         # 3b. Convert PSD to SPD by multiplying by sigma^2 (Hughes & Williams 2010, eq. A11)
@@ -497,12 +627,12 @@ def main() -> None:
 
         # 4. Map power spectrum to wavelength grid (replicates map_power_spectrum boundary handling)
         power_interp_src = power_ascending[interp_nearest_idx]
-        mapped_power     = np.interp(wavelength_targets, interp_periods, power_interp_src)
+        mapped_power = np.interp(wavelength_targets, interp_periods, power_interp_src)
 
         # 5. Spectrum to XYZ
         if options.use_new_funcs:
-            spd             = SpectralDistribution(mapped_power, cie_wavelengths)
-            xyz_results[i]  = sd_to_XYZ(spd, cmfs)
+            spd = SpectralDistribution(mapped_power, cie_wavelengths)
+            xyz_results[i] = sd_to_XYZ(spd, cmfs)
         else:
             # Riemann sum integration (Hughes & Williams 2010)
             xyz_results[i, 0] = (mapped_power * cie_x_vals).sum() * wavelength_step
@@ -517,8 +647,10 @@ def main() -> None:
     xyz_results /= max_y
 
     # Raise Y to power (brightens dark areas)
-    logging.info(f"Raising y to power {options.thepower} while keeping chromaticity constant. (This brightens dark areas.)")
-    factor       = np.power(xyz_results[:, 1], 1.0 - options.thepower)
+    logging.info(
+        f"Raising y to power {options.thepower} while keeping chromaticity constant. (This brightens dark areas.)"
+    )
+    factor = np.power(xyz_results[:, 1], 1.0 - options.thepower)
     xyz_results /= factor[:, np.newaxis]
 
     # === POST-LOOP: Vectorized XYZ -> sRGB (single call, replaces groupby.map) ===
@@ -533,49 +665,54 @@ def main() -> None:
     logging.info("Fixing RGB out-of-gamut values and normalizing...")
     rgb_arr = RGB_results.T.copy()  # shape (3, n_points) for easier per-channel access
 
-    nan_mask  = np.any(np.isnan(rgb_arr), axis=0)
-    min_vals  = np.full(n_points, 0.0)
+    nan_mask = np.any(np.isnan(rgb_arr), axis=0)
+    min_vals = np.full(n_points, 0.0)
     min_vals[~nan_mask] = rgb_arr[:, ~nan_mask].min(axis=0)
     needs_fix = (~nan_mask) & (min_vals < 0)
 
     if np.any(needs_fix):
-        offset     = -min_vals[needs_fix] + 1.0 / 255.0
-        y_vals     = xyz_results[needs_fix, 1]
+        offset = -min_vals[needs_fix] + 1.0 / 255.0
+        y_vals = xyz_results[needs_fix, 1]
         fix_factor = y_vals / (y_vals + offset)
         rgb_arr[:, needs_fix] = (rgb_arr[:, needs_fix] + offset) * fix_factor
 
     # Normalize RGB
     highest_value = np.nanmax(rgb_arr)
-    rgb_arr      /= highest_value
+    rgb_arr /= highest_value
 
     # === POST-LOOP: Apply BT.709 gamma correction (Hughes & Williams 2010, eqs. A7-A8) ===
     if not options.use_new_funcs:
         gamma_inv = 0.45
-        crit      = 0.018
-        h         = 4.506813168
-        g_coeff   = -0.09914989
-        f_coeff   = 1.09914989
+        crit = 0.018
+        h = 4.506813168
+        g_coeff = -0.09914989
+        f_coeff = 1.09914989
         for ch in range(3):
             vals = rgb_arr[ch]
-            low  = (~np.isnan(vals)) & (vals <= crit)
+            low = (~np.isnan(vals)) & (vals <= crit)
             high = (~np.isnan(vals)) & (vals > crit)
-            vals[low]  = vals[low] * h
+            vals[low] = vals[low] * h
             vals[high] = f_coeff * np.power(vals[high], gamma_inv) + g_coeff
 
     # === Assemble xarray Dataset and unstack ===
-    rgb_ds = xr.Dataset({
-        "x"     : ("latlon", xyz_results[:, 0]),
-        "y"     : ("latlon", xyz_results[:, 1]),
-        "z"     : ("latlon", xyz_results[:, 2]),
-        "red"   : ("latlon", rgb_arr[0]),
-        "green" : ("latlon", rgb_arr[1]),
-        "blue"  : ("latlon", rgb_arr[2]),
-    }, coords={"latlon": latlon_coord})
+    rgb_ds = xr.Dataset(
+        {
+            "x": ("latlon", xyz_results[:, 0]),
+            "y": ("latlon", xyz_results[:, 1]),
+            "z": ("latlon", xyz_results[:, 2]),
+            "red": ("latlon", rgb_arr[0]),
+            "green": ("latlon", rgb_arr[1]),
+            "blue": ("latlon", rgb_arr[2]),
+        },
+        coords={"latlon": latlon_coord},
+    )
 
-    spectral_color_maps = xr.Dataset({key: rgb_ds[key].unstack("latlon") for key in rgb_ds.data_vars})
+    spectral_color_maps = xr.Dataset(
+        {key: rgb_ds[key].unstack("latlon") for key in rgb_ds.data_vars}
+    )
 
     # Stop the timer
-    hot_end    = timeit.default_timer()
+    hot_end = timeit.default_timer()
     time_taken = hot_end - hot_start
     logging.info(f"Time taken WITHOUT DASK: {time_taken:.2f} seconds")
 
@@ -587,68 +724,97 @@ def main() -> None:
     # ===================================================================
     # Save XYZ tristimulus NetCDFs
     for thekey in ["x", "y", "z"]:
-        da       = spectral_color_maps[thekey]
+        da = spectral_color_maps[thekey]
         filename = options.output_folder / f"{thekey}.nc"
-        da.coords[options.lat_key].attrs = {"units": "degrees_north", "long_name": "Latitude"}
-        da.coords[options.lon_key].attrs = {"units": "degrees_east",  "long_name": "Longitude"}
-        da.attrs["long_name"]            = f"Spectral color {thekey}"
-        da.attrs["units"]                = "dimensionless"
+        da.coords[options.lat_key].attrs = {
+            "units": "degrees_north",
+            "long_name": "Latitude",
+        }
+        da.coords[options.lon_key].attrs = {
+            "units": "degrees_east",
+            "long_name": "Longitude",
+        }
+        da.attrs["long_name"] = f"Spectral color {thekey}"
+        da.attrs["units"] = "dimensionless"
         logging.info(f"Saving {os.fspath(filename)}...")
         da.to_netcdf(filename)
 
     # Save RGB NetCDFs at [0, 1] range (matches reference output)
     for thekey in ["red", "green", "blue"]:
-        da       = spectral_color_maps[thekey]
+        da = spectral_color_maps[thekey]
         filename = options.output_folder / f"{thekey}.nc"
-        da.coords[options.lat_key].attrs = {"units": "degrees_north", "long_name": "Latitude"}
-        da.coords[options.lon_key].attrs = {"units": "degrees_east",  "long_name": "Longitude"}
-        da.attrs["long_name"]            = f"Spectral color {thekey}"
-        da.attrs["units"]                = "dimensionless"
+        da.coords[options.lat_key].attrs = {
+            "units": "degrees_north",
+            "long_name": "Latitude",
+        }
+        da.coords[options.lon_key].attrs = {
+            "units": "degrees_east",
+            "long_name": "Longitude",
+        }
+        da.attrs["long_name"] = f"Spectral color {thekey}"
+        da.attrs["units"] = "dimensionless"
         logging.info(f"Saving {os.fspath(filename)}...")
         da.to_netcdf(filename)
 
     # Save RGB NetCDFs scaled to [0, 255] for GMT (grdimage expects byte range)
     for thekey in ["red", "green", "blue"]:
-        scaled   = spectral_color_maps[thekey] * 255.0
+        scaled = spectral_color_maps[thekey] * 255.0
         gmt_file = options.output_folder / f"{thekey}_gmt.nc"
-        scaled.coords[options.lat_key].attrs = {"units": "degrees_north", "long_name": "Latitude"}
-        scaled.coords[options.lon_key].attrs = {"units": "degrees_east",  "long_name": "Longitude"}
-        scaled.attrs["long_name"]            = f"Spectral color {thekey} (scaled 0-255)"
-        scaled.attrs["units"]                = "dimensionless"
+        scaled.coords[options.lat_key].attrs = {
+            "units": "degrees_north",
+            "long_name": "Latitude",
+        }
+        scaled.coords[options.lon_key].attrs = {
+            "units": "degrees_east",
+            "long_name": "Longitude",
+        }
+        scaled.attrs["long_name"] = f"Spectral color {thekey} (scaled 0-255)"
+        scaled.attrs["units"] = "dimensionless"
         logging.info(f"Saving {os.fspath(gmt_file)} (scaled to [0,255] for GMT)...")
         scaled.to_netcdf(gmt_file)
     logging.info("Finished saving NetCDFs.")
 
-    # Plot individual variables
+    # Plot individual variables as projected maps
+    map_projection = _get_cartopy_projection(options.plot_options.projection)
     for thekey in spectral_color_maps.keys():
-        img = plt.imshow(spectral_color_maps[thekey], origin="lower")
-        plt.colorbar(img, orientation="horizontal")
-        plt.title(thekey)
-        plt.savefig(options.output_folder / f"output_{thekey}.png", dpi=options.dpi)
-        plt.close()
+        plot_map(
+            spectral_color_maps[thekey],
+            lat_key=options.lat_key,
+            lon_key=options.lon_key,
+            projection=map_projection,
+            title=thekey,
+            output_path=options.output_folder / f"output_{thekey}.png",
+            plot_options=options.plot_options,
+            colorbar_label=thekey,
+        )
 
-    # Stack into an RGB image
-    image = np.dstack((
-        spectral_color_maps["red"].values,
-        spectral_color_maps["green"].values,
-        spectral_color_maps["blue"].values,
-    ))
-
-    plt.imshow(image, origin="lower")
-    plt.title(f"{options.y_key}, periods {options.min_period / 7.:.0f}-{options.max_period / 7.:.0f} weeks,{funcs_desc}")
-    plt.savefig(options.output_folder / "image_matplotlib.png", dpi=options.dpi)
-    plt.close()
+    # Plot composite RGB map
+    plot_rgb_map(
+        spectral_color_maps["red"],
+        spectral_color_maps["green"],
+        spectral_color_maps["blue"],
+        lat_key=options.lat_key,
+        lon_key=options.lon_key,
+        projection=map_projection,
+        title=f"{options.y_key}, periods {options.min_period / 7.0:.0f}-{options.max_period / 7.0:.0f} weeks,{funcs_desc}",
+        output_path=options.output_folder / "image_matplotlib.png",
+        plot_options=options.plot_options,
+    )
 
     if not options.plot_options.no_gmt_plots:
         write_rgb_colorscale(options, cie)
         write_gmt_scripts(options)
         run_gmt_scripts(options)
 
-    logging.debug("Next line assumes these units are originally in ns and you want the units to be days.")
+    logging.debug(
+        "Next line assumes these units are originally in ns and you want the units to be days."
+    )
     logging.info("All finished!")
-    logging.info("Download and analyze chlorophyll data, as well as sea surface salinity data!")
+    logging.info(
+        "Download and analyze chlorophyll data, as well as sea surface salinity data!"
+    )
 
-    end_time     = dt.datetime.now()
+    end_time = dt.datetime.now()
     elapsed_time = end_time - start_time
     logging.info(f"Elapsed time: {elapsed_time}")
     logging.shutdown()
@@ -657,6 +823,7 @@ def main() -> None:
 # ---------------------------------------------------------------------------
 # Pure helper functions (no options needed)
 # ---------------------------------------------------------------------------
+
 
 def gaussian(x: np.ndarray, mu: float, sig: float) -> np.ndarray:
     """Compute a Gaussian function."""
@@ -669,7 +836,7 @@ def spectrum2xyz_old(spectrum: xr.Dataset, cie: xr.Dataset) -> xr.Dataset:
     wavelength_step_size = np.diff(cie["wavelength"].values).mean()
     for l in ["x", "y", "z"]:
         temp_values = spectrum["power"].values * cie[l].values
-        xyz[l] = (temp_values.sum() * wavelength_step_size)
+        xyz[l] = temp_values.sum() * wavelength_step_size
     return xr.Dataset(xyz)
 
 
@@ -683,15 +850,17 @@ def spectrum2xyz_new(spectrum: xr.Dataset, cie: xr.Dataset) -> xr.Dataset:
     Returns:
         Dataset with 'x', 'y', 'z' tristimulus values.
     """
-    spd  = SpectralDistribution(spectrum["power"].values, spectrum.coords["wavelength"].values)
+    spd = SpectralDistribution(
+        spectrum["power"].values, spectrum.coords["wavelength"].values
+    )
     cmfs = MSDS_CMFS_STANDARD_OBSERVER["CIE 1931 2 Degree Standard Observer"]
-    XYZ  = sd_to_XYZ(spd, cmfs)
+    XYZ = sd_to_XYZ(spd, cmfs)
     return xr.Dataset({"x": XYZ[0], "y": XYZ[1], "z": XYZ[2]})
 
 
 def raise_y_to_power(xyz: xr.Dataset, power: float) -> xr.Dataset:
     """Raise Y to a power while keeping chromaticity constant."""
-    power  = 1 - power
+    power = 1 - power
     factor = pow(xyz["y"].values, power)
     for key in xyz.data_vars:
         xyz[key].values /= factor
@@ -700,33 +869,47 @@ def raise_y_to_power(xyz: xr.Dataset, power: float) -> xr.Dataset:
 
 def xyz2rgb_old(xyz: xr.Dataset) -> xr.Dataset:
     """Convert XYZ to linear sRGB using a manual matrix multiply (no gamma)."""
-    A = np.array([[3.2409699, -1.5373832, -0.49861079],
-                  [-0.96924375, 1.8759676, 0.041555082],
-                  [0.055630032, -0.20397685, 1.0569714]])
+    A = np.array(
+        [
+            [3.2409699, -1.5373832, -0.49861079],
+            [-0.96924375, 1.8759676, 0.041555082],
+            [0.055630032, -0.20397685, 1.0569714],
+        ]
+    )
 
-    xyz_vector = np.array([xyz["x"].values.squeeze(),
-                           xyz["y"].values.squeeze(),
-                           xyz["z"].values.squeeze()])
-    rgb_vals   = np.dot(A, xyz_vector)
-    rgb_ds     = xr.Dataset({"red": rgb_vals[0], "green": rgb_vals[1], "blue": rgb_vals[2]})
-    result     = xr.merge([xyz, rgb_ds])
+    xyz_vector = np.array(
+        [
+            xyz["x"].values.squeeze(),
+            xyz["y"].values.squeeze(),
+            xyz["z"].values.squeeze(),
+        ]
+    )
+    rgb_vals = np.dot(A, xyz_vector)
+    rgb_ds = xr.Dataset({"red": rgb_vals[0], "green": rgb_vals[1], "blue": rgb_vals[2]})
+    result = xr.merge([xyz, rgb_ds])
     return result
 
 
 def xyz2rgb_new(xyz: xr.Dataset) -> xr.Dataset:
     """Convert XYZ to sRGB using colour-science."""
-    XYZ    = np.array([xyz["x"].values.squeeze(), xyz["y"].values.squeeze(), xyz["z"].values.squeeze()])
-    RGB    = XYZ_to_sRGB(XYZ)
-    rgb    = xr.Dataset({"red": RGB[0], "green": RGB[1], "blue": RGB[2]})
+    XYZ = np.array(
+        [
+            xyz["x"].values.squeeze(),
+            xyz["y"].values.squeeze(),
+            xyz["z"].values.squeeze(),
+        ]
+    )
+    RGB = XYZ_to_sRGB(XYZ)
+    rgb = xr.Dataset({"red": RGB[0], "green": RGB[1], "blue": RGB[2]})
     result = xr.merge([xyz, rgb])
     return result
 
 
 def fix_gamut(rgb: xr.Dataset) -> xr.Dataset:
     """Fix out-of-gamut RGB values by adding white light to make all values positive."""
-    R          = rgb["red"].values.squeeze()
-    G          = rgb["green"].values.squeeze()
-    B          = rgb["blue"].values.squeeze()
+    R = rgb["red"].values.squeeze()
+    G = rgb["green"].values.squeeze()
+    B = rgb["blue"].values.squeeze()
     rgb_values = np.array([R, G, B])
 
     if np.any(np.isnan(rgb_values)):
@@ -735,43 +918,45 @@ def fix_gamut(rgb: xr.Dataset) -> xr.Dataset:
     min_val = rgb_values.min()
     if min_val < 0:
         # Make "min" positive as in paper's appendix, and add 1/255 so the rescale value isn't 0.
-        min_val    = -min_val + 1.0 / 255.0
+        min_val = -min_val + 1.0 / 255.0
         # This factor rescales the luminance back to its original value.
-        factor     = rgb["y"].values.squeeze() / (rgb["y"].values.squeeze() + min_val)
+        factor = rgb["y"].values.squeeze() / (rgb["y"].values.squeeze() + min_val)
         rgb_values = (rgb_values + min_val) * factor
 
-    result = xr.Dataset({
-        "x"     : rgb["x"],
-        "y"     : rgb["y"],
-        "z"     : rgb["z"],
-        "red"   : rgb_values[0],
-        "green" : rgb_values[1],
-        "blue"  : rgb_values[2],
-    })
+    result = xr.Dataset(
+        {
+            "x": rgb["x"],
+            "y": rgb["y"],
+            "z": rgb["z"],
+            "red": rgb_values[0],
+            "green": rgb_values[1],
+            "blue": rgb_values[2],
+        }
+    )
     return result
 
 
 def gamma_correct_rgb(rgb: xr.Dataset) -> xr.Dataset:
     """Apply BT.709 gamma correction to RGB values."""
     gamma_inv = 0.45
-    crit      = 0.018  # RGB values are gamma corrected differently below and above crit.
-    h         = 4.506813168
-    g         = -0.09914989
-    f         = 1.09914989
+    crit = 0.018  # RGB values are gamma corrected differently below and above crit.
+    h = 4.506813168
+    g = -0.09914989
+    f = 1.09914989
     for key in ["red", "green", "blue"]:
         # Typo in Hughes and Williams 2010 equation A7, compared to Charles Poynton's GammaFAQ:
         # http://www.poynton.com/GammaFAQ.html
-        vals       = rgb[key].values.copy()
-        low        = vals <= crit
-        vals[low]  *= h
-        vals[~low]  = f * np.power(vals[~low], gamma_inv) + g
-        rgb[key]    = (rgb[key].dims, vals)
+        vals = rgb[key].values.copy()
+        low = vals <= crit
+        vals[low] *= h
+        vals[~low] = f * np.power(vals[~low], gamma_inv) + g
+        rgb[key] = (rgb[key].dims, vals)
     return rgb
 
 
 def rms_and_mean(x: xr.DataArray) -> xr.Dataset:
     """Compute RMS and mean of an array."""
-    rms_value  = np.sqrt(np.mean(x**2))
+    rms_value = np.sqrt(np.mean(x**2))
     mean_value = np.mean(x)
     return xr.Dataset({"rms": rms_value, "mean": mean_value})
 
@@ -786,6 +971,7 @@ def normalize_data(data: Any, max_value: float) -> list[float]:
 # Populate dataclasses from computed results
 # ---------------------------------------------------------------------------
 
+
 def populate_results(options: Options, spectral_color_maps: xr.Dataset) -> None:
     """Populate options.results and options.plot_options from actual computed data.
 
@@ -799,8 +985,8 @@ def populate_results(options: Options, spectral_color_maps: xr.Dataset) -> None:
                               variables on (lat_key, lon_key) coordinates.
     """
     results = options.results
-    lats    = spectral_color_maps.coords[options.lat_key].values
-    lons    = spectral_color_maps.coords[options.lon_key].values
+    lats = spectral_color_maps.coords[options.lat_key].values
+    lons = spectral_color_maps.coords[options.lon_key].values
 
     # Populate latlon from actual computed grid
     results.latlon.lat = lats.tolist()
@@ -819,43 +1005,54 @@ def populate_results(options: Options, spectral_color_maps: xr.Dataset) -> None:
 
     # Real metadata
     results.titles = ["Spectral Colors"]
-    results.units  = ["days"]
-    results.rgb    = [1.0, 1.0, 1.0]  # 3 elements signals RGB mode
+    results.units = ["days"]
+    results.rgb = [1.0, 1.0, 1.0]  # 3 elements signals RGB mode
 
     # Populate grid
-    options.grid.lat    = lats.tolist()
-    options.grid.lon    = lons.tolist()
+    options.grid.lat = lats.tolist()
+    options.grid.lon = lons.tolist()
     options.grid.maxlat = results.maxlat
     options.grid.minlat = results.minlat
     options.grid.maxlon = results.maxlon
     options.grid.minlon = results.minlon
 
     # Plot options
-    options.plot_options.outputfolder       = os.fspath(options.output_folder) + os.sep
-    options.plot_options.just_the_filenames = ["red_gmt.nc", "green_gmt.nc", "blue_gmt.nc"]
-    options.plot_options.dpi                = options.dpi
+    options.plot_options.outputfolder = os.fspath(options.output_folder) + os.sep
+    options.plot_options.just_the_filenames = [
+        "red_gmt.nc",
+        "green_gmt.nc",
+        "blue_gmt.nc",
+    ]
+    options.plot_options.dpi = options.dpi
 
 
 # ---------------------------------------------------------------------------
 # GMT pure helpers (no options needed)
 # ---------------------------------------------------------------------------
 
+
 def write_gmt_defs(new_fp: BinaryIO) -> None:
     """Write clarifying GMT definitions to the script file."""
     new_fp.write(b"#######################################################\n")
     new_fp.write(b"#Clarifying definitions. Do not change!################\n")
-    new_fp.write(b"start=\" -K \" #Should always redirect using > to write new PS.\n")
-    new_fp.write(b"middle=\" -O -K \" #Should always redirect using >> to append to PS.\n")
-    new_fp.write(b"end=\" -O \" #Should always redirect using >> to append to PS.\n")
+    new_fp.write(b'start=" -K " #Should always redirect using > to write new PS.\n')
+    new_fp.write(
+        b'middle=" -O -K " #Should always redirect using >> to append to PS.\n'
+    )
+    new_fp.write(b'end=" -O " #Should always redirect using >> to append to PS.\n')
     new_fp.write(b"#######################################################\n")
 
 
 def write_gmt_coastlines(new_fp: BinaryIO) -> None:
     """Write GMT coastlines commands to the script file."""
-    new_fp.write(b"gmt pscoast -W$coast_thk/$coast_color $coast_res $range $projection $map_pos $middle >> $plot_base.ps\n")
+    new_fp.write(
+        b"gmt pscoast -W$coast_thk/$coast_color $coast_res $range $projection $map_pos $middle >> $plot_base.ps\n"
+    )
     new_fp.write(b"if [ $coastlines == 2 ]\n")
     new_fp.write(b"then\n")
-    new_fp.write(b"  gmt psxy -N $coast_file -: -Sc$coast_thk -W$coast_thk/$coast_color $range $projection $map_pos $middle >> $plot_base.ps\n")
+    new_fp.write(
+        b"  gmt psxy -N $coast_file -: -Sc$coast_thk -W$coast_thk/$coast_color $range $projection $map_pos $middle >> $plot_base.ps\n"
+    )
     new_fp.write(b"fi\n")
 
 
@@ -864,11 +1061,17 @@ def finish_flip_backgrounds(flip_fp: BinaryIO) -> None:
     flip_fp.write(b"for current_base in $all_bases\n")
     flip_fp.write(b"do\n")
     flip_fp.write(b"  #Change black to cyan temporarily.\n")
-    flip_fp.write(b"  convert $current_base.png -fill cyan -opaque black $current_base.png\n")
+    flip_fp.write(
+        b"  convert $current_base.png -fill cyan -opaque black $current_base.png\n"
+    )
     flip_fp.write(b"  #Change white to black.\n")
-    flip_fp.write(b"  convert $current_base.png -fill black -opaque white $current_base.png\n")
+    flip_fp.write(
+        b"  convert $current_base.png -fill black -opaque white $current_base.png\n"
+    )
     flip_fp.write(b"  #Change temporary cyan to white.\n")
-    flip_fp.write(b"  convert $current_base.png -fill white -opaque cyan $current_base.png\n")
+    flip_fp.write(
+        b"  convert $current_base.png -fill white -opaque cyan $current_base.png\n"
+    )
     flip_fp.write(b"done\n")
 
 
@@ -884,6 +1087,7 @@ def finish_trim(trim_fp: BinaryIO) -> None:
 # Data / science functions
 # ---------------------------------------------------------------------------
 
+
 def load_cie_functions(options: Options) -> xr.Dataset:
     """Load CIE 1931 color matching functions from CSV.
 
@@ -897,7 +1101,7 @@ def load_cie_functions(options: Options) -> xr.Dataset:
     cie_path = Path(options.cie_file)
 
     data: dict[str, list[float]] = {"x": [], "y": [], "z": []}
-    wavelengths: list[float]     = []
+    wavelengths: list[float] = []
 
     try:
         with cie_path.open("r") as in_fp:
@@ -906,14 +1110,14 @@ def load_cie_functions(options: Options) -> xr.Dataset:
                 wavelengths.append(float(row[0]))
                 for i, val in enumerate(row[1:], start=0):
                     data[list(data.keys())[i]].append(float(val))
-    except IOError:
+    except OSError:
         logging.error(f"The CIE file, {os.fspath(cie_path)}, failed to open.")
 
     da = xr.Dataset(
         {var: ("wavelength", data[var]) for var in data},
         coords={"wavelength": wavelengths},
     )
-    da.attrs["title"]                     = "CIE 1931 color matching functions"
+    da.attrs["title"] = "CIE 1931 color matching functions"
     da.coords["wavelength"].attrs["units"] = "nm"
     return da
 
@@ -921,16 +1125,23 @@ def load_cie_functions(options: Options) -> xr.Dataset:
 def synthetic_spectrum(cie: xr.Dataset, mu: float, sig: float) -> xr.Dataset:
     """Create a synthetic Gaussian spectrum on the CIE wavelength grid."""
     wavelengths = cie.coords["wavelength"].values
-    power       = gaussian(wavelengths, mu, sig)
-    spectrum    = xr.DataArray(power, coords=[("wavelength", wavelengths)], name="power").to_dataset()
+    power = gaussian(wavelengths, mu, sig)
+    spectrum = xr.DataArray(
+        power, coords=[("wavelength", wavelengths)], name="power"
+    ).to_dataset()
     return spectrum
 
 
-def synthetic_timeseries(options: Options, signal: str = "annual", signal_amplitude: float = 1,
-                         noise: str = "white", noise_level: float = 0.1,
-                         temporal_resolution: str = "monthly",
-                         time_start: dt.datetime = dt.datetime(2001, 1, 1),
-                         time_stop: dt.datetime = dt.datetime(2005, 1, 1)) -> xr.Dataset:
+def synthetic_timeseries(
+    options: Options,
+    signal: str = "annual",
+    signal_amplitude: float = 1,
+    noise: str = "white",
+    noise_level: float = 0.1,
+    temporal_resolution: str = "monthly",
+    time_start: dt.datetime = dt.datetime(2001, 1, 1),
+    time_stop: dt.datetime = dt.datetime(2005, 1, 1),
+) -> xr.Dataset:
     """Generate a synthetic timeseries with signal and noise.
 
     Args:
@@ -949,14 +1160,16 @@ def synthetic_timeseries(options: Options, signal: str = "annual", signal_amplit
         Dataset with the synthetic timeseries.
     """
     if temporal_resolution == "monthly":
-        dates = pd.date_range(start=time_start, end=time_stop, freq="M") + pd.Timedelta(days=15)
+        dates = pd.date_range(start=time_start, end=time_stop, freq="M") + pd.Timedelta(
+            days=15
+        )
     elif temporal_resolution == "daily":
         dates = pd.date_range(start=time_start, end=time_stop, freq="D")
     else:
         logging.error(f"!!!WARNING!!! {temporal_resolution = }")
 
     if signal == "annual":
-        t             = (dates - time_start).days / 365.25
+        t = (dates - time_start).days / 365.25
         signal_values = signal_amplitude * np.sin(2 * np.pi * t)
     else:
         logging.error(f"!!!WARNING!!! {signal = }")
@@ -974,8 +1187,9 @@ def synthetic_timeseries(options: Options, signal: str = "annual", signal_amplit
     )
 
 
-def fancy_detrend(timeseries: xr.Dataset, x_key: str, y_key: str,
-                  terms: list[str] | None = None) -> tuple[xr.Dataset, dict[str, float]]:
+def fancy_detrend(
+    timeseries: xr.Dataset, x_key: str, y_key: str, terms: list[str] | None = None
+) -> tuple[xr.Dataset, dict[str, float]]:
     """Detrend a timeseries using OLS regression.
 
     Args:
@@ -990,7 +1204,9 @@ def fancy_detrend(timeseries: xr.Dataset, x_key: str, y_key: str,
     if terms is None:
         terms = ["constant", "trend"]
 
-    x = (timeseries[x_key] - timeseries[x_key][0]).values.astype(float) / (24 * 3600 * 1e9)
+    x = (timeseries[x_key] - timeseries[x_key][0]).values.astype(float) / (
+        24 * 3600 * 1e9
+    )
     y = timeseries[y_key].values.squeeze()
 
     design_matrix = []
@@ -1010,13 +1226,16 @@ def fancy_detrend(timeseries: xr.Dataset, x_key: str, y_key: str,
 
     design_matrix = np.column_stack(design_matrix)
 
-    model  = sm.OLS(y, design_matrix)
+    model = sm.OLS(y, design_matrix)
     result = model.fit()
 
     detrended_y = y - result.fittedvalues
 
-    detrended_timeseries             = timeseries.copy()
-    detrended_timeseries[y_key]      = (timeseries[y_key].dims, detrended_y.reshape(timeseries[y_key].shape))
+    detrended_timeseries = timeseries.copy()
+    detrended_timeseries[y_key] = (
+        timeseries[y_key].dims,
+        detrended_y.reshape(timeseries[y_key].shape),
+    )
 
     fits: dict[str, float] = {}
     for i, term in enumerate(terms):
@@ -1032,8 +1251,9 @@ def fancy_detrend(timeseries: xr.Dataset, x_key: str, y_key: str,
     return detrended_timeseries, fits
 
 
-def turn_fits_into_timeseries(timeseries: xr.Dataset, x_key: str, y_key: str,
-                              fits: dict[str, float]) -> xr.Dataset:
+def turn_fits_into_timeseries(
+    timeseries: xr.Dataset, x_key: str, y_key: str, fits: dict[str, float]
+) -> xr.Dataset:
     """Reconstruct a timeseries from fit coefficients.
 
     Args:
@@ -1045,7 +1265,9 @@ def turn_fits_into_timeseries(timeseries: xr.Dataset, x_key: str, y_key: str,
     Returns:
         Dataset with reconstructed fitted values.
     """
-    x             = (timeseries[x_key] - timeseries[x_key][0]).values.astype(float) / (24 * 3600 * 1e9)
+    x = (timeseries[x_key] - timeseries[x_key][0]).values.astype(float) / (
+        24 * 3600 * 1e9
+    )
     fitted_values = np.zeros_like(x)
 
     for term, fit_value in fits.items():
@@ -1064,8 +1286,11 @@ def turn_fits_into_timeseries(timeseries: xr.Dataset, x_key: str, y_key: str,
         elif term == "semiannual_cos":
             fitted_values += fit_value * np.cos(2 * np.pi * x / DAYS_IN_YEAR / 2.0)
 
-    fitted_timeseries        = timeseries.copy()
-    fitted_timeseries[y_key] = (timeseries[y_key].dims, fitted_values.reshape(timeseries[y_key].shape))
+    fitted_timeseries = timeseries.copy()
+    fitted_timeseries[y_key] = (
+        timeseries[y_key].dims,
+        fitted_values.reshape(timeseries[y_key].shape),
+    )
     return fitted_timeseries
 
 
@@ -1081,26 +1306,30 @@ def nfft_power(options: Options, timeseries: xr.Dataset) -> xr.Dataset:
     Returns:
         Dataset with 'power' variable and 'frequency' coordinate.
     """
-    #logging.error("!!!WARNING!!! Next line assumes these units are originally in ns and you want the units to be days!!!")
-    x = (timeseries[options.x_key] - timeseries[options.x_key][0]).values.astype(float).squeeze() / (24 * 3600 * 1e9)
+    # logging.error("!!!WARNING!!! Next line assumes these units are originally in ns and you want the units to be days!!!")
+    x = (timeseries[options.x_key] - timeseries[options.x_key][0]).values.astype(
+        float
+    ).squeeze() / (24 * 3600 * 1e9)
     y = timeseries[options.y_key].values.squeeze()
 
     # If timeseries has an odd number of points,
     # remove the last data point, then calculate min, range.
     N = 1
     while N % 2:
-        N       = len(x)
-        x_min   = np.min(x)
+        N = len(x)
+        x_min = np.min(x)
         x_range = np.max(x) - np.min(x)
-        x_norm  = (x - x_min) / x_range - 0.5
+        x_norm = (x - x_min) / x_range - 0.5
         if N % 2:
-            logging.error(f"!!! WARNING!!! LENGTH NEEDS TO BE EVEN FOR NFFT, BUT: {len(x) = }")
+            logging.error(
+                f"!!! WARNING!!! LENGTH NEEDS TO BE EVEN FOR NFFT, BUT: {len(x) = }"
+            )
             logging.error("!!! DELETING LAST DATA POINT!")
             x = np.delete(x, -1)
             y = np.delete(y, -1)
 
     # Define Fourier modes
-    k  = -(N // 2) + np.arange(N)
+    k = -(N // 2) + np.arange(N)
     # Convert Fourier modes to frequencies
     xf = k / x_range
 
@@ -1108,18 +1337,20 @@ def nfft_power(options: Options, timeseries: xr.Dataset) -> xr.Dataset:
     f_k = nfft.nfft(x_norm, y)
 
     # Compute power spectrum, which is the square of the absolute value of the Fourier Transform
-    power_spectrum = np.abs(f_k)**2
+    power_spectrum = np.abs(f_k) ** 2
 
     # Only take the positive frequencies. Since the output is symmetric, this will not lose any information.
-    power_spectrum = power_spectrum[N // 2 + 1:]
-    xf_half        = xf[N // 2 + 1:]
+    power_spectrum = power_spectrum[N // 2 + 1 :]
+    xf_half = xf[N // 2 + 1 :]
 
     # Create xarray DataArray with coordinates
-    power_spectrum_da = xr.DataArray(power_spectrum, coords=[("frequency", xf_half)], name="power")
+    power_spectrum_da = xr.DataArray(
+        power_spectrum, coords=[("frequency", xf_half)], name="power"
+    )
 
     # Convert this DataArray to a Dataset
-    spectrum                              = power_spectrum_da.to_dataset()
-    spectrum["frequency"].attrs["units"]  = "1/days"
+    spectrum = power_spectrum_da.to_dataset()
+    spectrum["frequency"].attrs["units"] = "1/days"
 
     return spectrum
 
@@ -1145,14 +1376,20 @@ def convert_spectrum_from_frequency_to_period(spectrum: xr.Dataset) -> xr.Datase
         logging.error(f"!!!WARNING!!! DID NOT RECOGNIZE {freq_units = }")
 
     new_spectrum = spectrum.assign_coords(period=("frequency", period.data))
-    new_spectrum = new_spectrum.swap_dims({"frequency": "period"}).drop_vars("frequency")
+    new_spectrum = new_spectrum.swap_dims({"frequency": "period"}).drop_vars(
+        "frequency"
+    )
     new_spectrum = new_spectrum.sortby("period")
 
     return new_spectrum
 
 
-def map_power_spectrum(cie: xr.Dataset, power_spectrum: xr.Dataset,
-                       min_period: float = -1, max_period: float = -1) -> xr.Dataset:
+def map_power_spectrum(
+    cie: xr.Dataset,
+    power_spectrum: xr.Dataset,
+    min_period: float = -1,
+    max_period: float = -1,
+) -> xr.Dataset:
     """Map a power spectrum from period space to the CIE wavelength grid.
 
     Args:
@@ -1176,13 +1413,16 @@ def map_power_spectrum(cie: xr.Dataset, power_spectrum: xr.Dataset,
         new_period_added = True
 
     if new_period_added:
-        new_periods    = np.sort(existing_periods)
+        new_periods = np.sort(existing_periods)
         power_spectrum = power_spectrum.reindex(period=new_periods, method="nearest")
 
     power_spectrum["power"] = power_spectrum["power"].interpolate_na(dim="period")
 
     power_spectrum = power_spectrum.where(
-        (power_spectrum["period"] >= min_period) & (power_spectrum["period"] <= max_period), drop=True)
+        (power_spectrum["period"] >= min_period)
+        & (power_spectrum["period"] <= max_period),
+        drop=True,
+    )
 
     mapped_power_values = np.interp(
         np.linspace(min_period, max_period, len(cie["wavelength"])),
@@ -1200,6 +1440,33 @@ def map_power_spectrum(cie: xr.Dataset, power_spectrum: xr.Dataset,
 # ---------------------------------------------------------------------------
 # Plot functions
 # ---------------------------------------------------------------------------
+
+_CARTOPY_PROJECTIONS: dict[int, type[ccrs.Projection]] = {
+    1: ccrs.Robinson,
+    2: ccrs.Robinson,  # Winkel Tripel not available in cartopy
+    3: ccrs.Mollweide,
+    4: ccrs.Miller,
+}
+
+
+def _get_cartopy_projection(projection_code: int) -> ccrs.Projection:
+    """Return a cartopy projection matching the given integer code.
+
+    Args:
+        projection_code: Projection choice (1=Robinson, 2=Winkel Tripel
+                         fallback to Robinson, 3=Mollweide, 4=Miller).
+
+    Returns:
+        A cartopy CRS Projection instance with central_longitude=180
+        (appropriate for 0-360 longitude data).
+    """
+    if projection_code == 2:
+        logging.warning(
+            "Winkel Tripel is not available in cartopy. Using Robinson as fallback."
+        )
+    proj_cls = _CARTOPY_PROJECTIONS.get(projection_code, ccrs.Robinson)
+    return proj_cls(central_longitude=180)
+
 
 def plot_timeseries(options: Options, ds: xr.Dataset, title: str) -> None:
     """Plot a timeseries and save to the output folder.
@@ -1220,7 +1487,14 @@ def plot_timeseries(options: Options, ds: xr.Dataset, title: str) -> None:
     plt.title(title, color="white")
     date_str = dt.datetime.now().strftime("%Y%m%d-%H%M%S")
     filename = options.output_folder / f"{date_str}_{title.replace(' ', '_')}.png"
-    plt.savefig(filename, dpi=options.dpi, format="png", transparent=False, bbox_inches="tight", facecolor="black")
+    plt.savefig(
+        filename,
+        dpi=options.dpi,
+        format="png",
+        transparent=False,
+        bbox_inches="tight",
+        facecolor="black",
+    )
 
 
 def plot_fft_spectrum(options: Options, power_spectrum: xr.Dataset, title: str) -> None:
@@ -1233,16 +1507,27 @@ def plot_fft_spectrum(options: Options, power_spectrum: xr.Dataset, title: str) 
     """
     plt.figure(figsize=options.figsize)
     plt.plot(power_spectrum.period, power_spectrum.power, color="lime", linewidth=2.0)
-    plt.scatter(power_spectrum.period, power_spectrum.power, marker="s", color="cyan", s=10)
+    plt.scatter(
+        power_spectrum.period, power_spectrum.power, marker="s", color="cyan", s=10
+    )
     plt.title(title)
     plt.xlabel("Period (days)")
     plt.ylabel("Power")
     date_str = dt.datetime.now().strftime("%Y%m%d-%H%M%S")
     filename = options.output_folder / f"{date_str}_{title.replace(' ', '_')}.png"
-    plt.savefig(filename, dpi=options.dpi, format="png", transparent=False, bbox_inches="tight", facecolor="black")
+    plt.savefig(
+        filename,
+        dpi=options.dpi,
+        format="png",
+        transparent=False,
+        bbox_inches="tight",
+        facecolor="black",
+    )
 
 
-def plot_light_spectrum(options: Options, power_spectrum: xr.Dataset, title: str) -> None:
+def plot_light_spectrum(
+    options: Options, power_spectrum: xr.Dataset, title: str
+) -> None:
     """Plot a light spectrum and save to the output folder.
 
     Args:
@@ -1251,17 +1536,30 @@ def plot_light_spectrum(options: Options, power_spectrum: xr.Dataset, title: str
         title:          Plot title.
     """
     plt.figure(figsize=options.figsize)
-    plt.plot(power_spectrum.wavelength, power_spectrum.power, color="lime", linewidth=2.0)
-    plt.scatter(power_spectrum.wavelength, power_spectrum.power, marker="s", color="cyan", s=10)
+    plt.plot(
+        power_spectrum.wavelength, power_spectrum.power, color="lime", linewidth=2.0
+    )
+    plt.scatter(
+        power_spectrum.wavelength, power_spectrum.power, marker="s", color="cyan", s=10
+    )
     plt.title(title)
     plt.xlabel("Wavelength (nm)")
     plt.ylabel("Power")
     date_str = dt.datetime.now().strftime("%Y%m%d-%H%M%S")
     filename = options.output_folder / f"{date_str}_{title.replace(' ', '_')}.png"
-    plt.savefig(filename, dpi=options.dpi, format="png", transparent=False, bbox_inches="tight", facecolor="black")
+    plt.savefig(
+        filename,
+        dpi=options.dpi,
+        format="png",
+        transparent=False,
+        bbox_inches="tight",
+        facecolor="black",
+    )
 
 
-def plot_color(options: Options, rgb: xr.Dataset, filename: str | os.PathLike[str]) -> None:
+def plot_color(
+    options: Options, rgb: xr.Dataset, filename: str | os.PathLike[str]
+) -> None:
     """Plot a solid color square and save to a file.
 
     Args:
@@ -1270,15 +1568,208 @@ def plot_color(options: Options, rgb: xr.Dataset, filename: str | os.PathLike[st
         filename: Output file path.
     """
     filename = Path(filename)
-    fig, ax  = plt.subplots(1, 1, figsize=(2, 2), dpi=options.dpi)
+    fig, ax = plt.subplots(1, 1, figsize=(2, 2), dpi=options.dpi)
     ax.set_facecolor(tuple(rgb[key] for key in ["red", "green", "blue"]))
     ax.axis("off")
-    plt.savefig(filename, dpi=options.dpi, format="png", transparent=False, bbox_inches="tight")
+    plt.savefig(
+        filename, dpi=options.dpi, format="png", transparent=False, bbox_inches="tight"
+    )
+
+
+def _add_map_features(
+    ax: Any,  # noqa: ANN401 — cartopy GeoAxes; no type stubs available
+    plot_options: PlotOptions,
+) -> None:
+    """Add geographic features (land, ocean, coastlines, etc.) to a cartopy axis.
+
+    Args:
+        ax:           A GeoAxes with a cartopy projection.
+        plot_options: PlotOptions controlling which features to draw.
+    """
+    coastline_color = "darkgray" if plot_options.dark_mode else "black"
+    border_color = "gray" if plot_options.dark_mode else "#666666"
+
+    # ax.add_feature(cfeature.OCEAN, facecolor=plot_options.ocean_color, zorder=0)
+    # ax.add_feature(
+    #     cfeature.LAND,
+    #     facecolor=plot_options.land_color,
+    #     zorder=1,
+    #     edgecolor="none",
+    # )
+    ax.coastlines(
+        resolution=plot_options.coastline_resolution,
+        color=coastline_color,
+        linewidth=0.1,
+        zorder=3,
+    )
+    if plot_options.show_borders:
+        ax.add_feature(
+            cfeature.BORDERS,
+            linewidth=0.3,
+            edgecolor=border_color,
+            zorder=4,
+        )
+    if plot_options.show_rivers:
+        ax.add_feature(
+            cfeature.RIVERS,
+            linewidth=0.3,
+            edgecolor="steelblue",
+            zorder=4,
+        )
+
+    # Gridline labels only work on certain projections (PlateCarree, Mercator,
+    # Miller).  For others cartopy silently ignores draw_labels, so it is safe
+    # to always request them.
+    gl = ax.gridlines(
+        draw_labels=True,
+        color=coastline_color,
+        alpha=0.25,
+        linestyle="--",
+        linewidth=0.4,
+    )
+    gl.top_labels = False
+    gl.right_labels = False
+
+
+def plot_map(
+    data: xr.DataArray,
+    *,
+    lat_key: str,
+    lon_key: str,
+    projection: ccrs.Projection,
+    title: str,
+    output_path: Path,
+    plot_options: PlotOptions,
+    cmap: str = "viridis",
+    colorbar_label: str = "",
+) -> None:
+    """Plot a single-channel map with geographic projection and coastlines.
+
+    Uses pcolormesh for proper geographic rendering on a projected axis.
+    Data is assumed to be on a regular lat/lon grid.
+
+    Args:
+        data:           2D DataArray with (lat_key, lon_key) dimensions.
+        lat_key:        Name of the latitude coordinate.
+        lon_key:        Name of the longitude coordinate.
+        projection:     Cartopy CRS projection for display.
+        title:          Plot title string.
+        output_path:    Full path for the saved PNG file.
+        plot_options:   PlotOptions with dpi, figsize, colors, feature toggles.
+        cmap:           Matplotlib colormap name.
+        colorbar_label: Label for the colorbar.
+    """
+    facecolor = "black" if plot_options.dark_mode else "white"
+    title_color = "white" if plot_options.dark_mode else "black"
+
+    fig = plt.figure(figsize=plot_options.figsize, dpi=plot_options.dpi)
+    ax = fig.add_subplot(1, 1, 1, projection=projection)
+    ax.set_global()
+
+    _add_map_features(ax, plot_options)
+
+    lons = data.coords[lon_key].values
+    lats = data.coords[lat_key].values
+    mesh = ax.pcolormesh(
+        lons,
+        lats,
+        data.values,
+        transform=ccrs.PlateCarree(),
+        cmap=cmap,
+        shading="auto",
+        zorder=2,
+    )
+
+    fig.colorbar(
+        mesh,
+        ax=ax,
+        orientation="horizontal",
+        pad=0.05,
+        shrink=0.8,
+        label=colorbar_label,
+    )
+    ax.set_title(title, color=title_color, fontsize=16)
+    fig.savefig(
+        output_path,
+        dpi=plot_options.dpi,
+        bbox_inches="tight",
+        facecolor=facecolor,
+    )
+    plt.close(fig)
+
+
+def plot_rgb_map(
+    red: xr.DataArray,
+    green: xr.DataArray,
+    blue: xr.DataArray,
+    *,
+    lat_key: str,
+    lon_key: str,
+    projection: ccrs.Projection,
+    title: str,
+    output_path: Path,
+    plot_options: PlotOptions,
+) -> None:
+    """Plot a composite RGB map with geographic projection and coastlines.
+
+    Stacks three channels into an RGB image and renders it on a projected
+    map axis using imshow with proper geographic extent.
+
+    Args:
+        red:          2D DataArray for the red channel (values 0-1).
+        green:        2D DataArray for the green channel (values 0-1).
+        blue:         2D DataArray for the blue channel (values 0-1).
+        lat_key:      Name of the latitude coordinate.
+        lon_key:      Name of the longitude coordinate.
+        projection:   Cartopy CRS projection for display.
+        title:        Plot title string.
+        output_path:  Full path for the saved PNG file.
+        plot_options: PlotOptions with dpi, figsize, colors, feature toggles.
+    """
+    facecolor = "black" if plot_options.dark_mode else "white"
+    title_color = "white" if plot_options.dark_mode else "black"
+
+    image = np.dstack((red.values, green.values, blue.values))
+    image = np.nan_to_num(image, nan=0.0)
+    image = np.clip(image, 0.0, 1.0)
+
+    lons = red.coords[lon_key].values
+    lats = red.coords[lat_key].values
+    extent = [
+        float(lons.min()),
+        float(lons.max()),
+        float(lats.min()),
+        float(lats.max()),
+    ]
+
+    fig = plt.figure(figsize=plot_options.figsize, dpi=plot_options.dpi)
+    ax = fig.add_subplot(1, 1, 1, projection=projection)
+    ax.set_global()
+
+    _add_map_features(ax, plot_options)
+
+    ax.imshow(
+        image,
+        origin="lower",
+        extent=extent,
+        transform=ccrs.PlateCarree(),
+        zorder=2,
+    )
+
+    ax.set_title(title, color=title_color, fontsize=16)
+    fig.savefig(
+        output_path,
+        dpi=plot_options.dpi,
+        bbox_inches="tight",
+        facecolor=facecolor,
+    )
+    plt.close(fig)
 
 
 # ---------------------------------------------------------------------------
 # Data loading functions
 # ---------------------------------------------------------------------------
+
 
 def load_ssha_files(options: Options, tskip: int = 1) -> xr.Dataset:
     """Load SSHA NetCDF files.
@@ -1291,7 +1782,7 @@ def load_ssha_files(options: Options, tskip: int = 1) -> xr.Dataset:
     Returns:
         Combined dataset.
     """
-    sshafiles  = sorted(options.ssha_folder.glob("*.nc"))
+    sshafiles = sorted(options.ssha_folder.glob("*.nc"))
     tskip_files = sshafiles[::tskip]
     logging.info(f"Loading {len(tskip_files)} SSHA files...")
     input_data = xr.open_mfdataset(tskip_files, data_vars="all", combine="by_coords")
@@ -1308,7 +1799,7 @@ def load_argo_file(options: Options) -> xr.Dataset:
         Argo dataset.
     """
     thefiles = sorted(options.argo_folder.glob("*.nc"))
-    thefile  = thefiles[0]
+    thefile = thefiles[0]
     return xr.open_dataset(thefile)
 
 
@@ -1322,7 +1813,7 @@ def load_grace_file(options: Options) -> xr.Dataset:
         GRACE dataset.
     """
     thefiles = sorted(options.grace_folder.glob("*.nc"))
-    thefile  = thefiles[0]
+    thefile = thefiles[0]
     return xr.open_dataset(thefile)
 
 
@@ -1336,10 +1827,10 @@ def load_mur_sst_files(options: Options, tskip: int = 1) -> xr.Dataset:
     Returns:
         Combined dataset.
     """
-    thefiles    = sorted(options.mur_sst_folder.glob("*2003*.nc"))
+    thefiles = sorted(options.mur_sst_folder.glob("*2003*.nc"))
     tskip_files = thefiles[::tskip]
     logging.info(f"Loading {len(tskip_files)} MUR SST files...")
-    input_data  = xr.open_mfdataset(tskip_files, data_vars="all", combine="by_coords")
+    input_data = xr.open_mfdataset(tskip_files, data_vars="all", combine="by_coords")
     return input_data
 
 
@@ -1353,10 +1844,10 @@ def load_aqua_modis_files(options: Options, tskip: int = 1) -> xr.Dataset:
     Returns:
         Combined dataset.
     """
-    thefiles    = sorted(options.aqua_modis_folder.glob("*2003*.nc"))
+    thefiles = sorted(options.aqua_modis_folder.glob("*2003*.nc"))
     tskip_files = thefiles[::tskip]
     logging.info(f"Loading {len(tskip_files)} AQUA_MODIS files...")
-    input_data  = xr.open_mfdataset(tskip_files, data_vars="all", combine="by_coords")
+    input_data = xr.open_mfdataset(tskip_files, data_vars="all", combine="by_coords")
     return input_data
 
 
@@ -1381,10 +1872,12 @@ def load_simple_grid_files(options: Options, tskip: int = 1) -> xr.Dataset:
     all_files = sorted(options.simple_folder.rglob("*.nc"))
     if not all_files:
         raise FileNotFoundError(
-            f"No NetCDF files found in {os.fspath(options.simple_folder)}")
+            f"No NetCDF files found in {os.fspath(options.simple_folder)}"
+        )
     tskip_files = all_files[::tskip]
-    logging.info(f"Loading {len(tskip_files)} simple_grids files "
-                 f"(of {len(all_files)} total)...")
+    logging.info(
+        f"Loading {len(tskip_files)} simple_grids files (of {len(all_files)} total)..."
+    )
 
     def _preprocess(ds: xr.Dataset) -> xr.Dataset:
         """Promote scalar time variable to a dimension coordinate."""
@@ -1392,9 +1885,9 @@ def load_simple_grid_files(options: Options, tskip: int = 1) -> xr.Dataset:
 
     input_data = xr.open_mfdataset(
         tskip_files,
-        preprocess = _preprocess,
-        combine    = "nested",
-        concat_dim = "time",
+        preprocess=_preprocess,
+        combine="nested",
+        concat_dim="time",
     )
     return input_data
 
@@ -1403,8 +1896,10 @@ def load_simple_grid_files(options: Options, tskip: int = 1) -> xr.Dataset:
 # Analysis functions
 # ---------------------------------------------------------------------------
 
-def extract_ssha_timeseries(options: Options, ds: xr.Dataset,
-                            lat: float = 30, lon: float = 135) -> xr.Dataset:
+
+def extract_ssha_timeseries(
+    options: Options, ds: xr.Dataset, lat: float = 30, lon: float = 135
+) -> xr.Dataset:
     """Extract a single-point SSHA timeseries at given coordinates.
 
     Args:
@@ -1420,7 +1915,9 @@ def extract_ssha_timeseries(options: Options, ds: xr.Dataset,
     if lon < 0:
         lon = 360 + lon
 
-    measurements = ds[options.y_key].sel(Latitude=lat, Longitude=lon, method="nearest").values
+    measurements = (
+        ds[options.y_key].sel(Latitude=lat, Longitude=lon, method="nearest").values
+    )
 
     ds = xr.Dataset(
         {options.y_key: (options.x_key, measurements)},
@@ -1429,9 +1926,16 @@ def extract_ssha_timeseries(options: Options, ds: xr.Dataset,
     return ds
 
 
-def timeseries_to_xyz(options: Options, timeseries: xr.Dataset, x_key: str, y_key: str,
-                       min_period: float, max_period: float, cie: xr.Dataset,
-                       spectrum2xyz_fn: Callable[..., xr.Dataset] = spectrum2xyz_new) -> xr.Dataset:
+def timeseries_to_xyz(
+    options: Options,
+    timeseries: xr.Dataset,
+    x_key: str,
+    y_key: str,
+    min_period: float,
+    max_period: float,
+    cie: xr.Dataset,
+    spectrum2xyz_fn: Callable[..., xr.Dataset] = spectrum2xyz_new,
+) -> xr.Dataset:
     """Convert a timeseries to XYZ tristimulus values via spectral analysis.
 
     Args:
@@ -1450,18 +1954,18 @@ def timeseries_to_xyz(options: Options, timeseries: xr.Dataset, x_key: str, y_ke
     if 0:
         lat = timeseries[options.lat_key].values
         lon = timeseries[options.lon_key].values
-        #spectrum = synthetic_spectrum(cie, 500+lat, 5)
+        # spectrum = synthetic_spectrum(cie, 500+lat, 5)
         spectrum = synthetic_spectrum(cie, 580 + 2 * lat, 5)
-        #spectrum = synthetic_spectrum(cie, 550, 5)
+        # spectrum = synthetic_spectrum(cie, 550, 5)
         xyz = spectrum2xyz_fn(spectrum, cie)
         xyz["y"] = lon * lon * lon * lon
         return xyz
 
-    fit_terms  = []
+    fit_terms = []
     fit_terms += ["constant", "trend", "accel"]
-    #fit_terms += ['annual']
-    #fit_terms += ['semiannual']
-    #fit_terms += ['annual','semiannual']
+    # fit_terms += ['annual']
+    # fit_terms += ['semiannual']
+    # fit_terms += ['annual','semiannual']
     timeseries, fits = fancy_detrend(timeseries, x_key, y_key, terms=fit_terms)
 
     # Perform non-uniform FFT to get power spectrum.
@@ -1473,7 +1977,9 @@ def timeseries_to_xyz(options: Options, timeseries: xr.Dataset, x_key: str, y_ke
 
     power_spectrum = convert_spectrum_from_frequency_to_period(power_spectrum)
 
-    mapped_spectrum = map_power_spectrum(cie, power_spectrum, min_period=min_period, max_period=max_period)
+    mapped_spectrum = map_power_spectrum(
+        cie, power_spectrum, min_period=min_period, max_period=max_period
+    )
 
     return spectrum2xyz_fn(mapped_spectrum, cie)
 
@@ -1481,6 +1987,7 @@ def timeseries_to_xyz(options: Options, timeseries: xr.Dataset, x_key: str, y_ke
 # ---------------------------------------------------------------------------
 # GMT high-level functions
 # ---------------------------------------------------------------------------
+
 
 def write_gmt_cpt(options: Options, new_fp: BinaryIO, i: int) -> None:
     """Write GMT commands for creating the CPT (color palette) file.
@@ -1496,12 +2003,14 @@ def write_gmt_cpt(options: Options, new_fp: BinaryIO, i: int) -> None:
         new_fp:  Binary file handle for the GMT script being written.
         i:       Index of the parameter being scaled.
     """
-    results      = options.results
+    results = options.results
     plot_options = options.plot_options
-    numlevels    = 10
-    digits       = plot_options.scale_digits
+    numlevels = 10
+    digits = plot_options.scale_digits
 
-    palette_guide  = "#0-360phase=cyclic,amps=wysiwyg,trend=polar,topo=relief,pts=rainbow"
+    palette_guide = (
+        "#0-360phase=cyclic,amps=wysiwyg,trend=polar,topo=relief,pts=rainbow"
+    )
     overflow_guide = "#-E=both,-Ef=top,-Eb=bottom"
 
     if results.options.output_choice == 1:
@@ -1518,8 +2027,12 @@ def write_gmt_cpt(options: Options, new_fp: BinaryIO, i: int) -> None:
         new_fp.write(f'overflow="" {overflow_guide}\n'.encode())
         new_fp.write(f'numlevels="{numlevels}"\n'.encode())
         new_fp.write(b'# The "| bc -l" helps bash deal with floating point numbers.\n')
-        new_fp.write(b'interval="$(echo "($upper_limit - $lower_limit) / $numlevels" | bc -l)"\n')
-        new_fp.write(b'$gmt_prefix makecpt $palette -T$lower_limit/$upper_limit/$interval -Z > map.cpt\n')
+        new_fp.write(
+            b'interval="$(echo "($upper_limit - $lower_limit) / $numlevels" | bc -l)"\n'
+        )
+        new_fp.write(
+            b"$gmt_prefix makecpt $palette -T$lower_limit/$upper_limit/$interval -Z > map.cpt\n"
+        )
 
     elif results.options.output_choice == 5:
         # Latlon grid output — check RGB first since output_type may be empty
@@ -1527,52 +2040,89 @@ def write_gmt_cpt(options: Options, new_fp: BinaryIO, i: int) -> None:
             # RGB map: just set coast color
             new_fp.write(b'  coast_color="gray82"\n')
 
-        elif i < len(results.options.output_type) and results.options.output_type[i] == 104:
+        elif (
+            i < len(results.options.output_type)
+            and results.options.output_type[i] == 104
+        ):
             # Phase map: cyclic palette
-            logging.info("NOTE: Phases should only use the cyclic colorscale if the min/max span [-180,180] or [0,360]!")
+            logging.info(
+                "NOTE: Phases should only use the cyclic colorscale if the min/max span [-180,180] or [0,360]!"
+            )
             new_fp.write(f'palette=" -Ccyclic -I " {palette_guide}\n'.encode())
-            new_fp.write(f'limits="" #Default limits include all values (not just in subset), aren\'t always symmetric.\n'.encode())
+            new_fp.write(
+                b'limits="" #Default limits include all values (not just in subset), aren\'t always symmetric.\n'
+            )
             new_fp.write(f'overflow="" {overflow_guide}\n'.encode())
             numlevels = 13  # 360 degrees / 12 (+1 for value 0.0) divides nicely
             new_fp.write(f'numlevels="{numlevels}"\n'.encode())
-            new_fp.write(b'$gmt_prefix grd2cpt $data_name $palette $limits -E$numlevels -Z > map.cpt\n')
+            new_fp.write(
+                b"$gmt_prefix grd2cpt $data_name $palette $limits -E$numlevels -Z > map.cpt\n"
+            )
 
         else:
             # Non-RGB single-parameter map: WYSIWYG palette with data-driven limits
-            new_fp.write(b'subset_name=$data_name"_subset" #Weird to append, but works with ../pl..\n')
-            new_fp.write(b'$gmt_prefix grdcut $data_name -G$subset_name $actual_range #Only use subset values for scale.\n')
-            new_fp.write(b'$gmt_prefix grdinfo -L0 $subset_name > subset_grdinfo #Extract data range from subset.\n')
-            new_fp.write(f"data_min_e=$(awk '/z_min: /{{printf \"%.{digits}e\\n\", $3}}' subset_grdinfo)\n".encode())
-            new_fp.write(f"data_max_e=$(awk '/z_max: /{{printf \"%.{digits}e\\n\", $5}}' subset_grdinfo)\n".encode())
-            new_fp.write(f"data_min_f=$(awk '/z_min: /{{printf \"%.{digits}f\\n\", $3}}' subset_grdinfo)\n".encode())
-            new_fp.write(f"data_max_f=$(awk '/z_max: /{{printf \"%.{digits}f\\n\", $5}}' subset_grdinfo)\n".encode())
-            new_fp.write(b'notation="f" #By default, numbers appear in floating point format.\n')
-            new_fp.write(b'data_min_print=$data_min_f #By default, numbers appear in floating point format.\n')
-            new_fp.write(b'data_max_print=$data_max_f #By default, numbers appear in floating point format.\n')
+            new_fp.write(
+                b'subset_name=$data_name"_subset" #Weird to append, but works with ../pl..\n'
+            )
+            new_fp.write(
+                b"$gmt_prefix grdcut $data_name -G$subset_name $actual_range #Only use subset values for scale.\n"
+            )
+            new_fp.write(
+                b"$gmt_prefix grdinfo -L0 $subset_name > subset_grdinfo #Extract data range from subset.\n"
+            )
+            new_fp.write(
+                f"data_min_e=$(awk '/z_min: /{{printf \"%.{digits}e\\n\", $3}}' subset_grdinfo)\n".encode()
+            )
+            new_fp.write(
+                f"data_max_e=$(awk '/z_max: /{{printf \"%.{digits}e\\n\", $5}}' subset_grdinfo)\n".encode()
+            )
+            new_fp.write(
+                f"data_min_f=$(awk '/z_min: /{{printf \"%.{digits}f\\n\", $3}}' subset_grdinfo)\n".encode()
+            )
+            new_fp.write(
+                f"data_max_f=$(awk '/z_max: /{{printf \"%.{digits}f\\n\", $5}}' subset_grdinfo)\n".encode()
+            )
+            new_fp.write(
+                b'notation="f" #By default, numbers appear in floating point format.\n'
+            )
+            new_fp.write(
+                b"data_min_print=$data_min_f #By default, numbers appear in floating point format.\n"
+            )
+            new_fp.write(
+                b"data_max_print=$data_max_f #By default, numbers appear in floating point format.\n"
+            )
             new_fp.write(f'palette=" -Cwysiwyg " {palette_guide}\n'.encode())
-            new_fp.write(f'symmetric_limit="{plot_options.symmetric_limit:.6f}"\n'.encode())
-            new_fp.write(b'if [[ $(bc <<< "$symmetric_limit <= 0.0") == 1 || $(bc <<< "$data_min_f >= 0.0") == 1 || $(bc <<< "$data_max_f <= 0.0 ") == 1 ]]\n')
-            new_fp.write(b'then\n')
-            new_fp.write(b'  upper_limit=$data_max_f\n')
-            new_fp.write(b'  lower_limit=$data_min_f\n')
-            new_fp.write(b'else\n')
-            new_fp.write(b'  upper_limit=$symmetric_limit\n')
-            new_fp.write(b'  lower_limit=-$upper_limit\n')
-            new_fp.write(b'fi\n')
+            new_fp.write(
+                f'symmetric_limit="{plot_options.symmetric_limit:.6f}"\n'.encode()
+            )
+            new_fp.write(
+                b'if [[ $(bc <<< "$symmetric_limit <= 0.0") == 1 || $(bc <<< "$data_min_f >= 0.0") == 1 || $(bc <<< "$data_max_f <= 0.0 ") == 1 ]]\n'
+            )
+            new_fp.write(b"then\n")
+            new_fp.write(b"  upper_limit=$data_max_f\n")
+            new_fp.write(b"  lower_limit=$data_min_f\n")
+            new_fp.write(b"else\n")
+            new_fp.write(b"  upper_limit=$symmetric_limit\n")
+            new_fp.write(b"  lower_limit=-$upper_limit\n")
+            new_fp.write(b"fi\n")
             new_fp.write(b'limits=" -L$lower_limit/$upper_limit "\n')
-            new_fp.write(b'. ./overflow.sh\n')
+            new_fp.write(b". ./overflow.sh\n")
             # Coastline color: off-white if all non-negative, dark if mixed signs
             new_fp.write(b'if [[ $(bc <<< "$data_min_f >= 0.0") == 1 ]]\n')
-            new_fp.write(b'then\n')
+            new_fp.write(b"then\n")
             new_fp.write(b'  coast_color="gray82"\n')
-            new_fp.write(b'else\n')
+            new_fp.write(b"else\n")
             new_fp.write(b'  coast_color="gray10"\n')
-            new_fp.write(b'fi\n')
+            new_fp.write(b"fi\n")
             new_fp.write(f'numlevels="{numlevels}"\n'.encode())
-            new_fp.write(b'$gmt_prefix grd2cpt $data_name $palette $limits -E$numlevels -Z > map.cpt\n')
+            new_fp.write(
+                b"$gmt_prefix grd2cpt $data_name $palette $limits -E$numlevels -Z > map.cpt\n"
+            )
 
     else:
-        logging.error(f"!!!!WARNING!!!!!! results.options.output_choice {results.options.output_choice} isn't recognized.")
+        logging.error(
+            f"!!!!WARNING!!!!!! results.options.output_choice {results.options.output_choice} isn't recognized."
+        )
 
     plot_options.blurb_disabled = 0  # Better to always see the blurb
 
@@ -1589,8 +2139,8 @@ def is_polar(options: Options) -> int:
         0 for global, 1 for north pole, 2 for south pole.
     """
     results = options.results
-    grid    = options.grid
-    polar   = 0
+    grid = options.grid
+    polar = 0
 
     if results.options.output_choice in (1, 4):
         results.minlat = min(grid.lat)
@@ -1603,7 +2153,9 @@ def is_polar(options: Options) -> int:
         results.minlon = min(results.latlon.lon)
         results.maxlon = max(results.latlon.lon)
     else:
-        logging.error(f"!!!!WARNING!!!!!! results.options.output_choice {results.options.output_choice} isn't recognized.")
+        logging.error(
+            f"!!!!WARNING!!!!!! results.options.output_choice {results.options.output_choice} isn't recognized."
+        )
 
     if results.minlat < 0 and results.maxlat > 0:
         polar = 0
@@ -1626,33 +2178,55 @@ def write_gmt_colorscale(options: Options, new_fp: BinaryIO, kml_output: int) ->
     results = options.results
 
     if len(results.rgb) != 3:
-        new_fp.write(b"cpt_name=\"-Cmap.cpt \"\n")
+        new_fp.write(b'cpt_name="-Cmap.cpt "\n')
     else:
-        new_fp.write(b"cpt_name=\"-Crgb00001.cpt \"\n")
+        new_fp.write(b'cpt_name="-Crgb00001.cpt "\n')
 
     if len(results.rgb) != 3 or results.rgb_choice < 2:
         if kml_output:
-            new_fp.write(b"gmt psscale $cpt_name -L $scale_format $overflow $scale_pos -A $start > scale_$plot_base.ps\n")
-            new_fp.write(b"# Print units manually, otherwise they're too close to numbers on scale.\n")
-            new_fp.write(b"echo $units_format $scale_units | gmt pstext -N $units_pos $misc_range $end >> scale_$plot_base.ps\n")
+            new_fp.write(
+                b"gmt psscale $cpt_name -L $scale_format $overflow $scale_pos -A $start > scale_$plot_base.ps\n"
+            )
+            new_fp.write(
+                b"# Print units manually, otherwise they're too close to numbers on scale.\n"
+            )
+            new_fp.write(
+                b"echo $units_format $scale_units | gmt pstext -N $units_pos $misc_range $end >> scale_$plot_base.ps\n"
+            )
         else:
-            new_fp.write(b"gmt psscale $cpt_name -L $scale_format $overflow $scale_pos -A $middle >> $plot_base.ps\n")
-            new_fp.write(b"# Print units manually, otherwise they're too close to numbers on scale.\n")
-            new_fp.write(b"echo $units_format $scale_units | gmt pstext -N $units_pos $misc_range $middle >> $plot_base.ps\n")
+            new_fp.write(
+                b"gmt psscale $cpt_name -L $scale_format $overflow $scale_pos -A $middle >> $plot_base.ps\n"
+            )
+            new_fp.write(
+                b"# Print units manually, otherwise they're too close to numbers on scale.\n"
+            )
+            new_fp.write(
+                b"echo $units_format $scale_units | gmt pstext -N $units_pos $misc_range $middle >> $plot_base.ps\n"
+            )
     else:
         new_fp.write(f"numwidths={results.max_widths}\n".encode())
         new_fp.write(b"gmt set TICK_LENGTH 0.3c\n")
-        new_fp.write(b"scale_width=$(bc <<< \"scale=5; $scale_width / $numwidths\")\n")
+        new_fp.write(b'scale_width=$(bc <<< "scale=5; $scale_width / $numwidths")\n')
         new_fp.write(b"for (( j=1; j <= $numwidths; j++ ))\n")
         new_fp.write(b"do\n")
         new_fp.write(b"  j_string=$(printf '%%05d' $j)\n")
-        new_fp.write(b"  cpt_name=\"-Crgb$j_string.cpt\"\n")
-        new_fp.write(b"  gmt psscale $cpt_name -L $scale_format $overflow $scale_pos -S -A $middle >> $plot_base.ps\n")
-        new_fp.write(b"  # Print units manually, otherwise they're too close to numbers on scale.\n")
-        new_fp.write(b"  echo $units_format $scale_units | gmt pstext -N $units_pos $misc_range $middle >> $plot_base.ps\n")
-        new_fp.write(b"  # Move next scale to the right and get rid of the tick marks.\n")
-        new_fp.write(b"  scale_x=$(bc <<< \"scale=5; $scale_x+$scale_width\")\n")
-        new_fp.write(b"  scale_pos=\" -D${scale_x}c/${scale_y}c/${scale_length}c/${scale_width}c \"\n")
+        new_fp.write(b'  cpt_name="-Crgb$j_string.cpt"\n')
+        new_fp.write(
+            b"  gmt psscale $cpt_name -L $scale_format $overflow $scale_pos -S -A $middle >> $plot_base.ps\n"
+        )
+        new_fp.write(
+            b"  # Print units manually, otherwise they're too close to numbers on scale.\n"
+        )
+        new_fp.write(
+            b"  echo $units_format $scale_units | gmt pstext -N $units_pos $misc_range $middle >> $plot_base.ps\n"
+        )
+        new_fp.write(
+            b"  # Move next scale to the right and get rid of the tick marks.\n"
+        )
+        new_fp.write(b'  scale_x=$(bc <<< "scale=5; $scale_x+$scale_width")\n')
+        new_fp.write(
+            b'  scale_pos=" -D${scale_x}c/${scale_y}c/${scale_length}c/${scale_width}c "\n'
+        )
         new_fp.write(b"  gmt set TICK_LENGTH 0.0\n")
         new_fp.write(b"done\n")
 
@@ -1675,20 +2249,27 @@ def write_rgb_colorscale(options: Options, cie: xr.Dataset) -> None:
         cie:     CIE 1931 color matching functions Dataset with 'x', 'y', 'z'
                  variables and 'wavelength' coordinate.
     """
-    n_steps         = 256
+    n_steps = 256
     cie_wavelengths = cie["wavelength"].values
-    n_wl            = len(cie_wavelengths)
-    wl_min          = cie_wavelengths[0]
-    wl_range        = cie_wavelengths[-1] - wl_min
+    n_wl = len(cie_wavelengths)
+    wl_min = cie_wavelengths[0]
+    wl_range = cie_wavelengths[-1] - wl_min
 
     # Sample periods and their corresponding CIE wavelengths
-    periods            = np.linspace(options.min_period, options.max_period, n_steps)
-    target_wavelengths = wl_min + (periods - options.min_period) / (options.max_period - options.min_period) * wl_range
+    periods = np.linspace(options.min_period, options.max_period, n_steps)
+    target_wavelengths = (
+        wl_min
+        + (periods - options.min_period)
+        / (options.max_period - options.min_period)
+        * wl_range
+    )
 
     # Build power matrix: each row is a narrow Gaussian centered at the target wavelength
-    sigma        = 1.0  # nm — narrow enough to approximate a delta function
+    sigma = 1.0  # nm — narrow enough to approximate a delta function
     power_matrix = np.exp(
-        -np.power(cie_wavelengths[np.newaxis, :] - target_wavelengths[:, np.newaxis], 2.0)
+        -np.power(
+            cie_wavelengths[np.newaxis, :] - target_wavelengths[:, np.newaxis], 2.0
+        )
         / (2.0 * sigma**2)
     )
 
@@ -1698,25 +2279,31 @@ def write_rgb_colorscale(options: Options, cie: xr.Dataset) -> None:
     if options.use_new_funcs:
         cmfs = MSDS_CMFS_STANDARD_OBSERVER["CIE 1931 2 Degree Standard Observer"]
         for i in range(n_steps):
-            spd        = SpectralDistribution(power_matrix[i], cie_wavelengths)
+            spd = SpectralDistribution(power_matrix[i], cie_wavelengths)
             xyz_cpt[i] = sd_to_XYZ(spd, cmfs)
     else:
-        cie_x_vals      = cie["x"].values
-        cie_y_vals      = cie["y"].values
-        cie_z_vals      = cie["z"].values
+        cie_x_vals = cie["x"].values
+        cie_y_vals = cie["y"].values
+        cie_z_vals = cie["z"].values
         wavelength_step = np.diff(cie_wavelengths).mean()
-        xyz_cpt[:, 0]   = (power_matrix * cie_x_vals[np.newaxis, :]).sum(axis=1) * wavelength_step
-        xyz_cpt[:, 1]   = (power_matrix * cie_y_vals[np.newaxis, :]).sum(axis=1) * wavelength_step
-        xyz_cpt[:, 2]   = (power_matrix * cie_z_vals[np.newaxis, :]).sum(axis=1) * wavelength_step
+        xyz_cpt[:, 0] = (power_matrix * cie_x_vals[np.newaxis, :]).sum(
+            axis=1
+        ) * wavelength_step
+        xyz_cpt[:, 1] = (power_matrix * cie_y_vals[np.newaxis, :]).sum(
+            axis=1
+        ) * wavelength_step
+        xyz_cpt[:, 2] = (power_matrix * cie_z_vals[np.newaxis, :]).sum(
+            axis=1
+        ) * wavelength_step
 
     # --- Post-processing (same as hot path lines 338-373) ---
 
     # Normalize by max Y
-    max_y    = xyz_cpt[:, 1].max()
+    max_y = xyz_cpt[:, 1].max()
     xyz_cpt /= max_y
 
     # Raise Y to power while keeping chromaticity constant
-    factor   = np.power(xyz_cpt[:, 1], 1.0 - options.thepower)
+    factor = np.power(xyz_cpt[:, 1], 1.0 - options.thepower)
     xyz_cpt /= factor[:, np.newaxis]
 
     # XYZ to sRGB
@@ -1726,13 +2313,13 @@ def write_rgb_colorscale(options: Options, cie: xr.Dataset) -> None:
         rgb_cpt = (A_OLD_XYZ_TO_SRGB @ xyz_cpt.T).T
 
     # Fix gamut (vectorized)
-    rgb_arr   = rgb_cpt.T.copy()  # shape (3, n_steps)
-    min_vals  = rgb_arr.min(axis=0)
+    rgb_arr = rgb_cpt.T.copy()  # shape (3, n_steps)
+    min_vals = rgb_arr.min(axis=0)
     needs_fix = min_vals < 0
 
     if np.any(needs_fix):
-        offset     = -min_vals[needs_fix] + 1.0 / 255.0
-        y_vals     = xyz_cpt[needs_fix, 1]
+        offset = -min_vals[needs_fix] + 1.0 / 255.0
+        y_vals = xyz_cpt[needs_fix, 1]
         fix_factor = y_vals / (y_vals + offset)
         rgb_arr[:, needs_fix] = (rgb_arr[:, needs_fix] + offset) * fix_factor
 
@@ -1742,20 +2329,20 @@ def write_rgb_colorscale(options: Options, cie: xr.Dataset) -> None:
     # Apply BT.709 gamma correction (Hughes & Williams 2010, eqs. A7-A8)
     if not options.use_new_funcs:
         gamma_inv = 0.45
-        crit      = 0.018
-        h         = 4.506813168
-        g_coeff   = -0.09914989
-        f_coeff   = 1.09914989
+        crit = 0.018
+        h = 4.506813168
+        g_coeff = -0.09914989
+        f_coeff = 1.09914989
         for ch in range(3):
             vals = rgb_arr[ch]
-            low  = vals <= crit
+            low = vals <= crit
             high = vals > crit
-            vals[low]  = vals[low] * h
+            vals[low] = vals[low] * h
             vals[high] = f_coeff * np.power(vals[high], gamma_inv) + g_coeff
 
     # Scale to [0, 255]
     rgb_arr *= 255.0
-    rgb_arr  = np.clip(rgb_arr, 0.0, 255.0).astype(int)
+    rgb_arr = np.clip(rgb_arr, 0.0, 255.0).astype(int)
 
     # Write CPT file
     cpt_path = options.output_folder / "rgb00001.cpt"
@@ -1780,17 +2367,19 @@ def write_gmt_map_data(options: Options, new_fp: BinaryIO, title: str, i: int) -
         title:   Map title string. If blank, outputs KMZ format.
         i:       Index of the parameter being mapped.
     """
-    results      = options.results
-    grid         = options.grid
+    results = options.results
+    grid = options.grid
     plot_options = options.plot_options
 
-    polar      = is_polar(options)
+    polar = is_polar(options)
     coastlines = plot_options.coastlines  # Default; overridden below for polar == 1
 
     if i == 0:
         new_fp.write(b"#Set resolution, coast_file, coast_thickness, and coastlines\n")
         new_fp.write(b"#on first map only because they should be universal.\n")
-        coast_file = plot_options.outputfolder + "data/ancillary/Rignot/InSAR_GL_Antarctica.txt"
+        coast_file = (
+            plot_options.outputfolder + "data/ancillary/Rignot/InSAR_GL_Antarctica.txt"
+        )
         new_fp.write(f'coast_file="{coast_file}"\n'.encode())
 
         if results.options.output_choice == 5:
@@ -1808,16 +2397,22 @@ def write_gmt_map_data(options: Options, new_fp: BinaryIO, title: str, i: int) -
             new_fp.write(b'resolution=" -E50 " #50/2000 is low/high quality.\n')
             new_fp.write(b'coast_res=" -Di+ "\n')
         else:
-            logging.error(f"!!!!WARNING!!!!!! results.options.output_choice {results.options.output_choice} isn't recognized.")
+            logging.error(
+                f"!!!!WARNING!!!!!! results.options.output_choice {results.options.output_choice} isn't recognized."
+            )
 
-        new_fp.write(b'coast_res_orig=$coast_res #Don\'t want USA maps to repeatedly add -N2.\n')
+        new_fp.write(
+            b"coast_res_orig=$coast_res #Don't want USA maps to repeatedly add -N2.\n"
+        )
         new_fp.write(b'coast_thk="0.6"\n')
         new_fp.write(b'coast_thk="0.009"\n')
         if polar == 1:
             coastlines = 1  # InSAR is only in Antarctica, so disable for NP plots.
-        new_fp.write(f'coastlines={coastlines} #1:coast, 2:coast+InSAR.\n'.encode())
+        new_fp.write(f"coastlines={coastlines} #1:coast, 2:coast+InSAR.\n".encode())
 
-    new_fp.write(b"#coast_color is gray82 for off-white, or gray10 for dark coastlines.\n")
+    new_fp.write(
+        b"#coast_color is gray82 for off-white, or gray10 for dark coastlines.\n"
+    )
 
     # Adjust max/min latitudes for mapping points
     if results.options.output_choice in (1, 4):
@@ -1830,14 +2425,16 @@ def write_gmt_map_data(options: Options, new_fp: BinaryIO, title: str, i: int) -
     new_fp.write(b'title_format="0 0 30 0 0 MC"\n')
     new_fp.write(b'blurb_format="0 0 15 0 1 ML"\n')
     new_fp.write(b'units_format="0 0 13 0 0 MC"\n')
-    new_fp.write(f"scale_units=\"{results.units[i]}\"\n".encode())
+    new_fp.write(f'scale_units="{results.units[i]}"\n'.encode())
 
     new_fp.write(b'misc_range=" -R0/1/0/1 -JX1c "\n')
-    new_fp.write(b"#grdcut requires actual limits, but if grdimage uses them: GMT Fatal Error: grdimage could not allocate memory [21.69 Gb, n_items = 5823567396]\n")
-    new_fp.write(b'minlon=%.3f\n' % 0.0)
-    new_fp.write(b'maxlon=%.3f\n' % 360.0)
-    new_fp.write(b'minlat=%.3f\n' % -90.0)
-    new_fp.write(b'maxlat=%.3f\n' % 90.0)
+    new_fp.write(
+        b"#grdcut requires actual limits, but if grdimage uses them: GMT Fatal Error: grdimage could not allocate memory [21.69 Gb, n_items = 5823567396]\n"
+    )
+    new_fp.write(b"minlon=%.3f\n" % 0.0)
+    new_fp.write(b"maxlon=%.3f\n" % 360.0)
+    new_fp.write(b"minlat=%.3f\n" % -90.0)
+    new_fp.write(b"maxlat=%.3f\n" % 90.0)
 
     if title:
         if i == 0:
@@ -1861,48 +2458,60 @@ def write_gmt_map_data(options: Options, new_fp: BinaryIO, title: str, i: int) -
             new_fp.write(b"# 1102 - California\n")
 
         if polar == 0:
-            new_fp.write(f"{'#' if i > 0 else ''}projection_choice={plot_options.projection}\n".encode())
+            new_fp.write(
+                f"{'#' if i > 0 else ''}projection_choice={plot_options.projection}\n".encode()
+            )
         else:
             if polar == 1:
                 new_fp.write(f"{'#' if i > 0 else ''}projection_choice=101\n".encode())
             else:
                 new_fp.write(f"{'#' if i > 0 else ''}projection_choice=102\n".encode())
 
-        new_fp.write(b"standard_circle=0 #1=all specific regions use standard circular projection.\n")
-        new_fp.write(b"standard_rect=0 #1=all specific regions use standard rectangular projection.\n")
+        new_fp.write(
+            b"standard_circle=0 #1=all specific regions use standard circular projection.\n"
+        )
+        new_fp.write(
+            b"standard_rect=0 #1=all specific regions use standard rectangular projection.\n"
+        )
         new_fp.write(b". ./projections.sh\n")
         new_fp.write(b"if [ $projection_choice == 101 ]\n")
         new_fp.write(b"then\n")
 
         minlat = results.minlat if polar == 1 else 0.0
         new_fp.write(f"  minlat={minlat:.3f}\n".encode())
-        new_fp.write(b"  actual_range=\" -R0.0/360.0/$minlat/90.0 \"\n")
+        new_fp.write(b'  actual_range=" -R0.0/360.0/$minlat/90.0 "\n')
         polar_radius = 90 - minlat
         new_fp.write(f"  polar_radius={polar_radius}\n".encode())
-        new_fp.write(b"  projection=\" -JE0/90.0/${polar_radius}/${map_width}c \" #N. Azimuthal Equidistant\n")
+        new_fp.write(
+            b'  projection=" -JE0/90.0/${polar_radius}/${map_width}c " #N. Azimuthal Equidistant\n'
+        )
         new_fp.write(b"elif [ $projection_choice == 102 ]\n")
         new_fp.write(b"then\n")
 
         maxlat = results.maxlat if polar == 2 else 0.0
         new_fp.write(f"  maxlat={maxlat:.3f}\n".encode())
-        new_fp.write(b"  actual_range=\" -R0.0/360.0/-90.0/$maxlat \"\n")
+        new_fp.write(b'  actual_range=" -R0.0/360.0/-90.0/$maxlat "\n')
         polar_radius = 90 + maxlat
         new_fp.write(f"  polar_radius={polar_radius}\n".encode())
-        new_fp.write(b"  projection=\" -JE0/-90.0/{polar_radius}/${map_width}c \" #S. Azimuthal Equidistant\n")
+        new_fp.write(
+            b'  projection=" -JE0/-90.0/{polar_radius}/${map_width}c " #S. Azimuthal Equidistant\n'
+        )
         new_fp.write(b"fi\n")
 
-        new_fp.write(b"range=\" -R${minlon}/${maxlon}/${minlat}/${maxlat} \"\n")
-        new_fp.write(b"map_pos=\" -Xa${map_x}c -Ya${map_y}c \"\n")
+        new_fp.write(b'range=" -R${minlon}/${maxlon}/${minlat}/${maxlat} "\n')
+        new_fp.write(b'map_pos=" -Xa${map_x}c -Ya${map_y}c "\n')
 
         if len(results.rgb) == 3 and results.rgb_choice >= 2:
             new_fp.write(b"scale_width=1.2 #Override for RGB maps.\n")
 
-        new_fp.write(b"scale_pos=\" -D${scale_x}c/${scale_y}c/${scale_length}c/${scale_width}c \"\n")
-        new_fp.write(b"units_x=$(bc <<< \"scale=5; $scale_x+$scale_width/2\")\n")
-        new_fp.write(b"units_y=$(bc <<< \"scale=5; $scale_y+$scale_length/2\")\n")
-        new_fp.write(b"units_pos=\" -Xa${units_x}c -Ya${units_y}c \"\n")
-        new_fp.write(b"blurb_pos=\" -Xa${blurb_x}c -Ya${blurbs_y}c \"\n")
-        new_fp.write(b"blurb2_pos=\" -Xa${blurb2_x}c -Ya${blurbs_y}c \"\n")
+        new_fp.write(
+            b'scale_pos=" -D${scale_x}c/${scale_y}c/${scale_length}c/${scale_width}c "\n'
+        )
+        new_fp.write(b'units_x=$(bc <<< "scale=5; $scale_x+$scale_width/2")\n')
+        new_fp.write(b'units_y=$(bc <<< "scale=5; $scale_y+$scale_length/2")\n')
+        new_fp.write(b'units_pos=" -Xa${units_x}c -Ya${units_y}c "\n')
+        new_fp.write(b'blurb_pos=" -Xa${blurb_x}c -Ya${blurbs_y}c "\n')
+        new_fp.write(b'blurb2_pos=" -Xa${blurb2_x}c -Ya${blurbs_y}c "\n')
     else:
         logging.error("!!!WARNING!!! NO TITLE!")
 
@@ -1910,36 +2519,52 @@ def write_gmt_map_data(options: Options, new_fp: BinaryIO, title: str, i: int) -
     write_gmt_cpt(options, new_fp, i)
 
     # Plot data, with title on top.
-    new_fp.write(f"title=\"{title}\"\n".encode())
+    new_fp.write(f'title="{title}"\n'.encode())
     if len(results.rgb) == 3 and len(results.latlon.outputs) == 3:
-        new_fp.write(b"gmt grdimage red_gmt.nc green_gmt.nc blue_gmt.nc $boundary $resolution $range $projection $map_pos $start > $plot_base.ps\n")
+        new_fp.write(
+            b"gmt grdimage red_gmt.nc green_gmt.nc blue_gmt.nc $boundary $resolution $range $projection $map_pos $start > $plot_base.ps\n"
+        )
     else:
-        new_fp.write(b"gmt grdimage $data_name $boundary $resolution $range $projection $map_pos -Cmap.cpt $start > $plot_base.ps\n")
+        new_fp.write(
+            b"gmt grdimage $data_name $boundary $resolution $range $projection $map_pos -Cmap.cpt $start > $plot_base.ps\n"
+        )
 
     write_gmt_coastlines(new_fp)
 
-    if (len(results.marker_lats) == len(results.latlon.outputs)
-            and len(results.marker_lons) == len(results.latlon.outputs)
-            and results.latlon.outputs):
+    if (
+        len(results.marker_lats) == len(results.latlon.outputs)
+        and len(results.marker_lons) == len(results.latlon.outputs)
+        and results.latlon.outputs
+    ):
         if results.marker_lats[i] and results.marker_lons[i]:
-            new_fp.write(b"gmt psxy -N $data_name -bcmarker_lons/marker_lats -S+0.5c -W5/244/164/96 -G244/164/96 $range $projection $map_pos $middle >> $plot_base.ps\n")
+            new_fp.write(
+                b"gmt psxy -N $data_name -bcmarker_lons/marker_lats -S+0.5c -W5/244/164/96 -G244/164/96 $range $projection $map_pos $middle >> $plot_base.ps\n"
+            )
 
     new_fp.write(b"#Uncomment to put a marker at echoed coords, given as lon lat:\n")
-    new_fp.write(b"#echo -85.19 -77.36 | gmt psxy -N -S+0.5c -W5/244/164/96 -G244/164/96 $range $projection $map_pos $middle >> $plot_base.ps\n")
+    new_fp.write(
+        b"#echo -85.19 -77.36 | gmt psxy -N -S+0.5c -W5/244/164/96 -G244/164/96 $range $projection $map_pos $middle >> $plot_base.ps\n"
+    )
 
     if plot_options.plot_mascons != 0 and results.latlon.mascon_lats:
-        new_fp.write(b"gmt psxy $data_name -bcmascon_lons/mascon_lats -Sc0.01c -G139/69/19 $range $projection $map_pos $middle >> $plot_base.ps\n")
+        new_fp.write(
+            b"gmt psxy $data_name -bcmascon_lons/mascon_lats -Sc0.01c -G139/69/19 $range $projection $map_pos $middle >> $plot_base.ps\n"
+        )
 
     new_fp.write(b"if [ $montage != 0 ]\n")
     new_fp.write(b"then\n")
-    new_fp.write(b"  title=${prefixes[$index]}\" \"$title\n")
-    new_fp.write(b"  title_format=\"0 0 30 0 0 ML\" #Left-justify so montage titles are uniform.\n")
-    new_fp.write(b"  title_x=$(bc <<< \"scale=5; $blurb_x-0.1\")\n")
+    new_fp.write(b'  title=${prefixes[$index]}" "$title\n')
+    new_fp.write(
+        b'  title_format="0 0 30 0 0 ML" #Left-justify so montage titles are uniform.\n'
+    )
+    new_fp.write(b'  title_x=$(bc <<< "scale=5; $blurb_x-0.1")\n')
     new_fp.write(b"else\n")
-    new_fp.write(b"  title_x=$(bc <<< \"scale=5; $map_x+$map_width/2\")\n")
+    new_fp.write(b'  title_x=$(bc <<< "scale=5; $map_x+$map_width/2")\n')
     new_fp.write(b"fi\n")
-    new_fp.write(b"title_pos=\" -Xa${title_x}c -Ya${title_y}c \"\n")
-    new_fp.write(b"echo $title_format $title | gmt pstext -N $title_pos $misc_range $middle >> $plot_base.ps\n")
+    new_fp.write(b'title_pos=" -Xa${title_x}c -Ya${title_y}c "\n')
+    new_fp.write(
+        b"echo $title_format $title | gmt pstext -N $title_pos $misc_range $middle >> $plot_base.ps\n"
+    )
 
     # Draw color scale with units printed above.
     write_gmt_colorscale(options, new_fp, 0)
@@ -1948,20 +2573,29 @@ def write_gmt_map_data(options: Options, new_fp: BinaryIO, title: str, i: int) -
     if len(results.rgb) == 3 and len(results.latlon.outputs) == 3:
         plot_options.blurb_disabled = 1
     if plot_options.blurb_disabled:
-        new_fp.write(b"blurb_contents=\"\"\n")
+        new_fp.write(b'blurb_contents=""\n')
 
-    new_fp.write(b"echo $blurb_format $blurb_contents | gmt pstext -N $blurb_pos $misc_range $middle >> $plot_base.ps\n")
+    new_fp.write(
+        b"echo $blurb_format $blurb_contents | gmt pstext -N $blurb_pos $misc_range $middle >> $plot_base.ps\n"
+    )
 
     blurb2_written = 0
-    if len(results.latlon.outputs) == len(results.error_bars) and results.latlon.outputs:
+    if (
+        len(results.latlon.outputs) == len(results.error_bars)
+        and results.latlon.outputs
+    ):
         if results.error_bars[i] > 0.0:
             blurb2_written = 1
-            new_fp.write(f"blurb2_contents=\"Error bar: {results.error_bars[i]:.1f} $scale_units\"\n".encode())
+            new_fp.write(
+                f'blurb2_contents="Error bar: {results.error_bars[i]:.1f} $scale_units"\n'.encode()
+            )
 
     if not blurb2_written:
-        new_fp.write(b"blurb2_contents=\"\" #Error bar: N/A $scale_units\n")
+        new_fp.write(b'blurb2_contents="" #Error bar: N/A $scale_units\n')
 
-    new_fp.write(b"echo $blurb_format $blurb2_contents | gmt pstext -N $blurb2_pos $misc_range $end >> $plot_base.ps\n")
+    new_fp.write(
+        b"echo $blurb_format $blurb2_contents | gmt pstext -N $blurb2_pos $misc_range $end >> $plot_base.ps\n"
+    )
 
 
 def write_gmt_scripts(options: Options) -> None:
@@ -1971,13 +2605,13 @@ def write_gmt_scripts(options: Options) -> None:
         options: Options object (plot_options, grid, results).
     """
     plot_options = options.plot_options
-    grid         = options.grid
-    results      = options.results
+    grid = options.grid
+    results = options.results
 
     new_file = Path(plot_options.outputfolder) / "create_plots.sh"
     try:
         new_fp = new_file.open("wb")
-    except IOError:
+    except OSError:
         logging.error("The create_plots.sh GMT script couldn't be created.")
 
     new_fp.write(b"#!/bin/bash\n")
@@ -1986,7 +2620,7 @@ def write_gmt_scripts(options: Options) -> None:
     flip_file = Path(plot_options.outputfolder) / "flip_backgrounds.sh"
     try:
         flip_fp = flip_file.open("wb")
-    except IOError:
+    except OSError:
         logging.error("The flip_backgrounds.sh script couldn't be created.")
 
     flip_fp.write(b"#!/bin/bash\n")
@@ -1995,7 +2629,7 @@ def write_gmt_scripts(options: Options) -> None:
     trim_file = Path(plot_options.outputfolder) / "trim.sh"
     try:
         trim_fp = trim_file.open("wb")
-    except IOError:
+    except OSError:
         logging.error("The trim.sh script couldn't be created.")
 
     trim_fp.write(b"#!/bin/bash\n")
@@ -2009,14 +2643,28 @@ def write_gmt_scripts(options: Options) -> None:
     for i in range(len(just_the_filenames)):
         if i == 0:
             write_gmt_defs(new_fp)
-            new_fp.write(f"color_scheme={plot_options.color_scheme} #1/2=white/black background\n".encode())
-            new_fp.write(f"montage={plot_options.montage} #1=left-justify titles, add (a),(b), run montage.sh.\n".encode())
-            new_fp.write(b'prefixes=("(a)" "(b)" "(c)" "(d)" "(e)" "(f)" "(g)" "(h)" "(i)" "(j)" "(k)" "(l)" "(m)" "(n)" "(o)" "(p)" "(q)" "(r)" "(s)" "(t)" "(u)" "(v)" "(w)" "(x)" "(y)" "(z)")\n')
-            new_fp.write(b"index=-1 #Increments on each map, accesses prefixes above for montage.\n")
+            new_fp.write(
+                f"color_scheme={plot_options.color_scheme} #1/2=white/black background\n".encode()
+            )
+            new_fp.write(
+                f"montage={plot_options.montage} #1=left-justify titles, add (a),(b), run montage.sh.\n".encode()
+            )
+            new_fp.write(
+                b'prefixes=("(a)" "(b)" "(c)" "(d)" "(e)" "(f)" "(g)" "(h)" "(i)" "(j)" "(k)" "(l)" "(m)" "(n)" "(o)" "(p)" "(q)" "(r)" "(s)" "(t)" "(u)" "(v)" "(w)" "(x)" "(y)" "(z)")\n'
+            )
+            new_fp.write(
+                b"index=-1 #Increments on each map, accesses prefixes above for montage.\n"
+            )
             new_fp.write(b'png_options=" -P -Tg " #PDF default: -E720, else 300 dpi.\n')
-            new_fp.write(b"if [ $montage != 0 ]\nthen\n  png_options=\" -A\"$png_options\nfi\n")
-            new_fp.write(b"#Force off-white(dark gray) fore(back)ground color because\n#flip_backgrounds.sh can change the maps' text from\n#black to white, and their backgrounds from white to black.\n")
-            new_fp.write(b"gmt set COLOR_BACKGROUND=2/2/2 COLOR_FOREGROUND=253/253/253\n")
+            new_fp.write(
+                b'if [ $montage != 0 ]\nthen\n  png_options=" -A"$png_options\nfi\n'
+            )
+            new_fp.write(
+                b"#Force off-white(dark gray) fore(back)ground color because\n#flip_backgrounds.sh can change the maps' text from\n#black to white, and their backgrounds from white to black.\n"
+            )
+            new_fp.write(
+                b"gmt set COLOR_BACKGROUND=2/2/2 COLOR_FOREGROUND=253/253/253\n"
+            )
             new_fp.write(f"digits={plot_options.scale_digits}\n".encode())
             new_fp.write(b"gmt set D_FORMAT=%.${digits}f\n")
 
@@ -2038,16 +2686,20 @@ def write_gmt_scripts(options: Options) -> None:
                 flip_fp.write(f'all_bases="{s}\n'.encode())
                 trim_fp.write(f'all_bases="{s}\n'.encode())
         elif i < len(just_the_filenames) - 1:
-            flip_fp.write(f'{s}\n'.encode())
-            trim_fp.write(f'{s}\n'.encode())
+            flip_fp.write(f"{s}\n".encode())
+            trim_fp.write(f"{s}\n".encode())
         else:
             flip_fp.write(f'{s}"\n'.encode())
             trim_fp.write(f'{s}"\n'.encode())
 
         write_gmt_map_data(options, new_fp, results.titles[i], i)
 
-        new_fp.write(b"gmt psconvert $png_options $plot_base.ps #Convert PS to PNG format.\n")
-        new_fp.write(b"#convert -P -Tf $plot_base.ps #Convert PS to PDF, if uncommented.\n")
+        new_fp.write(
+            b"gmt psconvert $png_options $plot_base.ps #Convert PS to PNG format.\n"
+        )
+        new_fp.write(
+            b"#convert -P -Tf $plot_base.ps #Convert PS to PDF, if uncommented.\n"
+        )
         new_fp.write(b"rm -f $plot_base.ps\n")
 
         if len(results.rgb) != 3:
@@ -2081,18 +2733,22 @@ def write_gmt_scripts(options: Options) -> None:
     extra_file = Path(plot_options.outputfolder) / "animate.sh"
     try:
         extra_fp = extra_file.open("wb")
-    except IOError:
+    except OSError:
         logging.error("The animate.sh script couldn't be created.")
 
     extra_fp.write(b"#!/bin/bash\n")
     extra_fp.write(b"set -x\n")
     extra_fp.write(b"delay=100 #delay in hundredths of a second.\n")
-    extra_fp.write(b"#size=\"640x480\"\n")
-    extra_fp.write(b"#size=\"800x600\"\n")
-    extra_fp.write(b"size=\"1024x768\"\n")
-    extra_fp.write(f"output_base=\"{plot_options.output_base}\"\n".encode())
-    extra_fp.write(b"#Imagemagick can also output .mng (animated PNG, not well-supported), but ffmpeg is needed as a delegate for .mp4.\n")
-    extra_fp.write(b"#convert -verbose -delay $delay -loop 0 $output_base* -resize $size animation.gif\n")
+    extra_fp.write(b'#size="640x480"\n')
+    extra_fp.write(b'#size="800x600"\n')
+    extra_fp.write(b'size="1024x768"\n')
+    extra_fp.write(f'output_base="{plot_options.output_base}"\n'.encode())
+    extra_fp.write(
+        b"#Imagemagick can also output .mng (animated PNG, not well-supported), but ffmpeg is needed as a delegate for .mp4.\n"
+    )
+    extra_fp.write(
+        b"#convert -verbose -delay $delay -loop 0 $output_base* -resize $size animation.gif\n"
+    )
     extra_fp.write(b"#Or ffmpeg can output .mp4 directly.\n")
     extra_fp.write(b"ffmpeg -f image2 -i $output_base%d.png animation.mp4\n")
     extra_fp.close()
@@ -2101,12 +2757,12 @@ def write_gmt_scripts(options: Options) -> None:
     extra_file = Path(plot_options.outputfolder) / "montage.sh"
     try:
         extra_fp = extra_file.open("wb")
-    except IOError:
+    except OSError:
         logging.error("The montage.sh script couldn't be created.")
 
     extra_fp.write(b"#!/bin/bash\n")
     extra_fp.write(b"set -x\n")
-    extra_fp.write(f"output_base=\"{plot_options.output_base}\"\n".encode())
+    extra_fp.write(f'output_base="{plot_options.output_base}"\n'.encode())
     extra_fp.write(b"montage $output_base* -geometry +2+2 montage.png\n")
     extra_fp.close()
 
@@ -2142,6 +2798,7 @@ def run_gmt_scripts(options: Options) -> None:
 # Extraction helpers (called from main)
 # ---------------------------------------------------------------------------
 
+
 def zip_script(options: Options) -> None:
     """Zip the current script into the output folder.
 
@@ -2149,10 +2806,12 @@ def zip_script(options: Options) -> None:
         options: Options object (output_folder).
     """
     current_script_path = Path(__file__).resolve()
-    zip_file_path       = options.output_folder / (current_script_path.name + ".zip")
+    zip_file_path = options.output_folder / (current_script_path.name + ".zip")
     with zipfile.ZipFile(zip_file_path, "w") as zipf:
         zipf.write(current_script_path, arcname=current_script_path.name)
-    logging.info(f"Successfully zipped {os.fspath(current_script_path)} to {os.fspath(zip_file_path)}")
+    logging.info(
+        f"Successfully zipped {os.fspath(current_script_path)} to {os.fspath(zip_file_path)}"
+    )
 
 
 def load_input_data(options: Options) -> xr.Dataset:
