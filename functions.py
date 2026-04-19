@@ -478,6 +478,7 @@ def main() -> None:
     logging.info(f"DIAG: {options.y_key} finite range = [{_vmin:.6e}, {_vmax:.6e}]")
     if _vmax > 1e10:
         logging.error(f"DIAG: WARNING - {options.y_key} has extreme values (max={_vmax:.2e}), fill values may not be masked!")
+    del _vals, _data_var  # free ~3.6 GB before hot path allocates data_2d
 
     if options.xskip > 1:
         logging.info(
@@ -647,7 +648,9 @@ def main() -> None:
         if np.any(nan_idx):
             valid_idx = ~nan_idx
             n_valid_pts = int(valid_idx.sum())
-            if n_valid_pts < 4:
+            # The nfft library's kernel window half-width m is estimated as 9 for the default tolerance, and
+            # the internal assertion m <= n // 2 (where n = N * 3) fails when N < 6.
+            if n_valid_pts < 6:
                 continue
             y = y[valid_idx]
             y_x_days = x_days[valid_idx]
