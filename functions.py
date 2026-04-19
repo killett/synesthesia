@@ -469,14 +469,15 @@ def main() -> None:
     logging.info(f"DIAG: input_data dims = {dict(input_data.sizes)}")
     logging.info(f"DIAG: time dtype = {input_data[options.x_key].dtype}")
     _data_var = input_data[options.y_key]
-    _nan_count = int(np.isnan(_data_var.values).sum())
-    _total = int(_data_var.values.size)
+    _vals = _data_var.values
+    _nan_count = int(np.isnan(_vals).sum())
+    _total = int(_vals.size)
     logging.info(f"DIAG: {options.y_key} NaN={_nan_count}, valid={_total - _nan_count}, total={_total}")
-    _finite_vals = _data_var.values[np.isfinite(_data_var.values)]
-    if len(_finite_vals) > 0:
-        logging.info(f"DIAG: {options.y_key} finite range = [{_finite_vals.min():.6e}, {_finite_vals.max():.6e}]")
-        if _finite_vals.max() > 1e10:
-            logging.error(f"DIAG: WARNING - {options.y_key} has extreme values (max={_finite_vals.max():.2e}), fill values may not be masked!")
+    _vmin = float(np.nanmin(_vals))
+    _vmax = float(np.nanmax(_vals))
+    logging.info(f"DIAG: {options.y_key} finite range = [{_vmin:.6e}, {_vmax:.6e}]")
+    if _vmax > 1e10:
+        logging.error(f"DIAG: WARNING - {options.y_key} has extreme values (max={_vmax:.2e}), fill values may not be masked!")
 
     if options.xskip > 1:
         logging.info(
