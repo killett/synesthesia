@@ -78,7 +78,7 @@ class Options:
         self.input_choice: str = (
             "simple_grids"  # "SSHA", "Argo", "MUR_SST", "AQUA_MODIS", "GRACE", "simple_grids"
         )
-        self.xskip: int = 10
+        self.xskip: int = 1
         self.min_period: float =  2 * 7.0  # days
         self.max_period: float = 24 * 7.0  # days
         self.thepower: float = 0.8
@@ -624,13 +624,13 @@ def main() -> None:
 
     A_old = A_OLD_XYZ_TO_SRGB
 
-    # Pre-filter grid points with ANY NaN (land or partial coverage)
-    valid_mask = ~np.any(np.isnan(data_2d), axis=0)
+    # Pre-filter all-NaN grid points (land); partial-NaN handled per-point in the loop
+    valid_mask = ~np.all(np.isnan(data_2d), axis=0)
     n_valid = valid_mask.sum()
-    _all_nan = int(np.all(np.isnan(data_2d), axis=0).sum())
-    _partial_nan = n_points - _all_nan - int(n_valid)
+    _all_nan = n_points - int(n_valid)
+    _any_nan = int(np.any(np.isnan(data_2d), axis=0).sum()) - _all_nan
     logging.info(f"Processing {n_valid} valid grid points out of {n_points} total...")
-    logging.info(f"DIAG: all-NaN (land): {_all_nan}, partial-NaN (skipped): {_partial_nan}, fully valid: {n_valid}")
+    logging.info(f"DIAG: all-NaN (land): {_all_nan}, has-some-NaN (will drop NaN samples): {_any_nan}, fully complete: {int(n_valid) - _any_nan}")
 
     # === MAIN LOOP (pure numpy, no xarray overhead) ===
     xyz_results = np.full((n_points, 3), np.nan)
@@ -641,24 +641,69 @@ def main() -> None:
 
         y = data_2d[:, i]
 
+        # Drop NaN samples — use only real data points
+        nan_idx = np.isnan(y)
+        if np.any(nan_idx):
+            valid_idx = ~nan_idx
+            n_valid_pts = int(valid_idx.sum())
+            if n_valid_pts < 4:
+                continue
+            y = y[valid_idx]
+            y_x_days = x_days[valid_idx]
+            # Recompute per-point NFFT parameters for the reduced series
+            y_N = n_valid_pts
+            if y_N % 2:
+                y = y[:-1]
+                y_x_days = y_x_days[:-1]
+                y_N -= 1
+            y_x_min = y_x_days.min()
+            y_x_range = y_x_days.max() - y_x_min
+            y_x_norm = (y_x_days - y_x_min) / y_x_range - 0.5
+            y_design = np.column_stack([np.ones(y_N), y_x_days, y_x_days**2])
+            y_k = -(y_N // 2) + np.arange(y_N)
+            y_xf_half = (y_k / y_x_range)[y_N // 2 + 1 :]
+            y_periods_asc = (1.0 / y_xf_half)[::-1]
+            y_freq_sq_asc = (1.0 / y_periods_asc) ** 2
+        else:
+            y_N = N
+            y_x_norm = x_norm
+            y_design = design_matrix
+            y_periods_asc = periods_ascending
+            y_freq_sq_asc = freq_sq_ascending
+
         # 1. Detrend with numpy lstsq (replaces statsmodels OLS)
-        params, _, _, _ = np.linalg.lstsq(design_matrix, y, rcond=None)
-        detrended = y - design_matrix @ params
+        params, _, _, _ = np.linalg.lstsq(y_design, y, rcond=None)
+        detrended = y - y_design @ params
 
         # 2. NFFT
-        f_k = nfft.nfft(x_norm, detrended)
+        f_k = nfft.nfft(y_x_norm, detrended)
         power = np.abs(f_k) ** 2
 
         # 3. Take positive frequencies, reverse to ascending period order
-        power_half = power[N // 2 + 1 :]
+        power_half = power[y_N // 2 + 1 :]
         power_ascending = power_half[::-1]
 
         # 3b. Convert PSD to SPD by multiplying by sigma^2 (Hughes & Williams 2010, eq. A11)
-        power_ascending = power_ascending * freq_sq_ascending
+        power_ascending = power_ascending * y_freq_sq_asc
 
-        # 4. Map power spectrum to wavelength grid (replicates map_power_spectrum boundary handling)
-        power_interp_src = power_ascending[interp_nearest_idx]
-        mapped_power = np.interp(wavelength_targets, interp_periods, power_interp_src)
+        # 4. Map power spectrum to wavelength grid
+        # Recompute boundary handling for this point's period range
+        pt_periods_ext = y_periods_asc.copy()
+        if options.min_period not in y_periods_asc:
+            pt_periods_ext = np.append(pt_periods_ext, options.min_period)
+        if options.max_period not in y_periods_asc:
+            pt_periods_ext = np.append(pt_periods_ext, options.max_period)
+        pt_periods_ext = np.sort(pt_periods_ext)
+        pt_nearest_idx = np.array(
+            [np.argmin(np.abs(y_periods_asc - p)) for p in pt_periods_ext]
+        )
+        pt_mask = (pt_periods_ext >= options.min_period) & (
+            pt_periods_ext <= options.max_period
+        )
+        pt_interp_periods = pt_periods_ext[pt_mask]
+        pt_interp_nearest = pt_nearest_idx[pt_mask]
+        power_interp_src = power_ascending[pt_interp_nearest]
+        mapped_power = np.interp(wavelength_targets, pt_interp_periods, power_interp_src)
 
         # 5. Spectrum to XYZ
         if options.use_new_funcs:
