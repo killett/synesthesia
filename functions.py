@@ -78,7 +78,7 @@ class Options:
         self.input_choice: str = (
             "simple_grids"  # "SSHA", "Argo", "MUR_SST", "AQUA_MODIS", "GRACE", "simple_grids"
         )
-        self.xskip: int = 1
+        self.xskip: int = 10
         self.min_period: float =  2 * 7.0  # days
         self.max_period: float = 24 * 7.0  # days
         self.thepower: float = 0.8
@@ -464,6 +464,20 @@ def main() -> None:
     # Load and decimate input data
     logging.info(f"Loading {options.input_choice}")
     input_data = load_input_data(options)
+
+    # --- DIAGNOSTIC: Check loaded data ---
+    logging.info(f"DIAG: input_data dims = {dict(input_data.sizes)}")
+    logging.info(f"DIAG: time dtype = {input_data[options.x_key].dtype}")
+    _data_var = input_data[options.y_key]
+    _nan_count = int(np.isnan(_data_var.values).sum())
+    _total = int(_data_var.values.size)
+    logging.info(f"DIAG: {options.y_key} NaN={_nan_count}, valid={_total - _nan_count}, total={_total}")
+    _finite_vals = _data_var.values[np.isfinite(_data_var.values)]
+    if len(_finite_vals) > 0:
+        logging.info(f"DIAG: {options.y_key} finite range = [{_finite_vals.min():.6e}, {_finite_vals.max():.6e}]")
+        if _finite_vals.max() > 1e10:
+            logging.error(f"DIAG: WARNING - {options.y_key} has extreme values (max={_finite_vals.max():.2e}), fill values may not be masked!")
+
     if options.xskip > 1:
         logging.info(
             f"Selecting one lat/lon point in every {options.xskip**2} points..."
@@ -486,7 +500,15 @@ def main() -> None:
         input_data = input_data.isel({options.x_key: slice(None, -1)})
 
     # Validate min/max period against available NFFT periods
-    sliced_data = input_data.isel({options.lat_key: 0, options.lon_key: 0})
+    # Pick a grid point with valid data (index 0 may be land/pole)
+    _first_time = input_data[options.y_key].isel({options.x_key: 0}).values
+    _valid_pts = np.argwhere(np.isfinite(_first_time))
+    if len(_valid_pts) > 0:
+        _mid = len(_valid_pts) // 2
+        _vlat, _vlon = int(_valid_pts[_mid, 0]), int(_valid_pts[_mid, 1])
+    else:
+        _vlat, _vlon = 0, 0
+    sliced_data = input_data.isel({options.lat_key: _vlat, options.lon_key: _vlon})
     power_spectrum = nfft_power(options, sliced_data)
     power_spectrum = convert_spectrum_from_frequency_to_period(power_spectrum)
 
@@ -536,7 +558,13 @@ def main() -> None:
     n_times, n_points = data_2d.shape
 
     # Time axis in days (shared across all grid points)
-    x_days = (times - times[0]).astype(float) / (24 * 3600 * 1e9)
+    x_days = (times - times[0]) / np.timedelta64(1, "D")
+
+    # --- DIAGNOSTIC: Check time conversion ---
+    logging.info(f"DIAG: times dtype = {times.dtype}")
+    logging.info(f"DIAG: x_days range = [{x_days.min():.4f}, {x_days.max():.4f}] days")
+    if x_days.max() < 1.0:
+        logging.error("DIAG: CRITICAL - x_days span < 1 day! Time conversion may be wrong.")
 
     # Ensure even length for NFFT
     N = len(x_days)
@@ -596,10 +624,13 @@ def main() -> None:
 
     A_old = A_OLD_XYZ_TO_SRGB
 
-    # Pre-filter all-NaN grid points (land)
-    valid_mask = ~np.all(np.isnan(data_2d), axis=0)
+    # Pre-filter grid points with ANY NaN (land or partial coverage)
+    valid_mask = ~np.any(np.isnan(data_2d), axis=0)
     n_valid = valid_mask.sum()
+    _all_nan = int(np.all(np.isnan(data_2d), axis=0).sum())
+    _partial_nan = n_points - _all_nan - int(n_valid)
     logging.info(f"Processing {n_valid} valid grid points out of {n_points} total...")
+    logging.info(f"DIAG: all-NaN (land): {_all_nan}, partial-NaN (skipped): {_partial_nan}, fully valid: {n_valid}")
 
     # === MAIN LOOP (pure numpy, no xarray overhead) ===
     xyz_results = np.full((n_points, 3), np.nan)
@@ -641,6 +672,16 @@ def main() -> None:
 
     logging.info("Main loop complete.")
 
+    # --- DIAGNOSTIC: Check xyz_results ---
+    _xyz_valid = int(np.any(np.isfinite(xyz_results), axis=1).sum())
+    _xyz_nan = int(np.all(np.isnan(xyz_results), axis=1).sum())
+    logging.info(f"DIAG: xyz_results: {_xyz_valid} valid, {_xyz_nan} all-NaN, {n_points} total")
+    if _xyz_valid > 0:
+        _y_valid = xyz_results[np.isfinite(xyz_results[:, 1]), 1]
+        logging.info(f"DIAG: Y range = [{_y_valid.min():.6e}, {_y_valid.max():.6e}]")
+    else:
+        logging.error("DIAG: CRITICAL - ALL xyz_results are NaN!")
+
     # === POST-LOOP: Normalize XYZ ===
     max_y = np.nanmax(xyz_results[:, 1])
     logging.info(f"The highest value of 'y' is: {max_y}")
@@ -679,6 +720,16 @@ def main() -> None:
     # Normalize RGB
     highest_value = np.nanmax(rgb_arr)
     rgb_arr /= highest_value
+
+    # --- DIAGNOSTIC: Check normalization ---
+    logging.info(f"DIAG: max_y = {max_y:.6e}, highest_value = {highest_value:.6e}")
+    _rgb_valid_mask = ~np.any(np.isnan(rgb_arr), axis=0)
+    _n_rgb_valid = int(_rgb_valid_mask.sum())
+    if _n_rgb_valid > 0:
+        _rgb_valid_vals = rgb_arr[:, _rgb_valid_mask]
+        logging.info(f"DIAG: RGB valid points: {_n_rgb_valid}, range=[{_rgb_valid_vals.min():.6f}, {_rgb_valid_vals.max():.6f}]")
+    else:
+        logging.error("DIAG: CRITICAL - ALL RGB values are NaN!")
 
     # === POST-LOOP: Apply BT.709 gamma correction (Hughes & Williams 2010, eqs. A7-A8) ===
     if not options.use_new_funcs:
@@ -806,9 +857,6 @@ def main() -> None:
         write_gmt_scripts(options)
         run_gmt_scripts(options)
 
-    logging.debug(
-        "Next line assumes these units are originally in ns and you want the units to be days."
-    )
     logging.info("All finished!")
     logging.info(
         "Download and analyze chlorophyll data, as well as sea surface salinity data!"
@@ -1204,9 +1252,7 @@ def fancy_detrend(
     if terms is None:
         terms = ["constant", "trend"]
 
-    x = (timeseries[x_key] - timeseries[x_key][0]).values.astype(float) / (
-        24 * 3600 * 1e9
-    )
+    x = (timeseries[x_key] - timeseries[x_key][0]).values / np.timedelta64(1, "D")
     y = timeseries[y_key].values.squeeze()
 
     design_matrix = []
@@ -1265,9 +1311,7 @@ def turn_fits_into_timeseries(
     Returns:
         Dataset with reconstructed fitted values.
     """
-    x = (timeseries[x_key] - timeseries[x_key][0]).values.astype(float) / (
-        24 * 3600 * 1e9
-    )
+    x = (timeseries[x_key] - timeseries[x_key][0]).values / np.timedelta64(1, "D")
     fitted_values = np.zeros_like(x)
 
     for term, fit_value in fits.items():
@@ -1306,10 +1350,10 @@ def nfft_power(options: Options, timeseries: xr.Dataset) -> xr.Dataset:
     Returns:
         Dataset with 'power' variable and 'frequency' coordinate.
     """
-    # logging.error("!!!WARNING!!! Next line assumes these units are originally in ns and you want the units to be days!!!")
-    x = (timeseries[options.x_key] - timeseries[options.x_key][0]).values.astype(
-        float
-    ).squeeze() / (24 * 3600 * 1e9)
+    x = (
+        (timeseries[options.x_key] - timeseries[options.x_key][0]).values.squeeze()
+        / np.timedelta64(1, "D")
+    )
     y = timeseries[options.y_key].values.squeeze()
 
     # If timeseries has an odd number of points,
@@ -1881,6 +1925,9 @@ def load_simple_grid_files(options: Options, tskip: int = 1) -> xr.Dataset:
 
     def _preprocess(ds: xr.Dataset) -> xr.Dataset:
         """Promote scalar time variable to a dimension coordinate."""
+        keep = {"ssha", "time"}
+        drop = set(ds.data_vars) - keep
+        ds = ds.drop_vars(drop, errors="ignore")
         return ds.set_coords("time").expand_dims("time")
 
     input_data = xr.open_mfdataset(
