@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 
-# Written by Emmy Killett and Claude Opus 4.6 Extended Thinking.
+# Written by Emmy Killett, Claude Opus 4.6 Extended Thinking, and Claude Opus 4.7 Adaptive.
 
 from __future__ import annotations
 
@@ -31,8 +31,10 @@ import xarray as xr
 from colour import SpectralDistribution, XYZ_to_sRGB, sd_to_XYZ
 from colour.colorimetry import MSDS_CMFS_STANDARD_OBSERVER
 from tqdm import tqdm
+import dask
+dask.config.set(scheduler="synchronous")
 
-__version__ = "0.1.5"
+__version__ = "0.1.6"
 DAYS_IN_YEAR: Final[float] = 365.25
 
 # XYZ-to-linear-sRGB matrix (Hughes & Williams 2010, no gamma correction)
@@ -83,11 +85,11 @@ class Options:
         # Numerical knobs
         self.dpi: int = 300
         self.input_choice: str = (
-            "simple_grids"  # "SSHA", "Argo", "MUR_SST", "AQUA_MODIS", "GRACE", "simple_grids"
+            "SSHA"  # "SSHA", "simple_grids", "Argo", "MUR_SST", "AQUA_MODIS", "GRACE"
         )
-        self.xskip:  int = 10  # only use every "xskip" point in each direction.
-        self.tskip:  int =  1  # only use every "tskip" point in the time series
-        self.chunks: int = 50  # for dask: aim for ~100-200 MB chunks
+        self.xskip: int = 2    # only use every "xskip" point in each direction.
+        self.tskip: int = 1     # only use every "tskip" point in the time series
+        self.chunks: int = 500  # for dask: aim for ~100-200 MB chunks
         self.min_period: float =  3 * 7.0  # days
         self.max_period: float = 24 * 7.0  # days
         self.thepower: float = 0.8
@@ -461,8 +463,10 @@ def main() -> None:
     # Load and decimate input data
     logging.info(f"Loading {options.input_choice}")
     input_data = load_input_data(options)
+    input_data = input_data.chunk({options.x_key: options.chunks})
 
     # --- DIAGNOSTIC: Check loaded data ---
+    logging.info(f"DIAGNOSTIC: chunks = {input_data[options.y_key].chunks}")
     logging.info(f"DIAGNOSTIC: input_data dims = {dict(input_data.sizes)}")
     logging.info(f"DIAGNOSTIC: time dtype = {input_data[options.x_key].dtype}")
     _data_var = input_data[options.y_key]
@@ -476,16 +480,7 @@ def main() -> None:
         logging.error(f"DIAGNOSTIC: WARNING - {options.y_key} has extreme values (max={_vmax:.2e}), fill values may not be masked!")
 
     if options.xskip > 1:
-        logging.info(
-            f"Selecting one lat/lon point in every {options.xskip**2} points..."
-        )
-        input_data = input_data.isel(
-            {
-                options.lat_key: slice(None, None, options.xskip),
-                options.lon_key: slice(None, None, options.xskip),
-            }
-        )
-        logging.info(" done.")
+        logging.info(f"Selecting one lat/lon point in every {options.xskip**2} points.")
     else:
         logging.info("Using all lat/lon points.")
 
@@ -540,10 +535,10 @@ def main() -> None:
     cie = load_cie_functions(options)
 
     # ===================================================================
-    # HOT PATH — optimized computation loop (copied verbatim from v46)
+    # HOT PATH — optimized computation loop
     # ===================================================================
     hot_start = timeit.default_timer()
-    logging.info("Starting timeseries_to_xyz WITHOUT dask (optimized)...")
+    logging.info("Starting timeseries_to_xyz...")
 
     # === PRE-COMPUTATION (outside loop) ===
     stacked = input_data.stack(latlon=[options.lat_key, options.lon_key])
@@ -551,9 +546,7 @@ def main() -> None:
 
     # Extract raw numpy arrays once
     times = stacked[options.x_key].values
-    # data_2d = stacked[options.y_key].values  # shape (n_times, n_points)
-    # Downcast to float32 because RGB only requires 8 bits per channel
-    data_2d = stacked[options.y_key].astype(np.float32, copy=False).values
+    data_2d = stacked[options.y_key].values  # shape (n_times, n_points)
     n_times, n_points = data_2d.shape
 
     # Clear unnecessary variables to manage memory
@@ -816,7 +809,7 @@ def main() -> None:
     # Stop the timer
     hot_end = timeit.default_timer()
     time_taken = hot_end - hot_start
-    logging.info(f"Time taken WITHOUT DASK: {time_taken:.2f} seconds")
+    logging.info(f"Time taken: {time_taken:.2f} seconds")
 
     # Populate dataclasses from actual computed data
     populate_results(options, spectral_color_maps)
@@ -1882,7 +1875,14 @@ def load_ssha_files(options: Options) -> xr.Dataset:
     logging.info(f"Loading {len(tskip_files)} SSHA files...")
 
     def _preprocess(ds: xr.Dataset) -> xr.Dataset:
-        return ds[[options.y_key]]   # keeps y_key + its coords; drops the rest
+        ds = ds[[options.y_key]]
+        if options.xskip > 1:
+            ds = ds.isel({
+                options.lat_key: slice(None, None, options.xskip),
+                options.lon_key: slice(None, None, options.xskip),
+            })
+        ds[options.y_key] = ds[options.y_key].astype(np.float32, copy=False)
+        return ds
 
     input_data = xr.open_mfdataset(
         tskip_files,
@@ -1908,7 +1908,15 @@ def load_argo_file(options: Options) -> xr.Dataset:
     """
     thefiles = sorted(options.argo_folder.glob("*.nc"))
     thefile = thefiles[0]
-    return xr.open_dataset(thefile, chunks={})[["ohc_2d", "ohc_2d_700m"]]
+    ds = xr.open_dataset(thefile, chunks={})[["ohc_2d", "ohc_2d_700m"]]
+    if options.xskip > 1:
+        ds = ds.isel({
+            options.lat_key: slice(None, None, options.xskip),
+            options.lon_key: slice(None, None, options.xskip),
+        })
+    for v in ("ohc_2d", "ohc_2d_700m"):
+        ds[v] = ds[v].astype(np.float32, copy=False)
+    return ds
 
 
 def load_grace_file(options: Options) -> xr.Dataset:
@@ -1922,7 +1930,14 @@ def load_grace_file(options: Options) -> xr.Dataset:
     """
     thefiles = sorted(options.grace_folder.glob("*.nc"))
     thefile = thefiles[0]
-    return xr.open_dataset(thefile, chunks={})[[options.y_key]]
+    ds = xr.open_dataset(thefile, chunks={})[[options.y_key]]
+    if options.xskip > 1:
+        ds = ds.isel({
+            options.lat_key: slice(None, None, options.xskip),
+            options.lon_key: slice(None, None, options.xskip),
+        })
+    ds[options.y_key] = ds[options.y_key].astype(np.float32, copy=False)
+    return ds
 
 
 def load_mur_sst_files(options: Options) -> xr.Dataset:
@@ -1939,7 +1954,14 @@ def load_mur_sst_files(options: Options) -> xr.Dataset:
     logging.info(f"Loading {len(tskip_files)} MUR SST files...")
 
     def _preprocess(ds: xr.Dataset) -> xr.Dataset:
-        return ds[[options.y_key]]   # keeps y_key + its coords; drops the rest
+        ds = ds[[options.y_key]]
+        if options.xskip > 1:
+            ds = ds.isel({
+                options.lat_key: slice(None, None, options.xskip),
+                options.lon_key: slice(None, None, options.xskip),
+            })
+        ds[options.y_key] = ds[options.y_key].astype(np.float32, copy=False)
+        return ds
 
     input_data = xr.open_mfdataset(
         tskip_files,
@@ -1968,7 +1990,14 @@ def load_aqua_modis_files(options: Options) -> xr.Dataset:
     logging.info(f"Loading {len(tskip_files)} AQUA_MODIS files...")
 
     def _preprocess(ds: xr.Dataset) -> xr.Dataset:
-        return ds[[options.y_key]]   # keeps y_key + its coords; drops the rest
+        ds = ds[[options.y_key]]
+        if options.xskip > 1:
+            ds = ds.isel({
+                options.lat_key: slice(None, None, options.xskip),
+                options.lon_key: slice(None, None, options.xskip),
+            })
+        ds[options.y_key] = ds[options.y_key].astype(np.float32, copy=False)
+        return ds
 
     input_data = xr.open_mfdataset(
         tskip_files,
@@ -2017,7 +2046,14 @@ def load_simple_grid_files(options: Options) -> xr.Dataset:
         keep = {options.y_key, options.x_key}
         drop = set(ds.data_vars) - keep
         ds = ds.drop_vars(drop, errors="ignore")
-        return ds.set_coords(options.x_key).expand_dims(options.x_key)
+        if options.xskip > 1:
+            ds = ds.isel({
+                options.lat_key: slice(None, None, options.xskip),
+                options.lon_key: slice(None, None, options.xskip),
+            })
+        ds = ds.set_coords(options.x_key).expand_dims(options.x_key)
+        ds[options.y_key] = ds[options.y_key].astype(np.float32, copy=False)
+        return ds
 
     input_data = xr.open_mfdataset(
         tskip_files,
