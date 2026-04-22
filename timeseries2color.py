@@ -33,8 +33,9 @@ from colour.colorimetry import MSDS_CMFS_STANDARD_OBSERVER
 from tqdm import tqdm
 import dask
 dask.config.set(scheduler="synchronous")
+import gc
 
-__version__ = "0.1.6"
+__version__ = "0.1.7"
 DAYS_IN_YEAR: Final[float] = 365.25
 
 # XYZ-to-linear-sRGB matrix (Hughes & Williams 2010, no gamma correction)
@@ -82,24 +83,29 @@ class Options:
         )
         self.output_folder: Path = Path()  # set in main()
 
-        # Numerical knobs
-        self.dpi: int = 300
-        self.input_choice: str = (
-            "SSHA"  # "SSHA", "simple_grids", "Argo", "MUR_SST", "AQUA_MODIS", "GRACE"
-        )
-        self.xskip: int = 2    # only use every "xskip" point in each direction.
-        self.tskip: int = 1     # only use every "tskip" point in the time series
-        self.chunks: int = 500  # for dask: aim for ~100-200 MB chunks
+        # Configuration
+
+        # Choices: "SSHA", "simple_grids", "Argo", "MUR_SST", "AQUA_MODIS", "GRACE"
+        self.input_choice: str = "SSHA"
         self.min_period: float =  3 * 7.0  # days
         self.max_period: float = 24 * 7.0  # days
-        self.thepower: float = 0.8
-        self.figsize: tuple[int, int] = (10, 5)
 
-        # Data key names (set per input_choice in configure_keys_for_input)
-        self.x_key: str = "Time"
-        self.y_key: str = "SLA"
-        self.lat_key: str = "Latitude"
-        self.lon_key: str = "Longitude"
+        self.xskip: int = 1  # only use every "xskip" point in each direction.
+        self.tskip: int = 1  # only use every "tskip" point in the time series
+        # Only load "chunk_size" time points at a time: aim for ~100-200 MB chunks
+        self.chunk_size: int = 250
+        # Only load "block_size" lat/lon points at a time.
+        self.block_size: int = 100_000
+
+        # Controls xarray.open_mfdataset's parallel setting.
+        # Be careful, parallel=True can spike RAM on open
+        # (Not unrelated: dask.config.set(scheduler="synchronous"))
+        self.mf_parallel: bool = bool(0)
+
+        self.thepower: float = 0.8
+
+        self.dpi: int = 300
+        self.figsize: tuple[int, int] = (10, 5)
 
         # Function selection
         self.use_new_funcs: bool = bool(0)
@@ -111,6 +117,12 @@ class Options:
         self.plot_options: PlotOptions = PlotOptions()
         self.grid: GridData = GridData()
         self.results: Results = Results()
+
+        # Data key names (set per input_choice in configure_keys_for_input)
+        self.x_key: str = ""
+        self.y_key: str = ""
+        self.lat_key: str = ""
+        self.lon_key: str = ""
 
 
 def configure_keys_for_input(options: Options) -> None:
@@ -463,21 +475,108 @@ def main() -> None:
     # Load and decimate input data
     logging.info(f"Loading {options.input_choice}")
     input_data = load_input_data(options)
-    input_data = input_data.chunk({options.x_key: options.chunks})
+    input_data = input_data.chunk({options.x_key: options.chunk_size})
+
+    # --- DIAGNOSTIC: Tuning chunk_size and block_size ---
+    _da = input_data[options.y_key]
+    _itemsize = _da.dtype.itemsize  # 4 for float32
+    _n_time = _da.sizes[options.x_key]
+    _n_lat = _da.sizes[options.lat_key]
+    _n_lon = _da.sizes[options.lon_key]
+    _n_points = _n_lat * _n_lon
+
+    # Actual chunk sizes along time (may differ from requested if files contain 1 step each
+    # and xarray can't fuse across files cleanly)
+    _time_chunks = _da.chunks[_da.dims.index(options.x_key)]
+    _effective_chunk = max(_time_chunks)    # largest per-chunk memory
+    _n_chunks = len(_time_chunks)
+
+    # Per-chunk memory footprint when dask materializes one chunk
+    _chunk_bytes = _effective_chunk * _n_lat * _n_lon * _itemsize
+    logging.info(
+        f"TUNING chunk_size: requested={options.chunk_size}, "
+        f"effective max along {options.x_key}={_effective_chunk} "
+        f"({_n_chunks} chunks total)"
+    )
+    logging.info(
+        f"TUNING chunk_size: peak per-chunk RAM ≈ "
+        f"{_effective_chunk} × {_n_lat} × {_n_lon} × {_itemsize} B = "
+        f"{_chunk_bytes / 1e9:.3f} GB"
+    )
+    # Sweet-spot targets (midpoints of the acceptable ranges)
+    _CHUNK_TARGET_BYTES = 250e6   # between 10 MB and 500 MB
+    _BLOCK_TARGET_BYTES = 500e6   # between 20 MB and 1 GB
+
+    if _chunk_bytes > 500e6:
+        _suggested = max(1, int(_CHUNK_TARGET_BYTES / (_n_lat * _n_lon * _itemsize)))
+        logging.warning(
+            f"TUNING chunk_size: {_chunk_bytes / 1e9:.2f} GB per chunk is large "
+            f"— try options.chunk_size ≈ {_suggested} (currently {options.chunk_size})"
+        )
+    elif _chunk_bytes < 10e6 and _n_chunks > 50:
+        _suggested = max(1, int(_CHUNK_TARGET_BYTES / (_n_lat * _n_lon * _itemsize)))
+        # Don't recommend more than the full time axis
+        _suggested = min(_suggested, _n_time)
+        logging.warning(
+            f"TUNING chunk_size: {_chunk_bytes / 1e6:.1f} MB per chunk is small and "
+            f"there are {_n_chunks} chunks — try options.chunk_size ≈ {_suggested} "
+            f"(currently {options.chunk_size})"
+        )
+
+    # Per-block memory footprint in the main loop
+    _block_bytes = _n_time * options.block_size * _itemsize
+    _n_blocks = (_n_points + options.block_size - 1) // options.block_size
+    logging.info(
+        f"TUNING block_size: {_n_blocks} blocks of up to {options.block_size} points each"
+    )
+    logging.info(
+        f"TUNING block_size: peak per-block RAM ≈ "
+        f"{_n_time} × {options.block_size} × {_itemsize} B = "
+        f"{_block_bytes / 1e9:.3f} GB"
+    )
+    if _block_bytes > 1e9:
+        _suggested = max(1, int(_BLOCK_TARGET_BYTES / (_n_time * _itemsize)))
+        logging.warning(
+            f"TUNING block_size: {_block_bytes / 1e9:.2f} GB per block is large "
+            f"— try options.block_size ≈ {_suggested} (currently {options.block_size})"
+        )
+    elif _block_bytes < 20e6 and _n_blocks > 20:
+        _suggested = max(1, int(_BLOCK_TARGET_BYTES / (_n_time * _itemsize)))
+        # Don't recommend more than the total number of points
+        _suggested = min(_suggested, _n_points)
+        logging.warning(
+            f"TUNING block_size: {_block_bytes / 1e6:.1f} MB per block is small and "
+            f"there are {_n_blocks} blocks — try options.block_size ≈ {_suggested} "
+            f"(currently {options.block_size})"
+        )
+
+    # Combined peak estimate (block being built + one chunk live in dask's hands)
+    _peak = _block_bytes + _chunk_bytes
+    logging.info(
+        f"TUNING combined: rough peak RAM during loop ≈ "
+        f"{_peak / 1e9:.3f} GB (block + one chunk)"
+    )
+    del _da
 
     # --- DIAGNOSTIC: Check loaded data ---
-    logging.info(f"DIAGNOSTIC: chunks = {input_data[options.y_key].chunks}")
-    logging.info(f"DIAGNOSTIC: input_data dims = {dict(input_data.sizes)}")
-    logging.info(f"DIAGNOSTIC: time dtype = {input_data[options.x_key].dtype}")
-    _data_var = input_data[options.y_key]
-    _total = int(_data_var.size)
-    _nan_count = int(_data_var.isnull().sum().compute())
-    logging.info(f"DIAGNOSTIC: {options.y_key} NaN={_nan_count}, valid={_total - _nan_count}, total={_total}")
-    _vmin = float(_data_var.min(skipna=True).compute())
-    _vmax = float(_data_var.max(skipna=True).compute())
-    logging.info(f"DIAGNOSTIC: {options.y_key} finite range = [{_vmin:.6e}, {_vmax:.6e}]")
-    if _vmax > 1e10:
-        logging.error(f"DIAGNOSTIC: WARNING - {options.y_key} has extreme values (max={_vmax:.2e}), fill values may not be masked!")
+    if 0:
+        logging.info(f"DIAGNOSTIC: chunks = {input_data[options.y_key].chunks}")
+        logging.info(f"DIAGNOSTIC: input_data dims = {dict(input_data.sizes)}")
+        logging.info(f"DIAGNOSTIC: time dtype = {input_data[options.x_key].dtype}")
+        _data_var = input_data[options.y_key]
+        _total = int(_data_var.size)
+        _stats = xr.Dataset({
+            "nan": _data_var.isnull().sum(),
+            "vmin": _data_var.min(skipna=True),
+            "vmax": _data_var.max(skipna=True),
+        }).compute()
+        _nan_count = int(_stats["nan"])
+        _vmin = float(_stats["vmin"])
+        _vmax = float(_stats["vmax"])
+        logging.info(f"DIAGNOSTIC: {options.y_key} NaN={_nan_count}, valid={_total - _nan_count}, total={_total}")
+        logging.info(f"DIAGNOSTIC: {options.y_key} finite range = [{_vmin:.6e}, {_vmax:.6e}]")
+        if _vmax > 1e10:
+            logging.error(f"DIAGNOSTIC: WARNING - {options.y_key} has extreme values (max={_vmax:.2e}), fill values may not be masked!")
 
     if options.xskip > 1:
         logging.info(f"Selecting one lat/lon point in every {options.xskip**2} points.")
@@ -544,14 +643,16 @@ def main() -> None:
     stacked = input_data.stack(latlon=[options.lat_key, options.lon_key])
     latlon_coord = stacked["latlon"]
 
-    # Extract raw numpy arrays once
+    # Extract time coord (small) and keep data lazy
     times = stacked[options.x_key].values
-    data_2d = stacked[options.y_key].values  # shape (n_times, n_points)
-    n_times, n_points = data_2d.shape
+    data_lazy = stacked[options.y_key]   # dask-backed DataArray
+    n_times = len(times)
+    n_points = stacked.sizes["latlon"]
 
-    # Clear unnecessary variables to manage memory
-    del stacked, input_data
-    import gc; gc.collect()
+    logging.info(
+        f"Full data_2d would be {n_times} × {n_points} × 4 bytes = "
+        f"{n_times * n_points * 4 / 1e9:.2f} GB — loading in blocks instead."
+    )
 
     # Time axis in days (shared across all grid points)
     x_days = (times - times[0]) / np.timedelta64(1, "D")
@@ -567,7 +668,7 @@ def main() -> None:
     if N % 2:
         logging.info(f"Trimming last time step for even NFFT length: {N} -> {N - 1}")
         x_days = x_days[:-1]
-        data_2d = data_2d[:-1, :]
+        n_times -= 1
         N -= 1
 
     # Detrending design matrix: [constant, trend, accel] (shared)
@@ -620,98 +721,106 @@ def main() -> None:
 
     A_old = A_OLD_XYZ_TO_SRGB
 
-    # Pre-filter all-NaN grid points (land); partial-NaN handled per-point in the loop
-    valid_mask = ~np.all(np.isnan(data_2d), axis=0)
-    n_valid = valid_mask.sum()
-    _all_nan = n_points - int(n_valid)
-    _any_nan = int(np.any(np.isnan(data_2d), axis=0).sum()) - _all_nan
-    logging.info(f"Processing {n_valid} valid grid points out of {n_points} total...")
-    logging.info(f"DIAG: all-NaN (land): {_all_nan}, has-some-NaN (will drop NaN samples): {_any_nan}, fully complete: {int(n_valid) - _any_nan}")
-
-    # === MAIN LOOP (pure numpy, no xarray overhead) ===
+    # === MAIN LOOP — block-wise to keep memory bounded ===
     xyz_results = np.full((n_points, 3), np.nan)
 
-    for i in tqdm(range(n_points), desc="Grid points"):
-        if not valid_mask[i]:
-            continue
+    with tqdm(total=n_points, desc="Grid points") as pbar:
+        for block_start in range(0, n_points, options.block_size):
+            block_end = min(block_start + options.block_size, n_points)
+            # Materialize just this block (triggers dask read for the needed chunks only)
+            block = data_lazy.isel(latlon=slice(block_start, block_end)).values
+            if N < block.shape[0]:   # handle the even-length trim
+                block = block[:N, :]
 
-        y = data_2d[:, i]
+            for j in range(block.shape[1]):
+                i = block_start + j
+                pbar.update(1)
 
-        # Drop NaN samples — use only real data points
-        nan_idx = np.isnan(y)
-        if np.any(nan_idx):
-            valid_idx = ~nan_idx
-            n_valid_pts = int(valid_idx.sum())
-            # The nfft library's kernel window half-width m is estimated as 9 for the default tolerance, and
-            # the internal assertion m <= n // 2 (where n = N * 3) fails when N < 6.
-            if n_valid_pts < 6:
-                continue
-            y = y[valid_idx]
-            y_x_days = x_days[valid_idx]
-            # Recompute per-point NFFT parameters for the reduced series
-            y_N = n_valid_pts
-            if y_N % 2:
-                y = y[:-1]
-                y_x_days = y_x_days[:-1]
-                y_N -= 1
-            y_x_min = y_x_days.min()
-            y_x_range = y_x_days.max() - y_x_min
-            y_x_norm = (y_x_days - y_x_min) / y_x_range - 0.5
-            y_design = np.column_stack([np.ones(y_N), y_x_days, y_x_days**2])
-            y_k = -(y_N // 2) + np.arange(y_N)
-            y_xf_half = (y_k / y_x_range)[y_N // 2 + 1 :]
-            y_periods_asc = (1.0 / y_xf_half)[::-1]
-            y_freq_sq_asc = (1.0 / y_periods_asc) ** 2
-        else:
-            y_N = N
-            y_x_norm = x_norm
-            y_design = design_matrix
-            y_periods_asc = periods_ascending
-            y_freq_sq_asc = freq_sq_ascending
+                y = block[:, j]
 
-        # 1. Detrend with numpy lstsq (replaces statsmodels OLS)
-        params, _, _, _ = np.linalg.lstsq(y_design, y, rcond=None)
-        detrended = y - y_design @ params
+                # Skip all-NaN columns (land)
+                if np.all(np.isnan(y)):
+                    continue
 
-        # 2. NFFT
-        f_k = nfft.nfft(y_x_norm, detrended)
-        power = np.abs(f_k) ** 2
+                # Drop NaN samples — use only real data points
+                nan_idx = np.isnan(y)
+                if np.any(nan_idx):
+                    valid_idx = ~nan_idx
+                    n_valid_pts = int(valid_idx.sum())
+                    # The nfft library's kernel window half-width m is estimated as 9 for the default tolerance, and
+                    # the internal assertion m <= n // 2 (where n = N * 3) fails when N < 6.
+                    if n_valid_pts < 6:
+                        continue
+                    y = y[valid_idx]
+                    y_x_days = x_days[valid_idx]
+                    # Recompute per-point NFFT parameters for the reduced series
+                    y_N = n_valid_pts
+                    if y_N % 2:
+                        y = y[:-1]
+                        y_x_days = y_x_days[:-1]
+                        y_N -= 1
+                    y_x_min = y_x_days.min()
+                    y_x_range = y_x_days.max() - y_x_min
+                    y_x_norm = (y_x_days - y_x_min) / y_x_range - 0.5
+                    y_design = np.column_stack([np.ones(y_N), y_x_days, y_x_days**2])
+                    y_k = -(y_N // 2) + np.arange(y_N)
+                    y_xf_half = (y_k / y_x_range)[y_N // 2 + 1 :]
+                    y_periods_asc = (1.0 / y_xf_half)[::-1]
+                    y_freq_sq_asc = (1.0 / y_periods_asc) ** 2
+                else:
+                    y_N = N
+                    y_x_norm = x_norm
+                    y_design = design_matrix
+                    y_periods_asc = periods_ascending
+                    y_freq_sq_asc = freq_sq_ascending
 
-        # 3. Take positive frequencies, reverse to ascending period order
-        power_half = power[y_N // 2 + 1 :]
-        power_ascending = power_half[::-1]
+                # 1. Detrend with numpy lstsq (replaces statsmodels OLS)
+                params, _, _, _ = np.linalg.lstsq(y_design, y, rcond=None)
+                detrended = y - y_design @ params
 
-        # 3b. Convert PSD to SPD by multiplying by sigma^2 (Hughes & Williams 2010, eq. A11)
-        power_ascending = power_ascending * y_freq_sq_asc
+                # 2. NFFT
+                f_k = nfft.nfft(y_x_norm, detrended)
+                power = np.abs(f_k) ** 2
 
-        # 4. Map power spectrum to wavelength grid
-        # Recompute boundary handling for this point's period range
-        pt_periods_ext = y_periods_asc.copy()
-        if options.min_period not in y_periods_asc:
-            pt_periods_ext = np.append(pt_periods_ext, options.min_period)
-        if options.max_period not in y_periods_asc:
-            pt_periods_ext = np.append(pt_periods_ext, options.max_period)
-        pt_periods_ext = np.sort(pt_periods_ext)
-        pt_nearest_idx = np.array(
-            [np.argmin(np.abs(y_periods_asc - p)) for p in pt_periods_ext]
-        )
-        pt_mask = (pt_periods_ext >= options.min_period) & (
-            pt_periods_ext <= options.max_period
-        )
-        pt_interp_periods = pt_periods_ext[pt_mask]
-        pt_interp_nearest = pt_nearest_idx[pt_mask]
-        power_interp_src = power_ascending[pt_interp_nearest]
-        mapped_power = np.interp(wavelength_targets, pt_interp_periods, power_interp_src)
+                # 3. Take positive frequencies, reverse to ascending period order
+                power_half = power[y_N // 2 + 1 :]
+                power_ascending = power_half[::-1]
 
-        # 5. Spectrum to XYZ
-        if options.use_new_funcs:
-            spd = SpectralDistribution(mapped_power, cie_wavelengths)
-            xyz_results[i] = sd_to_XYZ(spd, cmfs)
-        else:
-            # Riemann sum integration (Hughes & Williams 2010)
-            xyz_results[i, 0] = (mapped_power * cie_x_vals).sum() * wavelength_step
-            xyz_results[i, 1] = (mapped_power * cie_y_vals).sum() * wavelength_step
-            xyz_results[i, 2] = (mapped_power * cie_z_vals).sum() * wavelength_step
+                # 3b. Convert PSD to SPD by multiplying by sigma^2 (Hughes & Williams 2010, eq. A11)
+                power_ascending = power_ascending * y_freq_sq_asc
+
+                # 4. Map power spectrum to wavelength grid
+                # Recompute boundary handling for this point's period range
+                pt_periods_ext = y_periods_asc.copy()
+                if options.min_period not in y_periods_asc:
+                    pt_periods_ext = np.append(pt_periods_ext, options.min_period)
+                if options.max_period not in y_periods_asc:
+                    pt_periods_ext = np.append(pt_periods_ext, options.max_period)
+                pt_periods_ext = np.sort(pt_periods_ext)
+                pt_nearest_idx = np.array(
+                    [np.argmin(np.abs(y_periods_asc - p)) for p in pt_periods_ext]
+                )
+                pt_mask = (pt_periods_ext >= options.min_period) & (
+                    pt_periods_ext <= options.max_period
+                )
+                pt_interp_periods = pt_periods_ext[pt_mask]
+                pt_interp_nearest = pt_nearest_idx[pt_mask]
+                power_interp_src = power_ascending[pt_interp_nearest]
+                mapped_power = np.interp(wavelength_targets, pt_interp_periods, power_interp_src)
+
+                # 5. Spectrum to XYZ
+                if options.use_new_funcs:
+                    spd = SpectralDistribution(mapped_power, cie_wavelengths)
+                    xyz_results[i] = sd_to_XYZ(spd, cmfs)
+                else:
+                    # Riemann sum integration (Hughes & Williams 2010)
+                    xyz_results[i, 0] = (mapped_power * cie_x_vals).sum() * wavelength_step
+                    xyz_results[i, 1] = (mapped_power * cie_y_vals).sum() * wavelength_step
+                    xyz_results[i, 2] = (mapped_power * cie_z_vals).sum() * wavelength_step
+
+    # Cleanup
+    del stacked, input_data
+    gc.collect()
 
     logging.info("Main loop complete.")
 
@@ -1891,8 +2000,8 @@ def load_ssha_files(options: Options) -> xr.Dataset:
         coords="minimal",
         compat="override",
         combine="by_coords",
-        parallel=False,                   # parallel=True can spike RAM on open
-        chunks={options.x_key: options.chunks},
+        parallel=options.mf_parallel,
+        chunks={options.x_key: options.chunk_size},
     )
     return input_data
 
@@ -1970,8 +2079,8 @@ def load_mur_sst_files(options: Options) -> xr.Dataset:
         coords="minimal",
         compat="override",
         combine="by_coords",
-        parallel=False,                   # parallel=True can spike RAM on open
-        chunks={options.x_key: options.chunks},
+        parallel=options.mf_parallel,
+        chunks={options.x_key: options.chunk_size},
     )
     return input_data
 
@@ -2006,8 +2115,8 @@ def load_aqua_modis_files(options: Options) -> xr.Dataset:
         coords="minimal",
         compat="override",
         combine="by_coords",
-        parallel=False,                   # parallel=True can spike RAM on open
-        chunks={options.x_key: options.chunks},
+        parallel=options.mf_parallel,
+        chunks={options.x_key: options.chunk_size},
     )
 
     return input_data
@@ -2063,8 +2172,8 @@ def load_simple_grid_files(options: Options) -> xr.Dataset:
         data_vars="minimal",
         coords="minimal",
         compat="override",
-        parallel=False,                   # parallel=True can spike RAM on open
-        chunks={options.x_key: options.chunks},
+        parallel=options.mf_parallel,
+        chunks={options.x_key: options.chunk_size},
     )
     return input_data
 
