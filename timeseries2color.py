@@ -1,3 +1,7 @@
+#!/usr/bin/env python3
+
+# Written by Emmy Killett and Claude Opus 4.6 Extended Thinking.
+
 from __future__ import annotations
 
 import argparse
@@ -58,8 +62,11 @@ class Options:
 
         # Paths
         self.output_base: Path = self.cwd / "output"
+        # self.ssha_folder: Path = (
+        #     self.cwd / "sealevel_spectra" / "fast_202306" / "fast_netCDF4"
+        # )
         self.ssha_folder: Path = (
-            self.cwd / "sealevel_spectra" / "fast_202306" / "fast_netCDF4"
+            self.cwd / "sealevel_spectra" / "SSHA_v2205"
         )
         self.simple_folder: Path = self.cwd / "sealevel_spectra" / "simple_grids"
         self.argo_folder: Path = self.cwd / "sealevel_spectra" / "Argo"
@@ -78,8 +85,10 @@ class Options:
         self.input_choice: str = (
             "simple_grids"  # "SSHA", "Argo", "MUR_SST", "AQUA_MODIS", "GRACE", "simple_grids"
         )
-        self.xskip: int = 1
-        self.min_period: float =  2 * 7.0  # days
+        self.xskip:  int = 10  # only use every "xskip" point in each direction.
+        self.tskip:  int =  1  # only use every "tskip" point in the time series
+        self.chunks: int = 50  # for dask: aim for ~100-200 MB chunks
+        self.min_period: float =  3 * 7.0  # days
         self.max_period: float = 24 * 7.0  # days
         self.thepower: float = 0.8
         self.figsize: tuple[int, int] = (10, 5)
@@ -114,43 +123,31 @@ def configure_keys_for_input(options: Options) -> None:
         options.y_key = "SLA"
         options.lat_key = "Latitude"
         options.lon_key = "Longitude"
-        # options.min_period = 2 * 7.0  # days
-        # options.max_period = 24 * 7.0  # days
     elif options.input_choice == "simple_grids":
         options.x_key = "time"
         options.y_key = "ssha"
         options.lat_key = "latitude"
         options.lon_key = "longitude"
-        # options.min_period = 2 * 7.0  # days
-        # options.max_period = 24 * 7.0  # days
     elif options.input_choice == "Argo":
         options.x_key = "time"
         options.y_key = "ohc_2d_lt_700m"
         options.lat_key = "latitude"
         options.lon_key = "longitude"
-        # options.min_period = 55 * 7.0  # days
-        # options.max_period = 150 * 7.0  # days
     elif options.input_choice == "MUR_SST":
         options.x_key = "time"
         options.y_key = "sst_anomaly"
         options.lat_key = "lat"
         options.lon_key = "lon"
-        # options.min_period = 2 * 7.0  # days
-        # options.max_period = 24 * 7.0  # days
     elif options.input_choice == "AQUA_MODIS":
         options.x_key = "time"
         options.y_key = "sst_anomaly"
         options.lat_key = "lat"
         options.lon_key = "lon"
-        # options.min_period = 2 * 7.0  # days
-        # options.max_period = 24 * 7.0  # days
     elif options.input_choice == "GRACE":
         options.x_key = "time"
         options.y_key = "lwe_thickness"
         options.lat_key = "lat"
         options.lon_key = "lon"
-        # options.min_period = 24 * 7.0  # days
-        # options.max_period = 70 * 7.0  # days
     else:
         logging.error(f"DID NOT RECOGNIZE {options.input_choice = }")
 
@@ -466,19 +463,17 @@ def main() -> None:
     input_data = load_input_data(options)
 
     # --- DIAGNOSTIC: Check loaded data ---
-    logging.info(f"DIAG: input_data dims = {dict(input_data.sizes)}")
-    logging.info(f"DIAG: time dtype = {input_data[options.x_key].dtype}")
+    logging.info(f"DIAGNOSTIC: input_data dims = {dict(input_data.sizes)}")
+    logging.info(f"DIAGNOSTIC: time dtype = {input_data[options.x_key].dtype}")
     _data_var = input_data[options.y_key]
-    _vals = _data_var.values
-    _nan_count = int(np.isnan(_vals).sum())
-    _total = int(_vals.size)
-    logging.info(f"DIAG: {options.y_key} NaN={_nan_count}, valid={_total - _nan_count}, total={_total}")
-    _vmin = float(np.nanmin(_vals))
-    _vmax = float(np.nanmax(_vals))
-    logging.info(f"DIAG: {options.y_key} finite range = [{_vmin:.6e}, {_vmax:.6e}]")
+    _total = int(_data_var.size)
+    _nan_count = int(_data_var.isnull().sum().compute())
+    logging.info(f"DIAGNOSTIC: {options.y_key} NaN={_nan_count}, valid={_total - _nan_count}, total={_total}")
+    _vmin = float(_data_var.min(skipna=True).compute())
+    _vmax = float(_data_var.max(skipna=True).compute())
+    logging.info(f"DIAGNOSTIC: {options.y_key} finite range = [{_vmin:.6e}, {_vmax:.6e}]")
     if _vmax > 1e10:
-        logging.error(f"DIAG: WARNING - {options.y_key} has extreme values (max={_vmax:.2e}), fill values may not be masked!")
-    del _vals, _data_var  # free ~3.6 GB before hot path allocates data_2d
+        logging.error(f"DIAGNOSTIC: WARNING - {options.y_key} has extreme values (max={_vmax:.2e}), fill values may not be masked!")
 
     if options.xskip > 1:
         logging.info(
@@ -556,8 +551,14 @@ def main() -> None:
 
     # Extract raw numpy arrays once
     times = stacked[options.x_key].values
-    data_2d = stacked[options.y_key].values  # shape (n_times, n_points)
+    # data_2d = stacked[options.y_key].values  # shape (n_times, n_points)
+    # Downcast to float32 because RGB only requires 8 bits per channel
+    data_2d = stacked[options.y_key].astype(np.float32, copy=False).values
     n_times, n_points = data_2d.shape
+
+    # Clear unnecessary variables to manage memory
+    del stacked, input_data
+    import gc; gc.collect()
 
     # Time axis in days (shared across all grid points)
     x_days = (times - times[0]) / np.timedelta64(1, "D")
@@ -754,6 +755,7 @@ def main() -> None:
     # === POST-LOOP: Vectorized fix_gamut (replaces groupby.map) ===
     logging.info("Fixing RGB out-of-gamut values and normalizing...")
     rgb_arr = RGB_results.T.copy()  # shape (3, n_points) for easier per-channel access
+    del RGB_results  # Clear memory
 
     nan_mask = np.any(np.isnan(rgb_arr), axis=0)
     min_vals = np.full(n_points, 0.0)
@@ -1086,12 +1088,12 @@ def populate_results(options: Options, spectral_color_maps: xr.Dataset) -> None:
     lons = spectral_color_maps.coords[options.lon_key].values
 
     # Populate latlon from actual computed grid
-    results.latlon.lat = lats.tolist()
-    results.latlon.lon = lons.tolist()
+    results.latlon.lat = lats
+    results.latlon.lon = lons
     results.latlon.outputs = [
-        spectral_color_maps["red"].values.tolist(),
-        spectral_color_maps["green"].values.tolist(),
-        spectral_color_maps["blue"].values.tolist(),
+        spectral_color_maps["red"].values,
+        spectral_color_maps["green"].values,
+        spectral_color_maps["blue"].values,
     ]
 
     # Spatial extent from actual data
@@ -1864,21 +1866,34 @@ def plot_rgb_map(
 # ---------------------------------------------------------------------------
 
 
-def load_ssha_files(options: Options, tskip: int = 1) -> xr.Dataset:
+def load_ssha_files(options: Options) -> xr.Dataset:
     """Load SSHA NetCDF files.
 
     Args:
         options: Options object. Contains:
                      - ssha_folder: Path to SSHA data directory.
-        tskip:   Load every tskip-th file.
+                     - tskip:       Load every tskip-th file.
 
     Returns:
         Combined dataset.
     """
     sshafiles = sorted(options.ssha_folder.glob("*.nc"))
-    tskip_files = sshafiles[::tskip]
+    tskip_files = sshafiles[::options.tskip]
     logging.info(f"Loading {len(tskip_files)} SSHA files...")
-    input_data = xr.open_mfdataset(tskip_files, data_vars="all", combine="by_coords")
+
+    def _preprocess(ds: xr.Dataset) -> xr.Dataset:
+        return ds[[options.y_key]]   # keeps y_key + its coords; drops the rest
+
+    input_data = xr.open_mfdataset(
+        tskip_files,
+        preprocess=_preprocess,
+        data_vars="minimal",
+        coords="minimal",
+        compat="override",
+        combine="by_coords",
+        parallel=False,                   # parallel=True can spike RAM on open
+        chunks={options.x_key: options.chunks},
+    )
     return input_data
 
 
@@ -1893,7 +1908,7 @@ def load_argo_file(options: Options) -> xr.Dataset:
     """
     thefiles = sorted(options.argo_folder.glob("*.nc"))
     thefile = thefiles[0]
-    return xr.open_dataset(thefile)
+    return xr.open_dataset(thefile, chunks={})[["ohc_2d", "ohc_2d_700m"]]
 
 
 def load_grace_file(options: Options) -> xr.Dataset:
@@ -1907,44 +1922,69 @@ def load_grace_file(options: Options) -> xr.Dataset:
     """
     thefiles = sorted(options.grace_folder.glob("*.nc"))
     thefile = thefiles[0]
-    return xr.open_dataset(thefile)
+    return xr.open_dataset(thefile, chunks={})[[options.y_key]]
 
 
-def load_mur_sst_files(options: Options, tskip: int = 1) -> xr.Dataset:
+def load_mur_sst_files(options: Options) -> xr.Dataset:
     """Load MUR SST NetCDF files.
 
     Args:
-        options: Options object (mur_sst_folder).
-        tskip:   Load every tskip-th file.
+        options: Options object (mur_sst_folder, tskip).
 
     Returns:
         Combined dataset.
     """
-    thefiles = sorted(options.mur_sst_folder.glob("*2003*.nc"))
-    tskip_files = thefiles[::tskip]
+    thefiles = sorted(options.mur_sst_folder.glob("*.nc"))
+    tskip_files = thefiles[::options.tskip]
     logging.info(f"Loading {len(tskip_files)} MUR SST files...")
-    input_data = xr.open_mfdataset(tskip_files, data_vars="all", combine="by_coords")
+
+    def _preprocess(ds: xr.Dataset) -> xr.Dataset:
+        return ds[[options.y_key]]   # keeps y_key + its coords; drops the rest
+
+    input_data = xr.open_mfdataset(
+        tskip_files,
+        preprocess=_preprocess,
+        data_vars="minimal",
+        coords="minimal",
+        compat="override",
+        combine="by_coords",
+        parallel=False,                   # parallel=True can spike RAM on open
+        chunks={options.x_key: options.chunks},
+    )
     return input_data
 
 
-def load_aqua_modis_files(options: Options, tskip: int = 1) -> xr.Dataset:
+def load_aqua_modis_files(options: Options) -> xr.Dataset:
     """Load AQUA MODIS NetCDF files.
 
     Args:
-        options: Options object (aqua_modis_folder).
-        tskip:   Load every tskip-th file.
+        options: Options object (aqua_modis_folder, tskip).
 
     Returns:
         Combined dataset.
     """
-    thefiles = sorted(options.aqua_modis_folder.glob("*2003*.nc"))
-    tskip_files = thefiles[::tskip]
+    thefiles = sorted(options.aqua_modis_folder.glob("*.nc"))
+    tskip_files = thefiles[::options.tskip]
     logging.info(f"Loading {len(tskip_files)} AQUA_MODIS files...")
-    input_data = xr.open_mfdataset(tskip_files, data_vars="all", combine="by_coords")
+
+    def _preprocess(ds: xr.Dataset) -> xr.Dataset:
+        return ds[[options.y_key]]   # keeps y_key + its coords; drops the rest
+
+    input_data = xr.open_mfdataset(
+        tskip_files,
+        preprocess=_preprocess,
+        data_vars="minimal",
+        coords="minimal",
+        compat="override",
+        combine="by_coords",
+        parallel=False,                   # parallel=True can spike RAM on open
+        chunks={options.x_key: options.chunks},
+    )
+
     return input_data
 
 
-def load_simple_grid_files(options: Options, tskip: int = 1) -> xr.Dataset:
+def load_simple_grid_files(options: Options) -> xr.Dataset:
     """Load simple_grids weekly NetCDF files and concatenate along time.
 
     Each file contains a single weekly snapshot of ssha(latitude, longitude)
@@ -1954,7 +1994,7 @@ def load_simple_grid_files(options: Options, tskip: int = 1) -> xr.Dataset:
     Args:
         options: Options object. Contains:
                      - simple_folder: Path to simple_grids data directory.
-        tskip:   Load every tskip-th file (temporal decimation).
+                     - tskip:         Load every tskip-th file (temporal decimation).
 
     Returns:
         Combined dataset with dimensions (time, latitude, longitude).
@@ -1967,23 +2007,28 @@ def load_simple_grid_files(options: Options, tskip: int = 1) -> xr.Dataset:
         raise FileNotFoundError(
             f"No NetCDF files found in {os.fspath(options.simple_folder)}"
         )
-    tskip_files = all_files[::tskip]
+    tskip_files = all_files[::options.tskip]
     logging.info(
         f"Loading {len(tskip_files)} simple_grids files (of {len(all_files)} total)..."
     )
 
     def _preprocess(ds: xr.Dataset) -> xr.Dataset:
         """Promote scalar time variable to a dimension coordinate."""
-        keep = {"ssha", "time"}
+        keep = {options.y_key, options.x_key}
         drop = set(ds.data_vars) - keep
         ds = ds.drop_vars(drop, errors="ignore")
-        return ds.set_coords("time").expand_dims("time")
+        return ds.set_coords(options.x_key).expand_dims(options.x_key)
 
     input_data = xr.open_mfdataset(
         tskip_files,
         preprocess=_preprocess,
         combine="nested",
-        concat_dim="time",
+        concat_dim=options.x_key,
+        data_vars="minimal",
+        coords="minimal",
+        compat="override",
+        parallel=False,                   # parallel=True can spike RAM on open
+        chunks={options.x_key: options.chunks},
     )
     return input_data
 
@@ -2920,19 +2965,19 @@ def load_input_data(options: Options) -> xr.Dataset:
         Loaded xarray Dataset.
     """
     if options.input_choice == "SSHA":
-        input_data = load_ssha_files(options, tskip=1)
+        input_data = load_ssha_files(options)
     elif options.input_choice == "Argo":
         input_data = load_argo_file(options)
         input_data["ohc_2d_lt_700m"] = input_data["ohc_2d"] - input_data["ohc_2d_700m"]
     elif options.input_choice == "MUR_SST":
-        input_data = load_mur_sst_files(options, tskip=1)
+        input_data = load_mur_sst_files(options)
     elif options.input_choice == "AQUA_MODIS":
-        input_data = load_aqua_modis_files(options, tskip=1)
+        input_data = load_aqua_modis_files(options)
         logging.info(input_data)
     elif options.input_choice == "GRACE":
         input_data = load_grace_file(options)
     elif options.input_choice == "simple_grids":
-        input_data = load_simple_grid_files(options, tskip=1)
+        input_data = load_simple_grid_files(options)
     else:
         logging.error(f"DID NOT RECOGNIZE {options.input_choice = }")
         raise ValueError(f"Unknown input_choice: {options.input_choice}")
