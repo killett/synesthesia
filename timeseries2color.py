@@ -35,7 +35,7 @@ import dask
 dask.config.set(scheduler="synchronous")
 import gc
 
-__version__ = "0.1.7"
+__version__ = "0.1.8"
 DAYS_IN_YEAR: Final[float] = 365.25
 
 # XYZ-to-linear-sRGB matrix (Hughes & Williams 2010, no gamma correction)
@@ -85,21 +85,30 @@ class Options:
 
         # Configuration
 
-        # Choices: "SSHA", "simple_grids", "Argo", "MUR_SST", "AQUA_MODIS", "GRACE"
-        self.input_choice: str = "SSHA"
-        self.min_period: float =  3 * 7.0  # days
-        self.max_period: float = 24 * 7.0  # days
+        self.input_choices_list: list[str] = ["SSHA", "simple_grids", "Argo",
+                                              "MUR_SST", "AQUA_MODIS", "GRACE"]
+        self.input_choice: str = "MUR_SST"
+        # self.min_period: float =  3 * 7.0  # days
+        # self.max_period: float = 24 * 7.0  # days
+        self.min_period: float = 10 * 7.0  # days
+        self.max_period: float = 54 * 7.0  # days
+
+        self.fit_terms: list[str] = []
+        self.fit_terms += ["constant", "trend", "accel"]
+        # self.fit_terms += ["annual"]
+        # self.fit_terms += ["semiannual"]
+        self.fit_terms += ["annual", "semiannual"]
 
         self.xskip: int = 1  # only use every "xskip" point in each direction.
         self.tskip: int = 1  # only use every "tskip" point in the time series
-        # Only load "chunk_size" time points at a time: aim for ~100-200 MB chunks
-        self.chunk_size: int = 250
-        # Only load "block_size" lat/lon points at a time.
-        self.block_size: int = 100_000
+
+        # Desired memory footprints; chunk_size and block_size are derived from these
+        self.chunk_bytes: float = 250e6   # bytes per dask time chunk
+        self.block_bytes: float = 500e6   # bytes per loop lat/lon block
 
         # Controls xarray.open_mfdataset's parallel setting.
         # Be careful, parallel=True can spike RAM on open
-        # (Not unrelated: dask.config.set(scheduler="synchronous"))
+        # (Above, not unrelated: dask.config.set(scheduler="synchronous"))
         self.mf_parallel: bool = bool(0)
 
         self.thepower: float = 0.8
@@ -113,13 +122,16 @@ class Options:
         # Files to copy into output
         self.files_to_copy: list[str] = ["projections.sh", "overflow.sh", "notation.sh"]
 
+        # Not a configurable option.
+        self.fake_chunk: int = 100
+
         # Data structures (initialized by populate_results after hot path)
         self.plot_options: PlotOptions = PlotOptions()
         self.grid: GridData = GridData()
         self.results: Results = Results()
 
         # Data key names (set per input_choice in configure_keys_for_input)
-        self.x_key: str = ""
+        self.time_key: str = ""
         self.y_key: str = ""
         self.lat_key: str = ""
         self.lon_key: str = ""
@@ -129,36 +141,36 @@ def configure_keys_for_input(options: Options) -> None:
     """Set data key names and per-dataset defaults based on input_choice.
 
     Args:
-        options: Options object. Mutates x_key, y_key, lat_key, lon_key,
+        options: Options object. Mutates time_key, y_key, lat_key, lon_key,
                  min_period, max_period, xskip.
     """
     if options.input_choice == "SSHA":
-        options.x_key = "Time"
+        options.time_key = "Time"
         options.y_key = "SLA"
         options.lat_key = "Latitude"
         options.lon_key = "Longitude"
     elif options.input_choice == "simple_grids":
-        options.x_key = "time"
+        options.time_key = "time"
         options.y_key = "ssha"
         options.lat_key = "latitude"
         options.lon_key = "longitude"
     elif options.input_choice == "Argo":
-        options.x_key = "time"
+        options.time_key = "time"
         options.y_key = "ohc_2d_lt_700m"
         options.lat_key = "latitude"
         options.lon_key = "longitude"
     elif options.input_choice == "MUR_SST":
-        options.x_key = "time"
+        options.time_key = "time"
         options.y_key = "sst_anomaly"
         options.lat_key = "lat"
         options.lon_key = "lon"
     elif options.input_choice == "AQUA_MODIS":
-        options.x_key = "time"
+        options.time_key = "time"
         options.y_key = "sst_anomaly"
         options.lat_key = "lat"
         options.lon_key = "lon"
     elif options.input_choice == "GRACE":
-        options.x_key = "time"
+        options.time_key = "time"
         options.y_key = "lwe_thickness"
         options.lat_key = "lat"
         options.lon_key = "lon"
@@ -219,7 +231,7 @@ class PlotOptions:
     blurb_disabled: int = 1
     phase_mask: int = 12  # 1/2=abrupt, 11/12=gradual (matches C++)
     plot_mascons: int = 0
-    no_gmt_plots: int = 0  # 1=skip GMT
+    no_gmt_plots: int = 1  # 1=skip GMT
     # Matplotlib-only fields:
     dpi: int = 300
     show_fig: bool = False
@@ -309,7 +321,7 @@ def parse_arguments(options: Options) -> None:
         "--input-choice",
         type=str,
         default=None,
-        choices=["SSHA", "Argo", "MUR_SST", "AQUA_MODIS", "GRACE", "simple_grids"],
+        choices=options.input_choices_list,
         help=f"Data source (default: {options.input_choice}).",
     )
     parser.add_argument(
@@ -329,6 +341,18 @@ def parse_arguments(options: Options) -> None:
         type=float,
         default=None,
         help="Maximum period in days (default: per-dataset).",
+    )
+    parser.add_argument(
+        "--chunk-bytes",
+        type=float,
+        default=None,
+        help=f"Target bytes per dask chunk (default: {options.chunk_bytes:.0e}).",
+    )
+    parser.add_argument(
+        "--block-bytes",
+        type=float,
+        default=None,
+        help=f"Target bytes per loop block (default: {options.block_bytes:.0e}).",
     )
     parser.add_argument(
         "--dpi",
@@ -407,6 +431,10 @@ def parse_arguments(options: Options) -> None:
         options.plot_options.show_rivers = True
     if options.args.coastline_resolution is not None:
         options.plot_options.coastline_resolution = options.args.coastline_resolution
+    if options.args.chunk_bytes is not None:
+        options.chunk_bytes = options.args.chunk_bytes
+    if options.args.block_bytes is not None:
+        options.block_bytes = options.args.block_bytes
     options.dpi = options.args.dpi
 
 
@@ -472,22 +500,54 @@ def main() -> None:
         else:
             setattr(options, attr, getattr(options.args, attr))
 
-    # Load and decimate input data
+    # Coarse initial chunk_size for the initial open_mfdataset call.
+    # Actual value is derived from options.chunk_bytes after we know grid dimensions.
+    options.chunk_size = 100
     logging.info(f"Loading {options.input_choice}")
     input_data = load_input_data(options)
-    input_data = input_data.chunk({options.x_key: options.chunk_size})
+
+    # Derive final chunk_size and block_size from target byte budgets
+    _da = input_data[options.y_key]
+    _itemsize = _da.dtype.itemsize
+    _n_lat = _da.sizes[options.lat_key]
+    _n_lon = _da.sizes[options.lon_key]
+    _n_time = _da.sizes[options.time_key]
+    _n_points = _n_lat * _n_lon
+
+    options.chunk_size = max(1, min(
+        _n_time,
+        int(options.chunk_bytes / (_n_lat * _n_lon * _itemsize)),
+    ))
+    options.block_size = max(1, min(
+        _n_points,
+        int(options.block_bytes / (_n_time * _itemsize)),
+    ))
+
+    logging.info(
+        f"DERIVED chunk_size = {options.chunk_size} "
+        f"(target {options.chunk_bytes / 1e6:.0f} MB per chunk, "
+        f"actual ≈ {options.chunk_size * _n_lat * _n_lon * _itemsize / 1e6:.0f} MB)"
+    )
+    logging.info(
+        f"DERIVED block_size = {options.block_size} "
+        f"(target {options.block_bytes / 1e6:.0f} MB per block, "
+        f"actual ≈ {_n_time * options.block_size * _itemsize / 1e6:.0f} MB)"
+    )
+    del _da
+
+    input_data = input_data.chunk({options.time_key: options.chunk_size})
 
     # --- DIAGNOSTIC: Tuning chunk_size and block_size ---
     _da = input_data[options.y_key]
     _itemsize = _da.dtype.itemsize  # 4 for float32
-    _n_time = _da.sizes[options.x_key]
+    _n_time = _da.sizes[options.time_key]
     _n_lat = _da.sizes[options.lat_key]
     _n_lon = _da.sizes[options.lon_key]
     _n_points = _n_lat * _n_lon
 
     # Actual chunk sizes along time (may differ from requested if files contain 1 step each
     # and xarray can't fuse across files cleanly)
-    _time_chunks = _da.chunks[_da.dims.index(options.x_key)]
+    _time_chunks = _da.chunks[_da.dims.index(options.time_key)]
     _effective_chunk = max(_time_chunks)    # largest per-chunk memory
     _n_chunks = len(_time_chunks)
 
@@ -495,7 +555,7 @@ def main() -> None:
     _chunk_bytes = _effective_chunk * _n_lat * _n_lon * _itemsize
     logging.info(
         f"TUNING chunk_size: requested={options.chunk_size}, "
-        f"effective max along {options.x_key}={_effective_chunk} "
+        f"effective max along {options.time_key}={_effective_chunk} "
         f"({_n_chunks} chunks total)"
     )
     logging.info(
@@ -503,24 +563,17 @@ def main() -> None:
         f"{_effective_chunk} × {_n_lat} × {_n_lon} × {_itemsize} B = "
         f"{_chunk_bytes / 1e9:.3f} GB"
     )
-    # Sweet-spot targets (midpoints of the acceptable ranges)
-    _CHUNK_TARGET_BYTES = 250e6   # between 10 MB and 500 MB
-    _BLOCK_TARGET_BYTES = 500e6   # between 20 MB and 1 GB
 
     if _chunk_bytes > 500e6:
-        _suggested = max(1, int(_CHUNK_TARGET_BYTES / (_n_lat * _n_lon * _itemsize)))
         logging.warning(
             f"TUNING chunk_size: {_chunk_bytes / 1e9:.2f} GB per chunk is large "
-            f"— try options.chunk_size ≈ {_suggested} (currently {options.chunk_size})"
         )
     elif _chunk_bytes < 10e6 and _n_chunks > 50:
-        _suggested = max(1, int(_CHUNK_TARGET_BYTES / (_n_lat * _n_lon * _itemsize)))
         # Don't recommend more than the full time axis
         _suggested = min(_suggested, _n_time)
         logging.warning(
             f"TUNING chunk_size: {_chunk_bytes / 1e6:.1f} MB per chunk is small and "
-            f"there are {_n_chunks} chunks — try options.chunk_size ≈ {_suggested} "
-            f"(currently {options.chunk_size})"
+            f"there are {_n_chunks} chunks"
         )
 
     # Per-block memory footprint in the main loop
@@ -535,19 +588,15 @@ def main() -> None:
         f"{_block_bytes / 1e9:.3f} GB"
     )
     if _block_bytes > 1e9:
-        _suggested = max(1, int(_BLOCK_TARGET_BYTES / (_n_time * _itemsize)))
         logging.warning(
             f"TUNING block_size: {_block_bytes / 1e9:.2f} GB per block is large "
-            f"— try options.block_size ≈ {_suggested} (currently {options.block_size})"
         )
     elif _block_bytes < 20e6 and _n_blocks > 20:
-        _suggested = max(1, int(_BLOCK_TARGET_BYTES / (_n_time * _itemsize)))
         # Don't recommend more than the total number of points
         _suggested = min(_suggested, _n_points)
         logging.warning(
             f"TUNING block_size: {_block_bytes / 1e6:.1f} MB per block is small and "
-            f"there are {_n_blocks} blocks — try options.block_size ≈ {_suggested} "
-            f"(currently {options.block_size})"
+            f"there are {_n_blocks} blocks"
         )
 
     # Combined peak estimate (block being built + one chunk live in dask's hands)
@@ -562,7 +611,7 @@ def main() -> None:
     if 0:
         logging.info(f"DIAGNOSTIC: chunks = {input_data[options.y_key].chunks}")
         logging.info(f"DIAGNOSTIC: input_data dims = {dict(input_data.sizes)}")
-        logging.info(f"DIAGNOSTIC: time dtype = {input_data[options.x_key].dtype}")
+        logging.info(f"DIAGNOSTIC: time dtype = {input_data[options.time_key].dtype}")
         _data_var = input_data[options.y_key]
         _total = int(_data_var.size)
         _stats = xr.Dataset({
@@ -584,15 +633,15 @@ def main() -> None:
         logging.info("Using all lat/lon points.")
 
     # Ensure even number of time steps for NFFT
-    if input_data.sizes[options.x_key] % 2 == 1:
+    if input_data.sizes[options.time_key] % 2 == 1:
         logging.info(
-            f"Deleting last data point because number of time stamps needs to be even for NFFT. Before deletion: {input_data.sizes[options.x_key] = }"
+            f"Deleting last data point because number of time stamps needs to be even for NFFT. Before deletion: {input_data.sizes[options.time_key] = }"
         )
-        input_data = input_data.isel({options.x_key: slice(None, -1)})
+        input_data = input_data.isel({options.time_key: slice(None, -1)})
 
     # Validate min/max period against available NFFT periods
     # Pick a grid point with valid data (index 0 may be land/pole)
-    _first_time = input_data[options.y_key].isel({options.x_key: 0}).values
+    _first_time = input_data[options.y_key].isel({options.time_key: 0}).values
     _valid_pts = np.argwhere(np.isfinite(_first_time))
     if len(_valid_pts) > 0:
         _mid = len(_valid_pts) // 2
@@ -637,47 +686,46 @@ def main() -> None:
     # HOT PATH — optimized computation loop
     # ===================================================================
     hot_start = timeit.default_timer()
-    logging.info("Starting timeseries_to_xyz...")
 
     # === PRE-COMPUTATION (outside loop) ===
     stacked = input_data.stack(latlon=[options.lat_key, options.lon_key])
     latlon_coord = stacked["latlon"]
 
     # Extract time coord (small) and keep data lazy
-    times = stacked[options.x_key].values
+    times = stacked[options.time_key].values
     data_lazy = stacked[options.y_key]   # dask-backed DataArray
     n_times = len(times)
     n_points = stacked.sizes["latlon"]
 
     logging.info(
         f"Full data_2d would be {n_times} × {n_points} × 4 bytes = "
-        f"{n_times * n_points * 4 / 1e9:.2f} GB — loading in blocks instead."
+        f"{n_times * n_points * 4 / 1e9:.2f} GB — loading in blocks."
     )
 
     # Time axis in days (shared across all grid points)
-    x_days = (times - times[0]) / np.timedelta64(1, "D")
+    time_days = (times - times[0]) / np.timedelta64(1, "D")
 
     # --- DIAGNOSTIC: Check time conversion ---
-    logging.info(f"DIAG: times dtype = {times.dtype}")
-    logging.info(f"DIAG: x_days range = [{x_days.min():.4f}, {x_days.max():.4f}] days")
-    if x_days.max() < 1.0:
-        logging.error("DIAG: CRITICAL - x_days span < 1 day! Time conversion may be wrong.")
+    logging.info(f"DIAGNOSTIC: times dtype = {times.dtype}")
+    logging.info(f"DIAGNOSTIC: time_days range = [{time_days.min():.4f}, {time_days.max():.4f}] days")
+    if time_days.max() < 1.0:
+        logging.error("DIAGNOSTIC: CRITICAL - time_days span < 1 day! Time conversion may be wrong.")
 
     # Ensure even length for NFFT
-    N = len(x_days)
+    N = len(time_days)
     if N % 2:
         logging.info(f"Trimming last time step for even NFFT length: {N} -> {N - 1}")
-        x_days = x_days[:-1]
+        time_days = time_days[:-1]
         n_times -= 1
         N -= 1
 
     # Detrending design matrix: [constant, trend, accel] (shared)
-    design_matrix = np.column_stack([np.ones(N), x_days, x_days**2])
+    design_matrix = np.column_stack([np.ones(N), time_days, time_days**2])
 
     # NFFT parameters (shared)
-    x_min = x_days.min()
-    x_range = x_days.max() - x_min
-    x_norm = (x_days - x_min) / x_range - 0.5
+    x_min = time_days.min()
+    x_range = time_days.max() - x_min
+    x_norm = (time_days - x_min) / x_range - 0.5
     k = -(N // 2) + np.arange(N)
     xf = k / x_range
     xf_half = xf[N // 2 + 1 :]  # positive frequencies, ascending
@@ -752,17 +800,17 @@ def main() -> None:
                     if n_valid_pts < 6:
                         continue
                     y = y[valid_idx]
-                    y_x_days = x_days[valid_idx]
+                    y_time_days = time_days[valid_idx]
                     # Recompute per-point NFFT parameters for the reduced series
                     y_N = n_valid_pts
                     if y_N % 2:
                         y = y[:-1]
-                        y_x_days = y_x_days[:-1]
+                        y_time_days = y_time_days[:-1]
                         y_N -= 1
-                    y_x_min = y_x_days.min()
-                    y_x_range = y_x_days.max() - y_x_min
-                    y_x_norm = (y_x_days - y_x_min) / y_x_range - 0.5
-                    y_design = np.column_stack([np.ones(y_N), y_x_days, y_x_days**2])
+                    y_x_min = y_time_days.min()
+                    y_x_range = y_time_days.max() - y_x_min
+                    y_x_norm = (y_time_days - y_x_min) / y_x_range - 0.5
+                    y_design = np.column_stack([np.ones(y_N), y_time_days, y_time_days**2])
                     y_k = -(y_N // 2) + np.arange(y_N)
                     y_xf_half = (y_k / y_x_range)[y_N // 2 + 1 :]
                     y_periods_asc = (1.0 / y_xf_half)[::-1]
@@ -827,12 +875,12 @@ def main() -> None:
     # --- DIAGNOSTIC: Check xyz_results ---
     _xyz_valid = int(np.any(np.isfinite(xyz_results), axis=1).sum())
     _xyz_nan = int(np.all(np.isnan(xyz_results), axis=1).sum())
-    logging.info(f"DIAG: xyz_results: {_xyz_valid} valid, {_xyz_nan} all-NaN, {n_points} total")
+    logging.info(f"DIAGNOSTIC: xyz_results: {_xyz_valid} valid, {_xyz_nan} all-NaN, {n_points} total")
     if _xyz_valid > 0:
         _y_valid = xyz_results[np.isfinite(xyz_results[:, 1]), 1]
-        logging.info(f"DIAG: Y range = [{_y_valid.min():.6e}, {_y_valid.max():.6e}]")
+        logging.info(f"DIAGNOSTIC: Y range = [{_y_valid.min():.6e}, {_y_valid.max():.6e}]")
     else:
-        logging.error("DIAG: CRITICAL - ALL xyz_results are NaN!")
+        logging.error("DIAGNOSTIC: CRITICAL - ALL xyz_results are NaN!")
 
     # === POST-LOOP: Normalize XYZ ===
     max_y = np.nanmax(xyz_results[:, 1])
@@ -875,14 +923,14 @@ def main() -> None:
     rgb_arr /= highest_value
 
     # --- DIAGNOSTIC: Check normalization ---
-    logging.info(f"DIAG: max_y = {max_y:.6e}, highest_value = {highest_value:.6e}")
+    logging.info(f"DIAGNOSTIC: max_y = {max_y:.6e}, highest_value = {highest_value:.6e}")
     _rgb_valid_mask = ~np.any(np.isnan(rgb_arr), axis=0)
     _n_rgb_valid = int(_rgb_valid_mask.sum())
     if _n_rgb_valid > 0:
         _rgb_valid_vals = rgb_arr[:, _rgb_valid_mask]
-        logging.info(f"DIAG: RGB valid points: {_n_rgb_valid}, range=[{_rgb_valid_vals.min():.6f}, {_rgb_valid_vals.max():.6f}]")
+        logging.info(f"DIAGNOSTIC: RGB valid points: {_n_rgb_valid}, range=[{_rgb_valid_vals.min():.6f}, {_rgb_valid_vals.max():.6f}]")
     else:
-        logging.error("DIAG: CRITICAL - ALL RGB values are NaN!")
+        logging.error("DIAGNOSTIC: CRITICAL - ALL RGB values are NaN!")
 
     # === POST-LOOP: Apply BT.709 gamma correction (Hughes & Williams 2010, eqs. A7-A8) ===
     if not options.use_new_funcs:
@@ -926,71 +974,20 @@ def main() -> None:
     # ===================================================================
     # Save outputs and plot
     # ===================================================================
-    # Save XYZ tristimulus NetCDFs
-    for thekey in ["x", "y", "z"]:
-        da = spectral_color_maps[thekey]
-        filename = options.output_folder / f"{thekey}.nc"
-        da.coords[options.lat_key].attrs = {
-            "units": "degrees_north",
-            "long_name": "Latitude",
-        }
-        da.coords[options.lon_key].attrs = {
-            "units": "degrees_east",
-            "long_name": "Longitude",
-        }
-        da.attrs["long_name"] = f"Spectral color {thekey}"
-        da.attrs["units"] = "dimensionless"
-        logging.info(f"Saving {os.fspath(filename)}...")
-        da.to_netcdf(filename)
-
-    # Save RGB NetCDFs at [0, 1] range (matches reference output)
-    for thekey in ["red", "green", "blue"]:
-        da = spectral_color_maps[thekey]
-        filename = options.output_folder / f"{thekey}.nc"
-        da.coords[options.lat_key].attrs = {
-            "units": "degrees_north",
-            "long_name": "Latitude",
-        }
-        da.coords[options.lon_key].attrs = {
-            "units": "degrees_east",
-            "long_name": "Longitude",
-        }
-        da.attrs["long_name"] = f"Spectral color {thekey}"
-        da.attrs["units"] = "dimensionless"
-        logging.info(f"Saving {os.fspath(filename)}...")
-        da.to_netcdf(filename)
-
-    # Save RGB NetCDFs scaled to [0, 255] for GMT (grdimage expects byte range)
-    for thekey in ["red", "green", "blue"]:
-        scaled = spectral_color_maps[thekey] * 255.0
-        gmt_file = options.output_folder / f"{thekey}_gmt.nc"
-        scaled.coords[options.lat_key].attrs = {
-            "units": "degrees_north",
-            "long_name": "Latitude",
-        }
-        scaled.coords[options.lon_key].attrs = {
-            "units": "degrees_east",
-            "long_name": "Longitude",
-        }
-        scaled.attrs["long_name"] = f"Spectral color {thekey} (scaled 0-255)"
-        scaled.attrs["units"] = "dimensionless"
-        logging.info(f"Saving {os.fspath(gmt_file)} (scaled to [0,255] for GMT)...")
-        scaled.to_netcdf(gmt_file)
-    logging.info("Finished saving NetCDFs.")
 
     # Plot individual variables as projected maps
     map_projection = _get_cartopy_projection(options.plot_options.projection)
-    for thekey in spectral_color_maps.keys():
-        plot_map(
-            spectral_color_maps[thekey],
-            lat_key=options.lat_key,
-            lon_key=options.lon_key,
-            projection=map_projection,
-            title=thekey,
-            output_path=options.output_folder / f"output_{thekey}.png",
-            plot_options=options.plot_options,
-            colorbar_label=thekey,
-        )
+    # for thekey in spectral_color_maps.keys():
+    #     plot_map(
+    #         spectral_color_maps[thekey],
+    #         lat_key=options.lat_key,
+    #         lon_key=options.lon_key,
+    #         projection=map_projection,
+    #         title=thekey,
+    #         output_path=options.output_folder / f"output_{thekey}.png",
+    #         plot_options=options.plot_options,
+    #         colorbar_label=thekey,
+    #     )
 
     # Plot composite RGB map
     plot_rgb_map(
@@ -1000,12 +997,64 @@ def main() -> None:
         lat_key=options.lat_key,
         lon_key=options.lon_key,
         projection=map_projection,
-        title=f"{options.y_key}, periods {options.min_period / 7.0:.0f}-{options.max_period / 7.0:.0f} weeks,{funcs_desc}",
-        output_path=options.output_folder / "image_matplotlib.png",
+        title=f"{options.input_choice}, periods {options.min_period / 7.0:.0f}-{options.max_period / 7.0:.0f} weeks,{funcs_desc}",
+        output_path=options.output_folder / f"{options.input_choice}_map_matplotlib.png",
         plot_options=options.plot_options,
     )
 
     if not options.plot_options.no_gmt_plots:
+        # Save XYZ tristimulus NetCDFs
+        for thekey in ["x", "y", "z"]:
+            da = spectral_color_maps[thekey]
+            filename = options.output_folder / f"{thekey}.nc"
+            da.coords[options.lat_key].attrs = {
+                "units": "degrees_north",
+                "long_name": "Latitude",
+            }
+            da.coords[options.lon_key].attrs = {
+                "units": "degrees_east",
+                "long_name": "Longitude",
+            }
+            da.attrs["long_name"] = f"Spectral color {thekey}"
+            da.attrs["units"] = "dimensionless"
+            logging.info(f"Saving {os.fspath(filename)}...")
+            da.to_netcdf(filename)
+
+        # Save RGB NetCDFs at [0, 1] range (matches reference output)
+        for thekey in ["red", "green", "blue"]:
+            da = spectral_color_maps[thekey]
+            filename = options.output_folder / f"{thekey}.nc"
+            da.coords[options.lat_key].attrs = {
+                "units": "degrees_north",
+                "long_name": "Latitude",
+            }
+            da.coords[options.lon_key].attrs = {
+                "units": "degrees_east",
+                "long_name": "Longitude",
+            }
+            da.attrs["long_name"] = f"Spectral color {thekey}"
+            da.attrs["units"] = "dimensionless"
+            logging.info(f"Saving {os.fspath(filename)}...")
+            da.to_netcdf(filename)
+
+        # Save RGB NetCDFs scaled to [0, 255] for GMT (grdimage expects byte range)
+        for thekey in ["red", "green", "blue"]:
+            scaled = spectral_color_maps[thekey] * 255.0
+            gmt_file = options.output_folder / f"{thekey}_gmt.nc"
+            scaled.coords[options.lat_key].attrs = {
+                "units": "degrees_north",
+                "long_name": "Latitude",
+            }
+            scaled.coords[options.lon_key].attrs = {
+                "units": "degrees_east",
+                "long_name": "Longitude",
+            }
+            scaled.attrs["long_name"] = f"Spectral color {thekey} (scaled 0-255)"
+            scaled.attrs["units"] = "dimensionless"
+            logging.info(f"Saving {os.fspath(gmt_file)} (scaled to [0,255] for GMT)...")
+            scaled.to_netcdf(gmt_file)
+        logging.info("Finished saving NetCDFs.")
+
         write_rgb_colorscale(options, cie)
         write_gmt_scripts(options)
         run_gmt_scripts(options)
@@ -1347,7 +1396,7 @@ def synthetic_timeseries(
 
     Args:
         options:              Options object. Contains:
-                                  - x_key: Time coordinate name.
+                                  - time_key: Time coordinate name.
                                   - y_key: Variable name.
         signal:               Signal type ("annual").
         signal_amplitude:     Amplitude of the signal.
@@ -1383,19 +1432,19 @@ def synthetic_timeseries(
     measurements = signal_values + noise_values
 
     return xr.Dataset(
-        {options.y_key: (options.x_key, measurements)},
-        coords={options.x_key: dates},
+        {options.y_key: (options.time_key, measurements)},
+        coords={options.time_key: dates},
     )
 
 
 def fancy_detrend(
-    timeseries: xr.Dataset, x_key: str, y_key: str, terms: list[str] | None = None
+    timeseries: xr.Dataset, time_key: str, y_key: str, terms: list[str] | None = None
 ) -> tuple[xr.Dataset, dict[str, float]]:
     """Detrend a timeseries using OLS regression.
 
     Args:
         timeseries: Input timeseries dataset.
-        x_key:      Name of the time coordinate.
+        time_key:   Name of the time coordinate.
         y_key:      Name of the data variable.
         terms:      Regression terms (e.g. ["constant", "trend", "accel"]).
 
@@ -1405,7 +1454,7 @@ def fancy_detrend(
     if terms is None:
         terms = ["constant", "trend"]
 
-    x = (timeseries[x_key] - timeseries[x_key][0]).values / np.timedelta64(1, "D")
+    x = (timeseries[time_key] - timeseries[time_key][0]).values / np.timedelta64(1, "D")
     y = timeseries[y_key].values.squeeze()
 
     design_matrix = []
@@ -1451,20 +1500,20 @@ def fancy_detrend(
 
 
 def turn_fits_into_timeseries(
-    timeseries: xr.Dataset, x_key: str, y_key: str, fits: dict[str, float]
+    timeseries: xr.Dataset, time_key: str, y_key: str, fits: dict[str, float]
 ) -> xr.Dataset:
     """Reconstruct a timeseries from fit coefficients.
 
     Args:
         timeseries: Original timeseries (provides time axis and shape).
-        x_key:      Name of the time coordinate.
+        time_key:   Name of the time coordinate.
         y_key:      Name of the data variable.
         fits:       Dict of fit coefficients from fancy_detrend.
 
     Returns:
         Dataset with reconstructed fitted values.
     """
-    x = (timeseries[x_key] - timeseries[x_key][0]).values / np.timedelta64(1, "D")
+    x = (timeseries[time_key] - timeseries[time_key][0]).values / np.timedelta64(1, "D")
     fitted_values = np.zeros_like(x)
 
     for term, fit_value in fits.items():
@@ -1496,7 +1545,7 @@ def nfft_power(options: Options, timeseries: xr.Dataset) -> xr.Dataset:
 
     Args:
         options:    Options object. Contains:
-                        - x_key: Time coordinate name.
+                        - time_key: Time coordinate name.
                         - y_key: Variable name.
         timeseries: Input timeseries dataset.
 
@@ -1504,7 +1553,7 @@ def nfft_power(options: Options, timeseries: xr.Dataset) -> xr.Dataset:
         Dataset with 'power' variable and 'frequency' coordinate.
     """
     x = (
-        (timeseries[options.x_key] - timeseries[options.x_key][0]).values.squeeze()
+        (timeseries[options.time_key] - timeseries[options.time_key][0]).values.squeeze()
         / np.timedelta64(1, "D")
     )
     y = timeseries[options.y_key].values.squeeze()
@@ -1671,7 +1720,7 @@ def plot_timeseries(options: Options, ds: xr.Dataset, title: str) -> None:
     Args:
         options: Options object. Contains:
                      - figsize:       Figure size.
-                     - x_key:         Time coordinate name.
+                     - time_key:      Time coordinate name.
                      - y_key:         Variable name.
                      - output_folder: Output directory.
                      - dpi:           DPI for saved image.
@@ -1679,8 +1728,8 @@ def plot_timeseries(options: Options, ds: xr.Dataset, title: str) -> None:
         title:   Plot title.
     """
     plt.figure(figsize=options.figsize)
-    plt.plot(ds[options.x_key], ds[options.y_key], color="lime")
-    plt.scatter(ds[options.x_key], ds[options.y_key], marker="s", color="cyan", s=10)
+    plt.plot(ds[options.time_key], ds[options.y_key], color="lime")
+    plt.scatter(ds[options.time_key], ds[options.y_key], marker="s", color="cyan", s=10)
     plt.title(title, color="white")
     date_str = dt.datetime.now().strftime("%Y%m%d-%H%M%S")
     filename = options.output_folder / f"{date_str}_{title.replace(' ', '_')}.png"
@@ -2001,7 +2050,7 @@ def load_ssha_files(options: Options) -> xr.Dataset:
         compat="override",
         combine="by_coords",
         parallel=options.mf_parallel,
-        chunks={options.x_key: options.chunk_size},
+        chunks={options.time_key: options.fake_chunk},
     )
     return input_data
 
@@ -2080,7 +2129,7 @@ def load_mur_sst_files(options: Options) -> xr.Dataset:
         compat="override",
         combine="by_coords",
         parallel=options.mf_parallel,
-        chunks={options.x_key: options.chunk_size},
+        chunks={options.time_key: options.fake_chunk},
     )
     return input_data
 
@@ -2116,7 +2165,7 @@ def load_aqua_modis_files(options: Options) -> xr.Dataset:
         compat="override",
         combine="by_coords",
         parallel=options.mf_parallel,
-        chunks={options.x_key: options.chunk_size},
+        chunks={options.time_key: options.fake_chunk},
     )
 
     return input_data
@@ -2152,7 +2201,7 @@ def load_simple_grid_files(options: Options) -> xr.Dataset:
 
     def _preprocess(ds: xr.Dataset) -> xr.Dataset:
         """Promote scalar time variable to a dimension coordinate."""
-        keep = {options.y_key, options.x_key}
+        keep = {options.y_key, options.time_key}
         drop = set(ds.data_vars) - keep
         ds = ds.drop_vars(drop, errors="ignore")
         if options.xskip > 1:
@@ -2160,7 +2209,7 @@ def load_simple_grid_files(options: Options) -> xr.Dataset:
                 options.lat_key: slice(None, None, options.xskip),
                 options.lon_key: slice(None, None, options.xskip),
             })
-        ds = ds.set_coords(options.x_key).expand_dims(options.x_key)
+        ds = ds.set_coords(options.time_key).expand_dims(options.time_key)
         ds[options.y_key] = ds[options.y_key].astype(np.float32, copy=False)
         return ds
 
@@ -2168,12 +2217,12 @@ def load_simple_grid_files(options: Options) -> xr.Dataset:
         tskip_files,
         preprocess=_preprocess,
         combine="nested",
-        concat_dim=options.x_key,
+        concat_dim=options.time_key,
         data_vars="minimal",
         coords="minimal",
         compat="override",
         parallel=options.mf_parallel,
-        chunks={options.x_key: options.chunk_size},
+        chunks={options.time_key: options.fake_chunk},
     )
     return input_data
 
@@ -2189,7 +2238,7 @@ def extract_ssha_timeseries(
     """Extract a single-point SSHA timeseries at given coordinates.
 
     Args:
-        options: Options object (x_key, y_key).
+        options: Options object (time_key, y_key).
         ds:      Full SSHA dataset.
         lat:     Latitude (degrees).
         lon:     Longitude (degrees, converted to 0-360 if negative).
@@ -2206,8 +2255,8 @@ def extract_ssha_timeseries(
     )
 
     ds = xr.Dataset(
-        {options.y_key: (options.x_key, measurements)},
-        coords={options.x_key: ds[options.x_key].values},
+        {options.y_key: (options.time_key, measurements)},
+        coords={options.time_key: ds[options.time_key].values},
     )
     return ds
 
@@ -2215,7 +2264,7 @@ def extract_ssha_timeseries(
 def timeseries_to_xyz(
     options: Options,
     timeseries: xr.Dataset,
-    x_key: str,
+    time_key: str,
     y_key: str,
     min_period: float,
     max_period: float,
@@ -2227,7 +2276,7 @@ def timeseries_to_xyz(
     Args:
         options:          Options object (lat_key, lon_key).
         timeseries:       Input timeseries dataset.
-        x_key:            Time coordinate name.
+        time_key:         Time coordinate name.
         y_key:            Data variable name.
         min_period:       Minimum period for spectrum mapping.
         max_period:       Maximum period for spectrum mapping.
@@ -2247,12 +2296,7 @@ def timeseries_to_xyz(
         xyz["y"] = lon * lon * lon * lon
         return xyz
 
-    fit_terms = []
-    fit_terms += ["constant", "trend", "accel"]
-    # fit_terms += ['annual']
-    # fit_terms += ['semiannual']
-    # fit_terms += ['annual','semiannual']
-    timeseries, fits = fancy_detrend(timeseries, x_key, y_key, terms=fit_terms)
+    timeseries, fits = fancy_detrend(timeseries, time_key, y_key, terms=options.fit_terms)
 
     # Perform non-uniform FFT to get power spectrum.
     power_spectrum = nfft_power(options, timeseries)
@@ -3060,7 +3104,7 @@ def run_gmt_scripts(options: Options) -> None:
 
     Args:
         options: Options object. Contains:
-                     - output_folder: Path to the output directory.
+                 - output_folder: Path to the output directory.
     """
     script_path = options.output_folder / "create_plots.sh"
     script_path.chmod(0o755)
