@@ -14,7 +14,6 @@ import subprocess
 import sys
 import timeit
 import zipfile
-from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, BinaryIO, Final
@@ -26,8 +25,6 @@ import h5py  # noqa: F401 — needed by xarray for NetCDF4 backend
 import matplotlib.pyplot as plt
 import nfft
 import numpy as np
-import pandas as pd
-import statsmodels.api as sm
 import xarray as xr
 from colour import SpectralDistribution, XYZ_to_sRGB, sd_to_XYZ
 from colour.colorimetry import MSDS_CMFS_STANDARD_OBSERVER
@@ -36,7 +33,7 @@ from tqdm import tqdm
 dask.config.set(scheduler="synchronous")
 import gc
 
-__version__ = "0.1.9"
+__version__ = "0.1.8"
 DAYS_IN_YEAR: Final[float] = 365.25
 
 # XYZ-to-linear-sRGB matrix (Hughes & Williams 2010, no gamma correction)
@@ -495,15 +492,7 @@ def main() -> None:
     plt.rcParams["font.size"] = 14
     plt.rcParams["axes.linewidth"] = 2
 
-    # Function variant selection
-    if options.use_new_funcs:
-        spectrum2xyz_fn = spectrum2xyz_new
-        xyz2rgb_fn = xyz2rgb_new
-        funcs_desc = " NEW functions"
-    else:
-        spectrum2xyz_fn = spectrum2xyz_old
-        xyz2rgb_fn = xyz2rgb_old
-        funcs_desc = " OLD functions"
+    funcs_desc = " NEW functions" if options.use_new_funcs else " OLD functions"
 
     # Configure data keys per input_choice
     configure_keys_for_input(options)
@@ -1024,19 +1013,7 @@ def main() -> None:
     # Save outputs and plot
     # ===================================================================
 
-    # Plot individual variables as projected maps
     map_projection = _get_cartopy_projection(options.plot_options.projection)
-    # for thekey in spectral_color_maps.keys():
-    #     plot_map(
-    #         spectral_color_maps[thekey],
-    #         lat_key=options.lat_key,
-    #         lon_key=options.lon_key,
-    #         projection=map_projection,
-    #         title=thekey,
-    #         output_path=options.output_folder / f"output_{thekey}.png",
-    #         plot_options=options.plot_options,
-    #         colorbar_label=thekey,
-    #     )
 
     # Plot composite RGB map
     plot_rgb_map(
@@ -1154,148 +1131,6 @@ def build_design_matrix(time_days: np.ndarray, fit_terms: list[str]) -> np.ndarr
     return np.column_stack(columns)
 
 
-def gaussian(x: np.ndarray, mu: float, sig: float) -> np.ndarray:
-    """Compute a Gaussian function."""
-    return np.exp(-np.power(x - mu, 2.0) / (2 * np.power(sig, 2.0)))
-
-
-def spectrum2xyz_old(spectrum: xr.Dataset, cie: xr.Dataset) -> xr.Dataset:
-    """Convert a power spectrum to XYZ tristimulus values using Riemann sum integration."""
-    xyz = {}
-    wavelength_step_size = np.diff(cie["wavelength"].values).mean()
-    for l in ["x", "y", "z"]:
-        temp_values = spectrum["power"].values * cie[l].values
-        xyz[l] = temp_values.sum() * wavelength_step_size
-    return xr.Dataset(xyz)
-
-
-def spectrum2xyz_new(spectrum: xr.Dataset, cie: xr.Dataset) -> xr.Dataset:
-    """Convert a power spectrum to XYZ tristimulus values using colour-science.
-
-    Args:
-        spectrum: Dataset with 'power' variable and 'wavelength' coordinate.
-        cie:      CIE color matching functions (unused, kept for API compatibility).
-
-    Returns:
-        Dataset with 'x', 'y', 'z' tristimulus values.
-    """
-    spd = SpectralDistribution(
-        spectrum["power"].values, spectrum.coords["wavelength"].values
-    )
-    cmfs = MSDS_CMFS_STANDARD_OBSERVER["CIE 1931 2 Degree Standard Observer"]
-    XYZ = sd_to_XYZ(spd, cmfs)
-    return xr.Dataset({"x": XYZ[0], "y": XYZ[1], "z": XYZ[2]})
-
-
-def raise_y_to_power(xyz: xr.Dataset, power: float) -> xr.Dataset:
-    """Raise Y to a power while keeping chromaticity constant."""
-    power = 1 - power
-    factor = pow(xyz["y"].values, power)
-    for key in xyz.data_vars:
-        xyz[key].values /= factor
-    return xyz
-
-
-def xyz2rgb_old(xyz: xr.Dataset) -> xr.Dataset:
-    """Convert XYZ to linear sRGB using a manual matrix multiply (no gamma)."""
-    A = np.array(
-        [
-            [3.2409699, -1.5373832, -0.49861079],
-            [-0.96924375, 1.8759676, 0.041555082],
-            [0.055630032, -0.20397685, 1.0569714],
-        ]
-    )
-
-    xyz_vector = np.array(
-        [
-            xyz["x"].values.squeeze(),
-            xyz["y"].values.squeeze(),
-            xyz["z"].values.squeeze(),
-        ]
-    )
-    rgb_vals = np.dot(A, xyz_vector)
-    rgb_ds = xr.Dataset({"red": rgb_vals[0], "green": rgb_vals[1], "blue": rgb_vals[2]})
-    result = xr.merge([xyz, rgb_ds])
-    return result
-
-
-def xyz2rgb_new(xyz: xr.Dataset) -> xr.Dataset:
-    """Convert XYZ to sRGB using colour-science."""
-    XYZ = np.array(
-        [
-            xyz["x"].values.squeeze(),
-            xyz["y"].values.squeeze(),
-            xyz["z"].values.squeeze(),
-        ]
-    )
-    RGB = XYZ_to_sRGB(XYZ)
-    rgb = xr.Dataset({"red": RGB[0], "green": RGB[1], "blue": RGB[2]})
-    result = xr.merge([xyz, rgb])
-    return result
-
-
-def fix_gamut(rgb: xr.Dataset) -> xr.Dataset:
-    """Fix out-of-gamut RGB values by adding white light to make all values positive."""
-    R = rgb["red"].values.squeeze()
-    G = rgb["green"].values.squeeze()
-    B = rgb["blue"].values.squeeze()
-    rgb_values = np.array([R, G, B])
-
-    if np.any(np.isnan(rgb_values)):
-        return rgb
-
-    min_val = rgb_values.min()
-    if min_val < 0:
-        # Make "min" positive as in paper's appendix, and add 1/255 so the rescale value isn't 0.
-        min_val = -min_val + 1.0 / 255.0
-        # This factor rescales the luminance back to its original value.
-        factor = rgb["y"].values.squeeze() / (rgb["y"].values.squeeze() + min_val)
-        rgb_values = (rgb_values + min_val) * factor
-
-    result = xr.Dataset(
-        {
-            "x": rgb["x"],
-            "y": rgb["y"],
-            "z": rgb["z"],
-            "red": rgb_values[0],
-            "green": rgb_values[1],
-            "blue": rgb_values[2],
-        }
-    )
-    return result
-
-
-def gamma_correct_rgb(rgb: xr.Dataset) -> xr.Dataset:
-    """Apply BT.709 gamma correction to RGB values."""
-    gamma_inv = 0.45
-    crit = 0.018  # RGB values are gamma corrected differently below and above crit.
-    h = 4.506813168
-    g = -0.09914989
-    f = 1.09914989
-    for key in ["red", "green", "blue"]:
-        # Typo in Hughes and Williams 2010 equation A7, compared to Charles Poynton's GammaFAQ:
-        # http://www.poynton.com/GammaFAQ.html
-        vals = rgb[key].values.copy()
-        low = vals <= crit
-        vals[low] *= h
-        vals[~low] = f * np.power(vals[~low], gamma_inv) + g
-        rgb[key] = (rgb[key].dims, vals)
-    return rgb
-
-
-def rms_and_mean(x: xr.DataArray) -> xr.Dataset:
-    """Compute RMS and mean of an array."""
-    rms_value = np.sqrt(np.mean(x**2))
-    mean_value = np.mean(x)
-    return xr.Dataset({"rms": rms_value, "mean": mean_value})
-
-
-def normalize_data(data: Any, max_value: float) -> list[float]:
-    """Normalize data by dividing by max_value."""
-    return [i / max_value for i in data]
-
-
-# ---------------------------------------------------------------------------
 # ---------------------------------------------------------------------------
 # Populate dataclasses from computed results
 # ---------------------------------------------------------------------------
@@ -1451,159 +1286,6 @@ def load_cie_functions(options: Options) -> xr.Dataset:
     return da
 
 
-def synthetic_spectrum(cie: xr.Dataset, mu: float, sig: float) -> xr.Dataset:
-    """Create a synthetic Gaussian spectrum on the CIE wavelength grid."""
-    wavelengths = cie.coords["wavelength"].values
-    power = gaussian(wavelengths, mu, sig)
-    spectrum = xr.DataArray(
-        power, coords=[("wavelength", wavelengths)], name="power"
-    ).to_dataset()
-    return spectrum
-
-
-def synthetic_timeseries(
-    options: Options,
-    signal: str = "annual",
-    signal_amplitude: float = 1,
-    noise: str = "white",
-    noise_level: float = 0.1,
-    temporal_resolution: str = "monthly",
-    time_start: dt.datetime = dt.datetime(2001, 1, 1),
-    time_stop: dt.datetime = dt.datetime(2005, 1, 1),
-) -> xr.Dataset:
-    """Generate a synthetic timeseries with signal and noise.
-
-    Args:
-        options:              Options object. Contains:
-                                  - time_key: Time coordinate name.
-                                  - y_key: Variable name.
-        signal:               Signal type ("annual").
-        signal_amplitude:     Amplitude of the signal.
-        noise:                Noise type ("white").
-        noise_level:          Standard deviation of noise.
-        temporal_resolution:  "monthly" or "daily".
-        time_start:           Start date.
-        time_stop:            End date.
-
-    Returns:
-        Dataset with the synthetic timeseries.
-    """
-    if temporal_resolution == "monthly":
-        dates = pd.date_range(start=time_start, end=time_stop, freq="M") + pd.Timedelta(
-            days=15
-        )
-    elif temporal_resolution == "daily":
-        dates = pd.date_range(start=time_start, end=time_stop, freq="D")
-    else:
-        logging.error(f"!!!WARNING!!! {temporal_resolution = }")
-
-    if signal == "annual":
-        t = (dates - time_start).days / 365.25
-        signal_values = signal_amplitude * np.sin(2 * np.pi * t)
-    else:
-        logging.error(f"!!!WARNING!!! {signal = }")
-
-    if noise == "white":
-        noise_values = noise_level * np.random.randn(len(dates))
-    else:
-        logging.error(f"!!!WARNING!!! {noise = }")
-
-    measurements = signal_values + noise_values
-
-    return xr.Dataset(
-        {options.y_key: (options.time_key, measurements)},
-        coords={options.time_key: dates},
-    )
-
-
-def fancy_detrend(
-    timeseries: xr.Dataset, time_key: str, y_key: str, terms: list[str] | None = None
-) -> tuple[xr.Dataset, dict[str, float]]:
-    """Detrend a timeseries using OLS regression.
-
-    Args:
-        timeseries: Input timeseries dataset.
-        time_key:   Name of the time coordinate.
-        y_key:      Name of the data variable.
-        terms:      Regression terms (e.g. ["constant", "trend", "accel"]).
-
-    Returns:
-        Tuple of (detrended timeseries, dict of fit coefficients).
-    """
-    if terms is None:
-        terms = ["constant", "trend"]
-
-    x = (timeseries[time_key] - timeseries[time_key][0]).values / np.timedelta64(1, "D")
-    y = timeseries[y_key].values.squeeze()
-
-    design_matrix = build_design_matrix(x, terms)
-
-    model = sm.OLS(y, design_matrix)
-    result = model.fit()
-
-    detrended_y = y - result.fittedvalues
-
-    detrended_timeseries = timeseries.copy()
-    detrended_timeseries[y_key] = (
-        timeseries[y_key].dims,
-        detrended_y.reshape(timeseries[y_key].shape),
-    )
-
-    fits: dict[str, float] = {}
-    for i, term in enumerate(terms):
-        if term == "annual":
-            fits["annual_sin"] = result.params[i]
-            fits["annual_cos"] = result.params[i + 1]
-        elif term == "semiannual":
-            fits["semiannual_sin"] = result.params[i]
-            fits["semiannual_cos"] = result.params[i + 1]
-        else:
-            fits[term] = result.params[i]
-
-    return detrended_timeseries, fits
-
-
-def turn_fits_into_timeseries(
-    timeseries: xr.Dataset, time_key: str, y_key: str, fits: dict[str, float]
-) -> xr.Dataset:
-    """Reconstruct a timeseries from fit coefficients.
-
-    Args:
-        timeseries: Original timeseries (provides time axis and shape).
-        time_key:   Name of the time coordinate.
-        y_key:      Name of the data variable.
-        fits:       Dict of fit coefficients from fancy_detrend.
-
-    Returns:
-        Dataset with reconstructed fitted values.
-    """
-    x = (timeseries[time_key] - timeseries[time_key][0]).values / np.timedelta64(1, "D")
-    fitted_values = np.zeros_like(x)
-
-    for term, fit_value in fits.items():
-        if term == "constant":
-            fitted_values += fit_value
-        elif term == "trend":
-            fitted_values += fit_value * x
-        elif term == "accel":
-            fitted_values += fit_value * x**2
-        elif term == "annual_sin":
-            fitted_values += fit_value * np.sin(2 * np.pi * x / DAYS_IN_YEAR)
-        elif term == "annual_cos":
-            fitted_values += fit_value * np.cos(2 * np.pi * x / DAYS_IN_YEAR)
-        elif term == "semiannual_sin":
-            fitted_values += fit_value * np.sin(2 * np.pi * x / DAYS_IN_YEAR / 2.0)
-        elif term == "semiannual_cos":
-            fitted_values += fit_value * np.cos(2 * np.pi * x / DAYS_IN_YEAR / 2.0)
-
-    fitted_timeseries = timeseries.copy()
-    fitted_timeseries[y_key] = (
-        timeseries[y_key].dims,
-        fitted_values.reshape(timeseries[y_key].shape),
-    )
-    return fitted_timeseries
-
-
 def nfft_power(options: Options, timeseries: xr.Dataset) -> xr.Dataset:
     """Compute the power spectrum of a timeseries using NFFT.
 
@@ -1693,59 +1375,6 @@ def convert_spectrum_from_frequency_to_period(spectrum: xr.Dataset) -> xr.Datase
     return new_spectrum
 
 
-def map_power_spectrum(
-    cie: xr.Dataset,
-    power_spectrum: xr.Dataset,
-    min_period: float = -1,
-    max_period: float = -1,
-) -> xr.Dataset:
-    """Map a power spectrum from period space to the CIE wavelength grid.
-
-    Args:
-        cie:             CIE color matching functions dataset.
-        power_spectrum:  Power spectrum with 'period' coordinate.
-        min_period:      Minimum period for mapping.
-        max_period:      Maximum period for mapping.
-
-    Returns:
-        Dataset with 'power' mapped onto the CIE 'wavelength' coordinate.
-    """
-    existing_periods = power_spectrum["period"].values
-
-    new_period_added = False
-
-    if min_period not in existing_periods:
-        existing_periods = np.append(existing_periods, min_period)
-        new_period_added = True
-    if max_period not in existing_periods:
-        existing_periods = np.append(existing_periods, max_period)
-        new_period_added = True
-
-    if new_period_added:
-        new_periods = np.sort(existing_periods)
-        power_spectrum = power_spectrum.reindex(period=new_periods, method="nearest")
-
-    power_spectrum["power"] = power_spectrum["power"].interpolate_na(dim="period")
-
-    power_spectrum = power_spectrum.where(
-        (power_spectrum["period"] >= min_period)
-        & (power_spectrum["period"] <= max_period),
-        drop=True,
-    )
-
-    mapped_power_values = np.interp(
-        np.linspace(min_period, max_period, len(cie["wavelength"])),
-        power_spectrum["period"],
-        power_spectrum["power"],
-    )
-
-    new_power_spectrum = xr.Dataset(
-        {"power": (("wavelength",), mapped_power_values)},
-        coords={"wavelength": cie["wavelength"]},
-    )
-    return new_power_spectrum
-
-
 # ---------------------------------------------------------------------------
 # Plot functions
 # ---------------------------------------------------------------------------
@@ -1775,114 +1404,6 @@ def _get_cartopy_projection(projection_code: int) -> ccrs.Projection:
         )
     proj_cls = _CARTOPY_PROJECTIONS.get(projection_code, ccrs.Robinson)
     return proj_cls(central_longitude=180)
-
-
-def plot_timeseries(options: Options, ds: xr.Dataset, title: str) -> None:
-    """Plot a timeseries and save to the output folder.
-
-    Args:
-        options: Options object. Contains:
-                     - figsize:       Figure size.
-                     - time_key:      Time coordinate name.
-                     - y_key:         Variable name.
-                     - output_folder: Output directory.
-                     - dpi:           DPI for saved image.
-        ds:      Timeseries dataset.
-        title:   Plot title.
-    """
-    plt.figure(figsize=options.figsize)
-    plt.plot(ds[options.time_key], ds[options.y_key], color="lime")
-    plt.scatter(ds[options.time_key], ds[options.y_key], marker="s", color="cyan", s=10)
-    plt.title(title, color="white")
-    date_str = dt.datetime.now().strftime("%Y%m%d-%H%M%S")
-    filename = options.output_folder / f"{date_str}_{title.replace(' ', '_')}.png"
-    plt.savefig(
-        filename,
-        dpi=options.dpi,
-        format="png",
-        transparent=False,
-        bbox_inches="tight",
-        facecolor="black",
-    )
-
-
-def plot_fft_spectrum(options: Options, power_spectrum: xr.Dataset, title: str) -> None:
-    """Plot an FFT power spectrum and save to the output folder.
-
-    Args:
-        options:        Options object (figsize, output_folder, dpi).
-        power_spectrum: Power spectrum dataset with 'period' and 'power'.
-        title:          Plot title.
-    """
-    plt.figure(figsize=options.figsize)
-    plt.plot(power_spectrum.period, power_spectrum.power, color="lime", linewidth=2.0)
-    plt.scatter(
-        power_spectrum.period, power_spectrum.power, marker="s", color="cyan", s=10
-    )
-    plt.title(title)
-    plt.xlabel("Period (days)")
-    plt.ylabel("Power")
-    date_str = dt.datetime.now().strftime("%Y%m%d-%H%M%S")
-    filename = options.output_folder / f"{date_str}_{title.replace(' ', '_')}.png"
-    plt.savefig(
-        filename,
-        dpi=options.dpi,
-        format="png",
-        transparent=False,
-        bbox_inches="tight",
-        facecolor="black",
-    )
-
-
-def plot_light_spectrum(
-    options: Options, power_spectrum: xr.Dataset, title: str
-) -> None:
-    """Plot a light spectrum and save to the output folder.
-
-    Args:
-        options:        Options object (figsize, output_folder, dpi).
-        power_spectrum: Spectrum dataset with 'wavelength' and 'power'.
-        title:          Plot title.
-    """
-    plt.figure(figsize=options.figsize)
-    plt.plot(
-        power_spectrum.wavelength, power_spectrum.power, color="lime", linewidth=2.0
-    )
-    plt.scatter(
-        power_spectrum.wavelength, power_spectrum.power, marker="s", color="cyan", s=10
-    )
-    plt.title(title)
-    plt.xlabel("Wavelength (nm)")
-    plt.ylabel("Power")
-    date_str = dt.datetime.now().strftime("%Y%m%d-%H%M%S")
-    filename = options.output_folder / f"{date_str}_{title.replace(' ', '_')}.png"
-    plt.savefig(
-        filename,
-        dpi=options.dpi,
-        format="png",
-        transparent=False,
-        bbox_inches="tight",
-        facecolor="black",
-    )
-
-
-def plot_color(
-    options: Options, rgb: xr.Dataset, filename: str | os.PathLike[str]
-) -> None:
-    """Plot a solid color square and save to a file.
-
-    Args:
-        options:  Options object (dpi).
-        rgb:      Dataset with 'red', 'green', 'blue' values.
-        filename: Output file path.
-    """
-    filename = Path(filename)
-    fig, ax = plt.subplots(1, 1, figsize=(2, 2), dpi=options.dpi)
-    ax.set_facecolor(tuple(rgb[key] for key in ["red", "green", "blue"]))
-    ax.axis("off")
-    plt.savefig(
-        filename, dpi=options.dpi, format="png", transparent=False, bbox_inches="tight"
-    )
 
 
 def _add_map_features(
@@ -1938,73 +1459,6 @@ def _add_map_features(
     )
     gl.top_labels = False
     gl.right_labels = False
-
-
-def plot_map(
-    data: xr.DataArray,
-    *,
-    lat_key: str,
-    lon_key: str,
-    projection: ccrs.Projection,
-    title: str,
-    output_path: Path,
-    plot_options: PlotOptions,
-    cmap: str = "viridis",
-    colorbar_label: str = "",
-) -> None:
-    """Plot a single-channel map with geographic projection and coastlines.
-
-    Uses pcolormesh for proper geographic rendering on a projected axis.
-    Data is assumed to be on a regular lat/lon grid.
-
-    Args:
-        data:           2D DataArray with (lat_key, lon_key) dimensions.
-        lat_key:        Name of the latitude coordinate.
-        lon_key:        Name of the longitude coordinate.
-        projection:     Cartopy CRS projection for display.
-        title:          Plot title string.
-        output_path:    Full path for the saved PNG file.
-        plot_options:   PlotOptions with dpi, figsize, colors, feature toggles.
-        cmap:           Matplotlib colormap name.
-        colorbar_label: Label for the colorbar.
-    """
-    facecolor = "black" if plot_options.dark_mode else "white"
-    title_color = "white" if plot_options.dark_mode else "black"
-
-    fig = plt.figure(figsize=plot_options.figsize, dpi=plot_options.dpi)
-    ax = fig.add_subplot(1, 1, 1, projection=projection)
-    ax.set_global()
-
-    _add_map_features(ax, plot_options)
-
-    lons = data.coords[lon_key].values
-    lats = data.coords[lat_key].values
-    mesh = ax.pcolormesh(
-        lons,
-        lats,
-        data.values,
-        transform=ccrs.PlateCarree(),
-        cmap=cmap,
-        shading="auto",
-        zorder=2,
-    )
-
-    fig.colorbar(
-        mesh,
-        ax=ax,
-        orientation="horizontal",
-        pad=0.05,
-        shrink=0.8,
-        label=colorbar_label,
-    )
-    ax.set_title(title, color=title_color, fontsize=16)
-    fig.savefig(
-        output_path,
-        dpi=plot_options.dpi,
-        bbox_inches="tight",
-        facecolor=facecolor,
-    )
-    plt.close(fig)
 
 
 def plot_rgb_map(
@@ -2300,95 +1754,6 @@ def load_simple_grid_files(options: Options) -> xr.Dataset:
         chunks={options.time_key: options.fake_chunk},
     )
     return input_data
-
-
-# ---------------------------------------------------------------------------
-# Analysis functions
-# ---------------------------------------------------------------------------
-
-
-def extract_ssha_timeseries(
-    options: Options, ds: xr.Dataset, lat: float = 30, lon: float = 135
-) -> xr.Dataset:
-    """Extract a single-point SSHA timeseries at given coordinates.
-
-    Args:
-        options: Options object (time_key, y_key).
-        ds:      Full SSHA dataset.
-        lat:     Latitude (degrees).
-        lon:     Longitude (degrees, converted to 0-360 if negative).
-
-    Returns:
-        Single-point timeseries dataset.
-    """
-    logging.info(f"Extracting SSHA timeseries at {lat = } and {lon = }")
-    if lon < 0:
-        lon = 360 + lon
-
-    measurements = (
-        ds[options.y_key].sel(Latitude=lat, Longitude=lon, method="nearest").values
-    )
-
-    ds = xr.Dataset(
-        {options.y_key: (options.time_key, measurements)},
-        coords={options.time_key: ds[options.time_key].values},
-    )
-    return ds
-
-
-def timeseries_to_xyz(
-    options: Options,
-    timeseries: xr.Dataset,
-    time_key: str,
-    y_key: str,
-    min_period: float,
-    max_period: float,
-    cie: xr.Dataset,
-    spectrum2xyz_fn: Callable[..., xr.Dataset] = spectrum2xyz_new,
-) -> xr.Dataset:
-    """Convert a timeseries to XYZ tristimulus values via spectral analysis.
-
-    Args:
-        options:          Options object (lat_key, lon_key).
-        timeseries:       Input timeseries dataset.
-        time_key:         Time coordinate name.
-        y_key:            Data variable name.
-        min_period:       Minimum period for spectrum mapping.
-        max_period:       Maximum period for spectrum mapping.
-        cie:              CIE color matching functions.
-        spectrum2xyz_fn:  Function to convert spectrum to XYZ.
-
-    Returns:
-        Dataset with 'x', 'y', 'z' tristimulus values.
-    """
-    if 0:
-        lat = timeseries[options.lat_key].values
-        lon = timeseries[options.lon_key].values
-        # spectrum = synthetic_spectrum(cie, 500+lat, 5)
-        spectrum = synthetic_spectrum(cie, 580 + 2 * lat, 5)
-        # spectrum = synthetic_spectrum(cie, 550, 5)
-        xyz = spectrum2xyz_fn(spectrum, cie)
-        xyz["y"] = lon * lon * lon * lon
-        return xyz
-
-    timeseries, fits = fancy_detrend(
-        timeseries, time_key, y_key, terms=options.fit_terms
-    )
-
-    # Perform non-uniform FFT to get power spectrum.
-    power_spectrum = nfft_power(options, timeseries)
-
-    # Convert PSD to SPD by multiplying by sigma^2 (Hughes & Williams 2010, eq. A11)
-    freqs = power_spectrum["frequency"].values
-    power_spectrum["power"] = power_spectrum["power"] * freqs**2
-
-    power_spectrum = convert_spectrum_from_frequency_to_period(power_spectrum)
-
-    mapped_spectrum = map_power_spectrum(
-        cie, power_spectrum, min_period=min_period, max_period=max_period
-    )
-
-    return spectrum2xyz_fn(mapped_spectrum, cie)
 
 
 # ---------------------------------------------------------------------------
