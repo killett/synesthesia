@@ -21,6 +21,7 @@ from typing import Any, BinaryIO, Final
 
 import cartopy.crs as ccrs
 import cartopy.feature as cfeature
+import dask
 import h5py  # noqa: F401 — needed by xarray for NetCDF4 backend
 import matplotlib.pyplot as plt
 import nfft
@@ -31,11 +32,11 @@ import xarray as xr
 from colour import SpectralDistribution, XYZ_to_sRGB, sd_to_XYZ
 from colour.colorimetry import MSDS_CMFS_STANDARD_OBSERVER
 from tqdm import tqdm
-import dask
+
 dask.config.set(scheduler="synchronous")
 import gc
 
-__version__ = "0.1.8"
+__version__ = "0.1.9"
 DAYS_IN_YEAR: Final[float] = 365.25
 
 # XYZ-to-linear-sRGB matrix (Hughes & Williams 2010, no gamma correction)
@@ -68,9 +69,7 @@ class Options:
         # self.ssha_folder: Path = (
         #     self.cwd / "sealevel_spectra" / "fast_202306" / "fast_netCDF4"
         # )
-        self.ssha_folder: Path = (
-            self.cwd / "sealevel_spectra" / "SSHA_v2205"
-        )
+        self.ssha_folder: Path = self.cwd / "sealevel_spectra" / "SSHA_v2205"
         self.simple_folder: Path = self.cwd / "sealevel_spectra" / "simple_grids"
         self.argo_folder: Path = self.cwd / "sealevel_spectra" / "Argo"
         self.mur_sst_folder: Path = (
@@ -85,8 +84,14 @@ class Options:
 
         # Configuration
 
-        self.input_choices_list: list[str] = ["SSHA", "simple_grids", "Argo",
-                                              "MUR_SST", "AQUA_MODIS", "GRACE"]
+        self.input_choices_list: list[str] = [
+            "SSHA",
+            "simple_grids",
+            "Argo",
+            "MUR_SST",
+            "AQUA_MODIS",
+            "GRACE",
+        ]
         self.input_choice: str = "MUR_SST"
         # self.min_period: float =  3 * 7.0  # days
         # self.max_period: float = 24 * 7.0  # days
@@ -103,8 +108,8 @@ class Options:
         self.tskip: int = 1  # only use every "tskip" point in the time series
 
         # Desired memory footprints; chunk_size and block_size are derived from these
-        self.chunk_bytes: float = 250e6   # bytes per dask time chunk
-        self.block_bytes: float = 500e6   # bytes per loop lat/lon block
+        self.chunk_bytes: float = 250e6  # bytes per dask time chunk
+        self.block_bytes: float = 500e6  # bytes per loop lat/lon block
 
         # Controls xarray.open_mfdataset's parallel setting.
         # Be careful, parallel=True can spike RAM on open
@@ -408,6 +413,14 @@ def parse_arguments(options: Options) -> None:
         choices=["110m", "50m"],
         help="Coastline resolution (default: '110m').",
     )
+    parser.add_argument(
+        "--fit-terms",
+        type=str,
+        nargs="+",
+        default=None,
+        choices=["constant", "trend", "accel", "annual", "semiannual"],
+        help="Detrending terms (default: constant trend accel annual semiannual).",
+    )
     options.args = parser.parse_args()
     if options.args.debug:
         options.log_mode = logging.DEBUG
@@ -435,6 +448,8 @@ def parse_arguments(options: Options) -> None:
         options.chunk_bytes = options.args.chunk_bytes
     if options.args.block_bytes is not None:
         options.block_bytes = options.args.block_bytes
+    if options.args.fit_terms is not None:
+        options.fit_terms = options.args.fit_terms
     options.dpi = options.args.dpi
 
 
@@ -514,14 +529,20 @@ def main() -> None:
     _n_time = _da.sizes[options.time_key]
     _n_points = _n_lat * _n_lon
 
-    options.chunk_size = max(1, min(
-        _n_time,
-        int(options.chunk_bytes / (_n_lat * _n_lon * _itemsize)),
-    ))
-    options.block_size = max(1, min(
-        _n_points,
-        int(options.block_bytes / (_n_time * _itemsize)),
-    ))
+    options.chunk_size = max(
+        1,
+        min(
+            _n_time,
+            int(options.chunk_bytes / (_n_lat * _n_lon * _itemsize)),
+        ),
+    )
+    options.block_size = max(
+        1,
+        min(
+            _n_points,
+            int(options.block_bytes / (_n_time * _itemsize)),
+        ),
+    )
 
     logging.info(
         f"DERIVED chunk_size = {options.chunk_size} "
@@ -548,7 +569,7 @@ def main() -> None:
     # Actual chunk sizes along time (may differ from requested if files contain 1 step each
     # and xarray can't fuse across files cleanly)
     _time_chunks = _da.chunks[_da.dims.index(options.time_key)]
-    _effective_chunk = max(_time_chunks)    # largest per-chunk memory
+    _effective_chunk = max(_time_chunks)  # largest per-chunk memory
     _n_chunks = len(_time_chunks)
 
     # Per-chunk memory footprint when dask materializes one chunk
@@ -614,18 +635,26 @@ def main() -> None:
         logging.info(f"DIAGNOSTIC: time dtype = {input_data[options.time_key].dtype}")
         _data_var = input_data[options.y_key]
         _total = int(_data_var.size)
-        _stats = xr.Dataset({
-            "nan": _data_var.isnull().sum(),
-            "vmin": _data_var.min(skipna=True),
-            "vmax": _data_var.max(skipna=True),
-        }).compute()
+        _stats = xr.Dataset(
+            {
+                "nan": _data_var.isnull().sum(),
+                "vmin": _data_var.min(skipna=True),
+                "vmax": _data_var.max(skipna=True),
+            }
+        ).compute()
         _nan_count = int(_stats["nan"])
         _vmin = float(_stats["vmin"])
         _vmax = float(_stats["vmax"])
-        logging.info(f"DIAGNOSTIC: {options.y_key} NaN={_nan_count}, valid={_total - _nan_count}, total={_total}")
-        logging.info(f"DIAGNOSTIC: {options.y_key} finite range = [{_vmin:.6e}, {_vmax:.6e}]")
+        logging.info(
+            f"DIAGNOSTIC: {options.y_key} NaN={_nan_count}, valid={_total - _nan_count}, total={_total}"
+        )
+        logging.info(
+            f"DIAGNOSTIC: {options.y_key} finite range = [{_vmin:.6e}, {_vmax:.6e}]"
+        )
         if _vmax > 1e10:
-            logging.error(f"DIAGNOSTIC: WARNING - {options.y_key} has extreme values (max={_vmax:.2e}), fill values may not be masked!")
+            logging.error(
+                f"DIAGNOSTIC: WARNING - {options.y_key} has extreme values (max={_vmax:.2e}), fill values may not be masked!"
+            )
 
     if options.xskip > 1:
         logging.info(f"Selecting one lat/lon point in every {options.xskip**2} points.")
@@ -693,7 +722,7 @@ def main() -> None:
 
     # Extract time coord (small) and keep data lazy
     times = stacked[options.time_key].values
-    data_lazy = stacked[options.y_key]   # dask-backed DataArray
+    data_lazy = stacked[options.y_key]  # dask-backed DataArray
     n_times = len(times)
     n_points = stacked.sizes["latlon"]
 
@@ -707,9 +736,13 @@ def main() -> None:
 
     # --- DIAGNOSTIC: Check time conversion ---
     logging.info(f"DIAGNOSTIC: times dtype = {times.dtype}")
-    logging.info(f"DIAGNOSTIC: time_days range = [{time_days.min():.4f}, {time_days.max():.4f}] days")
+    logging.info(
+        f"DIAGNOSTIC: time_days range = [{time_days.min():.4f}, {time_days.max():.4f}] days"
+    )
     if time_days.max() < 1.0:
-        logging.error("DIAGNOSTIC: CRITICAL - time_days span < 1 day! Time conversion may be wrong.")
+        logging.error(
+            "DIAGNOSTIC: CRITICAL - time_days span < 1 day! Time conversion may be wrong."
+        )
 
     # Ensure even length for NFFT
     N = len(time_days)
@@ -719,8 +752,8 @@ def main() -> None:
         n_times -= 1
         N -= 1
 
-    # Detrending design matrix: [constant, trend, accel] (shared)
-    design_matrix = np.column_stack([np.ones(N), time_days, time_days**2])
+    # Detrending design matrix (shared, controlled by options.fit_terms)
+    design_matrix = build_design_matrix(time_days, options.fit_terms)
 
     # NFFT parameters (shared)
     x_min = time_days.min()
@@ -777,7 +810,7 @@ def main() -> None:
             block_end = min(block_start + options.block_size, n_points)
             # Materialize just this block (triggers dask read for the needed chunks only)
             block = data_lazy.isel(latlon=slice(block_start, block_end)).values
-            if N < block.shape[0]:   # handle the even-length trim
+            if N < block.shape[0]:  # handle the even-length trim
                 block = block[:N, :]
 
             for j in range(block.shape[1]):
@@ -810,7 +843,7 @@ def main() -> None:
                     y_x_min = y_time_days.min()
                     y_x_range = y_time_days.max() - y_x_min
                     y_x_norm = (y_time_days - y_x_min) / y_x_range - 0.5
-                    y_design = np.column_stack([np.ones(y_N), y_time_days, y_time_days**2])
+                    y_design = build_design_matrix(y_time_days, options.fit_terms)
                     y_k = -(y_N // 2) + np.arange(y_N)
                     y_xf_half = (y_k / y_x_range)[y_N // 2 + 1 :]
                     y_periods_asc = (1.0 / y_xf_half)[::-1]
@@ -854,7 +887,9 @@ def main() -> None:
                 pt_interp_periods = pt_periods_ext[pt_mask]
                 pt_interp_nearest = pt_nearest_idx[pt_mask]
                 power_interp_src = power_ascending[pt_interp_nearest]
-                mapped_power = np.interp(wavelength_targets, pt_interp_periods, power_interp_src)
+                mapped_power = np.interp(
+                    wavelength_targets, pt_interp_periods, power_interp_src
+                )
 
                 # 5. Spectrum to XYZ
                 if options.use_new_funcs:
@@ -862,9 +897,15 @@ def main() -> None:
                     xyz_results[i] = sd_to_XYZ(spd, cmfs)
                 else:
                     # Riemann sum integration (Hughes & Williams 2010)
-                    xyz_results[i, 0] = (mapped_power * cie_x_vals).sum() * wavelength_step
-                    xyz_results[i, 1] = (mapped_power * cie_y_vals).sum() * wavelength_step
-                    xyz_results[i, 2] = (mapped_power * cie_z_vals).sum() * wavelength_step
+                    xyz_results[i, 0] = (
+                        mapped_power * cie_x_vals
+                    ).sum() * wavelength_step
+                    xyz_results[i, 1] = (
+                        mapped_power * cie_y_vals
+                    ).sum() * wavelength_step
+                    xyz_results[i, 2] = (
+                        mapped_power * cie_z_vals
+                    ).sum() * wavelength_step
 
     # Cleanup
     del stacked, input_data
@@ -875,10 +916,14 @@ def main() -> None:
     # --- DIAGNOSTIC: Check xyz_results ---
     _xyz_valid = int(np.any(np.isfinite(xyz_results), axis=1).sum())
     _xyz_nan = int(np.all(np.isnan(xyz_results), axis=1).sum())
-    logging.info(f"DIAGNOSTIC: xyz_results: {_xyz_valid} valid, {_xyz_nan} all-NaN, {n_points} total")
+    logging.info(
+        f"DIAGNOSTIC: xyz_results: {_xyz_valid} valid, {_xyz_nan} all-NaN, {n_points} total"
+    )
     if _xyz_valid > 0:
         _y_valid = xyz_results[np.isfinite(xyz_results[:, 1]), 1]
-        logging.info(f"DIAGNOSTIC: Y range = [{_y_valid.min():.6e}, {_y_valid.max():.6e}]")
+        logging.info(
+            f"DIAGNOSTIC: Y range = [{_y_valid.min():.6e}, {_y_valid.max():.6e}]"
+        )
     else:
         logging.error("DIAGNOSTIC: CRITICAL - ALL xyz_results are NaN!")
 
@@ -923,12 +968,16 @@ def main() -> None:
     rgb_arr /= highest_value
 
     # --- DIAGNOSTIC: Check normalization ---
-    logging.info(f"DIAGNOSTIC: max_y = {max_y:.6e}, highest_value = {highest_value:.6e}")
+    logging.info(
+        f"DIAGNOSTIC: max_y = {max_y:.6e}, highest_value = {highest_value:.6e}"
+    )
     _rgb_valid_mask = ~np.any(np.isnan(rgb_arr), axis=0)
     _n_rgb_valid = int(_rgb_valid_mask.sum())
     if _n_rgb_valid > 0:
         _rgb_valid_vals = rgb_arr[:, _rgb_valid_mask]
-        logging.info(f"DIAGNOSTIC: RGB valid points: {_n_rgb_valid}, range=[{_rgb_valid_vals.min():.6f}, {_rgb_valid_vals.max():.6f}]")
+        logging.info(
+            f"DIAGNOSTIC: RGB valid points: {_n_rgb_valid}, range=[{_rgb_valid_vals.min():.6f}, {_rgb_valid_vals.max():.6f}]"
+        )
     else:
         logging.error("DIAGNOSTIC: CRITICAL - ALL RGB values are NaN!")
 
@@ -998,7 +1047,8 @@ def main() -> None:
         lon_key=options.lon_key,
         projection=map_projection,
         title=f"{options.input_choice}, periods {options.min_period / 7.0:.0f}-{options.max_period / 7.0:.0f} weeks,{funcs_desc}",
-        output_path=options.output_folder / f"{options.input_choice}_map_matplotlib.png",
+        output_path=options.output_folder
+        / f"{options.input_choice}_map_matplotlib.png",
         plot_options=options.plot_options,
     )
 
@@ -1073,6 +1123,35 @@ def main() -> None:
 # ---------------------------------------------------------------------------
 # Pure helper functions (no options needed)
 # ---------------------------------------------------------------------------
+
+
+def build_design_matrix(time_days: np.ndarray, fit_terms: list[str]) -> np.ndarray:
+    """Build an OLS design matrix from a list of fit terms.
+
+    Args:
+        time_days: Time axis in days (relative to start).
+        fit_terms: List of terms from {"constant", "trend", "accel",
+                   "annual", "semiannual"}.  "annual" and "semiannual"
+                   each contribute a sin/cos pair (2 columns).
+
+    Returns:
+        2D array of shape (len(time_days), n_columns).
+    """
+    columns: list[np.ndarray] = []
+    for term in fit_terms:
+        if term == "constant":
+            columns.append(np.ones_like(time_days))
+        elif term == "trend":
+            columns.append(time_days)
+        elif term == "accel":
+            columns.append(time_days**2)
+        elif term == "annual":
+            columns.append(np.sin(2 * np.pi * time_days / DAYS_IN_YEAR))
+            columns.append(np.cos(2 * np.pi * time_days / DAYS_IN_YEAR))
+        elif term == "semiannual":
+            columns.append(np.sin(4 * np.pi * time_days / DAYS_IN_YEAR))
+            columns.append(np.cos(4 * np.pi * time_days / DAYS_IN_YEAR))
+    return np.column_stack(columns)
 
 
 def gaussian(x: np.ndarray, mu: float, sig: float) -> np.ndarray:
@@ -1457,22 +1536,7 @@ def fancy_detrend(
     x = (timeseries[time_key] - timeseries[time_key][0]).values / np.timedelta64(1, "D")
     y = timeseries[y_key].values.squeeze()
 
-    design_matrix = []
-
-    if "constant" in terms:
-        design_matrix.append(np.ones_like(x))
-    if "trend" in terms:
-        design_matrix.append(x)
-    if "accel" in terms:
-        design_matrix.append(x**2)
-    if "annual" in terms:
-        design_matrix.append(np.sin(2 * np.pi * x / DAYS_IN_YEAR))
-        design_matrix.append(np.cos(2 * np.pi * x / DAYS_IN_YEAR))
-    if "semiannual" in terms:
-        design_matrix.append(np.sin(2 * np.pi * x / DAYS_IN_YEAR / 2.0))
-        design_matrix.append(np.cos(2 * np.pi * x / DAYS_IN_YEAR / 2.0))
-
-    design_matrix = np.column_stack(design_matrix)
+    design_matrix = build_design_matrix(x, terms)
 
     model = sm.OLS(y, design_matrix)
     result = model.fit()
@@ -1553,9 +1617,8 @@ def nfft_power(options: Options, timeseries: xr.Dataset) -> xr.Dataset:
         Dataset with 'power' variable and 'frequency' coordinate.
     """
     x = (
-        (timeseries[options.time_key] - timeseries[options.time_key][0]).values.squeeze()
-        / np.timedelta64(1, "D")
-    )
+        timeseries[options.time_key] - timeseries[options.time_key][0]
+    ).values.squeeze() / np.timedelta64(1, "D")
     y = timeseries[options.y_key].values.squeeze()
 
     # If timeseries has an odd number of points,
@@ -2029,16 +2092,18 @@ def load_ssha_files(options: Options) -> xr.Dataset:
         Combined dataset.
     """
     sshafiles = sorted(options.ssha_folder.glob("*.nc"))
-    tskip_files = sshafiles[::options.tskip]
+    tskip_files = sshafiles[:: options.tskip]
     logging.info(f"Loading {len(tskip_files)} SSHA files...")
 
     def _preprocess(ds: xr.Dataset) -> xr.Dataset:
         ds = ds[[options.y_key]]
         if options.xskip > 1:
-            ds = ds.isel({
-                options.lat_key: slice(None, None, options.xskip),
-                options.lon_key: slice(None, None, options.xskip),
-            })
+            ds = ds.isel(
+                {
+                    options.lat_key: slice(None, None, options.xskip),
+                    options.lon_key: slice(None, None, options.xskip),
+                }
+            )
         ds[options.y_key] = ds[options.y_key].astype(np.float32, copy=False)
         return ds
 
@@ -2068,10 +2133,12 @@ def load_argo_file(options: Options) -> xr.Dataset:
     thefile = thefiles[0]
     ds = xr.open_dataset(thefile, chunks={})[["ohc_2d", "ohc_2d_700m"]]
     if options.xskip > 1:
-        ds = ds.isel({
-            options.lat_key: slice(None, None, options.xskip),
-            options.lon_key: slice(None, None, options.xskip),
-        })
+        ds = ds.isel(
+            {
+                options.lat_key: slice(None, None, options.xskip),
+                options.lon_key: slice(None, None, options.xskip),
+            }
+        )
     for v in ("ohc_2d", "ohc_2d_700m"):
         ds[v] = ds[v].astype(np.float32, copy=False)
     return ds
@@ -2090,10 +2157,12 @@ def load_grace_file(options: Options) -> xr.Dataset:
     thefile = thefiles[0]
     ds = xr.open_dataset(thefile, chunks={})[[options.y_key]]
     if options.xskip > 1:
-        ds = ds.isel({
-            options.lat_key: slice(None, None, options.xskip),
-            options.lon_key: slice(None, None, options.xskip),
-        })
+        ds = ds.isel(
+            {
+                options.lat_key: slice(None, None, options.xskip),
+                options.lon_key: slice(None, None, options.xskip),
+            }
+        )
     ds[options.y_key] = ds[options.y_key].astype(np.float32, copy=False)
     return ds
 
@@ -2108,16 +2177,18 @@ def load_mur_sst_files(options: Options) -> xr.Dataset:
         Combined dataset.
     """
     thefiles = sorted(options.mur_sst_folder.glob("*.nc"))
-    tskip_files = thefiles[::options.tskip]
+    tskip_files = thefiles[:: options.tskip]
     logging.info(f"Loading {len(tskip_files)} MUR SST files...")
 
     def _preprocess(ds: xr.Dataset) -> xr.Dataset:
         ds = ds[[options.y_key]]
         if options.xskip > 1:
-            ds = ds.isel({
-                options.lat_key: slice(None, None, options.xskip),
-                options.lon_key: slice(None, None, options.xskip),
-            })
+            ds = ds.isel(
+                {
+                    options.lat_key: slice(None, None, options.xskip),
+                    options.lon_key: slice(None, None, options.xskip),
+                }
+            )
         ds[options.y_key] = ds[options.y_key].astype(np.float32, copy=False)
         return ds
 
@@ -2144,16 +2215,18 @@ def load_aqua_modis_files(options: Options) -> xr.Dataset:
         Combined dataset.
     """
     thefiles = sorted(options.aqua_modis_folder.glob("*.nc"))
-    tskip_files = thefiles[::options.tskip]
+    tskip_files = thefiles[:: options.tskip]
     logging.info(f"Loading {len(tskip_files)} AQUA_MODIS files...")
 
     def _preprocess(ds: xr.Dataset) -> xr.Dataset:
         ds = ds[[options.y_key]]
         if options.xskip > 1:
-            ds = ds.isel({
-                options.lat_key: slice(None, None, options.xskip),
-                options.lon_key: slice(None, None, options.xskip),
-            })
+            ds = ds.isel(
+                {
+                    options.lat_key: slice(None, None, options.xskip),
+                    options.lon_key: slice(None, None, options.xskip),
+                }
+            )
         ds[options.y_key] = ds[options.y_key].astype(np.float32, copy=False)
         return ds
 
@@ -2194,7 +2267,7 @@ def load_simple_grid_files(options: Options) -> xr.Dataset:
         raise FileNotFoundError(
             f"No NetCDF files found in {os.fspath(options.simple_folder)}"
         )
-    tskip_files = all_files[::options.tskip]
+    tskip_files = all_files[:: options.tskip]
     logging.info(
         f"Loading {len(tskip_files)} simple_grids files (of {len(all_files)} total)..."
     )
@@ -2205,10 +2278,12 @@ def load_simple_grid_files(options: Options) -> xr.Dataset:
         drop = set(ds.data_vars) - keep
         ds = ds.drop_vars(drop, errors="ignore")
         if options.xskip > 1:
-            ds = ds.isel({
-                options.lat_key: slice(None, None, options.xskip),
-                options.lon_key: slice(None, None, options.xskip),
-            })
+            ds = ds.isel(
+                {
+                    options.lat_key: slice(None, None, options.xskip),
+                    options.lon_key: slice(None, None, options.xskip),
+                }
+            )
         ds = ds.set_coords(options.time_key).expand_dims(options.time_key)
         ds[options.y_key] = ds[options.y_key].astype(np.float32, copy=False)
         return ds
@@ -2296,7 +2371,9 @@ def timeseries_to_xyz(
         xyz["y"] = lon * lon * lon * lon
         return xyz
 
-    timeseries, fits = fancy_detrend(timeseries, time_key, y_key, terms=options.fit_terms)
+    timeseries, fits = fancy_detrend(
+        timeseries, time_key, y_key, terms=options.fit_terms
+    )
 
     # Perform non-uniform FFT to get power spectrum.
     power_spectrum = nfft_power(options, timeseries)
