@@ -33,7 +33,7 @@ from tqdm import tqdm
 dask.config.set(scheduler="synchronous")
 import gc
 
-__version__ = "0.2.0"
+__version__ = "0.2.1"
 DAYS_IN_YEAR: Final[float] = 365.25
 
 # XYZ-to-linear-sRGB matrix (Hughes & Williams 2010, no gamma correction)
@@ -89,7 +89,7 @@ class Options:
             "AQUA_MODIS",
             "GRACE",
         ]
-        self.input_choice: str = "SSHA"
+        self.input_choice: str = "GRACE"
         # self.min_period: float =  3 * 7.0  # days
         # self.max_period: float = 24 * 7.0  # days
         self.min_period: float = 10 * 7.0  # days
@@ -99,7 +99,7 @@ class Options:
         self.fit_terms += ["constant", "trend", "accel"]
         # self.fit_terms += ["annual"]
         # self.fit_terms += ["semiannual"]
-        # self.fit_terms += ["annual", "semiannual"]
+        self.fit_terms += ["annual", "semiannual"]
 
         self.xskip: int = 1  # only use every "xskip" point in each direction.
         self.tskip: int = 1  # only use every "tskip" point in the time series
@@ -233,7 +233,7 @@ class PlotOptions:
     blurb_disabled: int = 1
     phase_mask: int = 12  # 1/2=abrupt, 11/12=gradual (matches C++)
     plot_mascons: int = 0
-    no_gmt_plots: int = 1  # 1=skip GMT
+    no_gmt_plots: int = 0  # 1=skip GMT
     # Matplotlib-only fields:
     dpi: int = 300
     show_fig: bool = False
@@ -1067,14 +1067,15 @@ def main() -> None:
         # Save RGB NetCDFs as uint8 [0, 255] for GMT.  GMT's grdimage
         # three-grid RGB mode normalizes float grids independently per
         # channel, destroying color relationships.  Uint8 grids are
-        # used as-is.
+        # used as-is.  All files use variable name "z" (GMT's default)
+        # and NETCDF4_CLASSIC format for maximum compatibility.
         for thekey in ["red", "green", "blue"]:
             uint8_values = _float01_to_gmt_uint8(spectral_color_maps[thekey].values)
             gmt_da = xr.DataArray(
                 uint8_values,
                 coords=spectral_color_maps[thekey].coords,
                 dims=spectral_color_maps[thekey].dims,
-                name=thekey,
+                name="z",
             )
             gmt_file = options.output_folder / f"{thekey}_gmt.nc"
             gmt_da.coords[options.lat_key].attrs = {
@@ -1090,7 +1091,7 @@ def main() -> None:
             logging.info(f"Saving {os.fspath(gmt_file)} (uint8 for GMT)...")
             gmt_da.to_netcdf(
                 gmt_file,
-                encoding={thekey: {"dtype": "uint8", "_FillValue": None}},
+                encoding={"z": {"dtype": "uint8", "_FillValue": None}},
             )
         logging.info("Finished saving NetCDFs.")
 
@@ -2326,7 +2327,13 @@ def write_gmt_map_data(options: Options, new_fp: BinaryIO, title: str, i: int) -
     new_fp.write(f'title="{title}"\n'.encode())
     if len(results.rgb) == 3 and len(results.latlon.outputs) == 3:
         new_fp.write(
-            b"gmt grdimage red_gmt.nc green_gmt.nc blue_gmt.nc $boundary $resolution $range $projection $map_pos $start > $plot_base.ps\n"
+            b"gmt grdinfo red_gmt.nc?z || echo 'ERROR: GMT cannot read red_gmt.nc' >&2\n"
+        )
+        new_fp.write(
+            b"gmt grdimage red_gmt.nc?z green_gmt.nc?z blue_gmt.nc?z $boundary $resolution $range $projection $map_pos $start > $plot_base.ps\n"
+        )
+        new_fp.write(
+            b'if [ $? -ne 0 ]; then echo "ERROR: gmt grdimage failed" >&2; fi\n'
         )
     else:
         new_fp.write(
