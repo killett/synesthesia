@@ -33,7 +33,7 @@ from tqdm import tqdm
 dask.config.set(scheduler="synchronous")
 import gc
 
-__version__ = "0.1.8"
+__version__ = "0.2.0"
 DAYS_IN_YEAR: Final[float] = 365.25
 
 # XYZ-to-linear-sRGB matrix (Hughes & Williams 2010, no gamma correction)
@@ -89,7 +89,7 @@ class Options:
             "AQUA_MODIS",
             "GRACE",
         ]
-        self.input_choice: str = "MUR_SST"
+        self.input_choice: str = "SSHA"
         # self.min_period: float =  3 * 7.0  # days
         # self.max_period: float = 24 * 7.0  # days
         self.min_period: float = 10 * 7.0  # days
@@ -99,7 +99,7 @@ class Options:
         self.fit_terms += ["constant", "trend", "accel"]
         # self.fit_terms += ["annual"]
         # self.fit_terms += ["semiannual"]
-        self.fit_terms += ["annual", "semiannual"]
+        # self.fit_terms += ["annual", "semiannual"]
 
         self.xskip: int = 1  # only use every "xskip" point in each direction.
         self.tskip: int = 1  # only use every "tskip" point in the time series
@@ -1064,22 +1064,34 @@ def main() -> None:
             logging.info(f"Saving {os.fspath(filename)}...")
             da.to_netcdf(filename)
 
-        # Save RGB NetCDFs scaled to [0, 255] for GMT (grdimage expects byte range)
+        # Save RGB NetCDFs as uint8 [0, 255] for GMT.  GMT's grdimage
+        # three-grid RGB mode normalizes float grids independently per
+        # channel, destroying color relationships.  Uint8 grids are
+        # used as-is.
         for thekey in ["red", "green", "blue"]:
-            scaled = spectral_color_maps[thekey] * 255.0
+            uint8_values = _float01_to_gmt_uint8(spectral_color_maps[thekey].values)
+            gmt_da = xr.DataArray(
+                uint8_values,
+                coords=spectral_color_maps[thekey].coords,
+                dims=spectral_color_maps[thekey].dims,
+                name=thekey,
+            )
             gmt_file = options.output_folder / f"{thekey}_gmt.nc"
-            scaled.coords[options.lat_key].attrs = {
+            gmt_da.coords[options.lat_key].attrs = {
                 "units": "degrees_north",
                 "long_name": "Latitude",
             }
-            scaled.coords[options.lon_key].attrs = {
+            gmt_da.coords[options.lon_key].attrs = {
                 "units": "degrees_east",
                 "long_name": "Longitude",
             }
-            scaled.attrs["long_name"] = f"Spectral color {thekey} (scaled 0-255)"
-            scaled.attrs["units"] = "dimensionless"
-            logging.info(f"Saving {os.fspath(gmt_file)} (scaled to [0,255] for GMT)...")
-            scaled.to_netcdf(gmt_file)
+            gmt_da.attrs["long_name"] = f"Spectral color {thekey} (scaled 0-255)"
+            gmt_da.attrs["units"] = "dimensionless"
+            logging.info(f"Saving {os.fspath(gmt_file)} (uint8 for GMT)...")
+            gmt_da.to_netcdf(
+                gmt_file,
+                encoding={thekey: {"dtype": "uint8", "_FillValue": None}},
+            )
         logging.info("Finished saving NetCDFs.")
 
         write_rgb_colorscale(options, cie)
@@ -1129,6 +1141,26 @@ def build_design_matrix(time_days: np.ndarray, fit_terms: list[str]) -> np.ndarr
             columns.append(np.sin(4 * np.pi * time_days / DAYS_IN_YEAR))
             columns.append(np.cos(4 * np.pi * time_days / DAYS_IN_YEAR))
     return np.column_stack(columns)
+
+
+def _float01_to_gmt_uint8(arr: np.ndarray) -> np.ndarray:
+    """Convert a float [0, 1] array to uint8 [0, 255] for GMT grdimage.
+
+    GMT's three-grid RGB mode normalizes float grids independently per channel,
+    destroying color relationships.  Uint8 grids are used as-is.
+
+    NaN values are replaced with 0 (black) because uint8 cannot represent NaN.
+    Values are clipped to [0, 255] before casting to handle floating-point
+    overshoot from gamma correction.
+
+    Args:
+        arr: 2D numpy array with values in [0, 1], possibly containing NaN.
+
+    Returns:
+        2D numpy array of dtype uint8 with values in [0, 255].
+    """
+    scaled = np.nan_to_num(arr, nan=0.0) * 255.0
+    return np.clip(scaled, 0.0, 255.0).astype(np.uint8)
 
 
 # ---------------------------------------------------------------------------
