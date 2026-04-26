@@ -228,7 +228,7 @@ class PlotOptions:
     coastlines: int = 1  # 1=coast, 2=coast+InSAR
     symmetric_limit: float = -1.0  # <=0 disables (matches C++)
     scale_digits: int = 2
-    color_scheme: int = 2  # 1=white BG, 2=black BG
+    color_scheme: int = 1  # 1=white BG, 2=black BG
     montage: int = 0
     blurb_disabled: int = 1
     phase_mask: int = 12  # 1/2=abrupt, 11/12=gradual (matches C++)
@@ -1091,7 +1091,12 @@ def main() -> None:
             logging.info(f"Saving {os.fspath(gmt_file)} (uint8 for GMT)...")
             gmt_da.to_netcdf(
                 gmt_file,
-                encoding={"z": {"dtype": "uint8", "_FillValue": None}},
+                format="NETCDF4_CLASSIC",
+                encoding={
+                    "z": {"dtype": "uint8", "_FillValue": None},
+                    options.lat_key: {"_FillValue": None},
+                    options.lon_key: {"_FillValue": None},
+                },
             )
         logging.info("Finished saving NetCDFs.")
 
@@ -2476,6 +2481,10 @@ def write_gmt_scripts(options: Options) -> None:
             new_fp.write(
                 b"gmt set COLOR_BACKGROUND=2/2/2 COLOR_FOREGROUND=253/253/253\n"
             )
+            if len(results.rgb) == 3 and len(results.latlon.outputs) == 3:
+                new_fp.write(
+                    b"gmt set PS_PAGE_COLOR=2/2/2\n"
+                )
             new_fp.write(f"digits={plot_options.scale_digits}\n".encode())
             new_fp.write(b"gmt set D_FORMAT=%.${digits}f\n")
 
@@ -2522,10 +2531,15 @@ def write_gmt_scripts(options: Options) -> None:
     new_fp.write(b". ./trim.sh\n")
 
     new_fp.write(b"#######################################################\n")
-    new_fp.write(b"if [ $color_scheme == 2 ]\n")
-    new_fp.write(b"then\n")
-    new_fp.write(b"  . ./flip_backgrounds.sh\n")
-    new_fp.write(b"fi\n")
+    if len(results.rgb) == 3 and len(results.latlon.outputs) == 3:
+        new_fp.write(b"# Skip flip_backgrounds for RGB maps — data pixels contain\n")
+        new_fp.write(b"# true black (0,0,0) that must not be converted to white.\n")
+        new_fp.write(b"# Dark background is set via PS_PAGE_COLOR instead.\n")
+    else:
+        new_fp.write(b"if [ $color_scheme == 2 ]\n")
+        new_fp.write(b"then\n")
+        new_fp.write(b"  . ./flip_backgrounds.sh\n")
+        new_fp.write(b"fi\n")
 
     new_fp.write(b"#######################################################\n")
     new_fp.write(b"if [ $montage != 0 ]\n")
