@@ -89,17 +89,17 @@ class Options:
             "AQUA_MODIS",
             "GRACE",
         ]
-        self.input_choice: str = "GRACE"
-        # self.min_period: float =  3 * 7.0  # days
-        # self.max_period: float = 24 * 7.0  # days
-        self.min_period: float = 10 * 7.0  # days
-        self.max_period: float = 54 * 7.0  # days
+        self.input_choice: str = "AQUA_MODIS"
+        self.min_period: float = 3 * 7.0  # days
+        self.max_period: float = 24 * 7.0  # days
+        # self.min_period: float = 10 * 7.0  # days
+        # self.max_period: float = 54 * 7.0  # days
 
         self.fit_terms: list[str] = []
         self.fit_terms += ["constant", "trend", "accel"]
         # self.fit_terms += ["annual"]
         # self.fit_terms += ["semiannual"]
-        self.fit_terms += ["annual", "semiannual"]
+        # self.fit_terms += ["annual", "semiannual"]
 
         self.xskip: int = 1  # only use every "xskip" point in each direction.
         self.tskip: int = 1  # only use every "tskip" point in the time series
@@ -168,7 +168,7 @@ def configure_keys_for_input(options: Options) -> None:
         options.lon_key = "lon"
     elif options.input_choice == "AQUA_MODIS":
         options.time_key = "time"
-        options.y_key = "sst_anomaly"
+        options.y_key = "chlor_a"
         options.lat_key = "lat"
         options.lon_key = "lon"
     elif options.input_choice == "GRACE":
@@ -228,12 +228,12 @@ class PlotOptions:
     coastlines: int = 1  # 1=coast, 2=coast+InSAR
     symmetric_limit: float = -1.0  # <=0 disables (matches C++)
     scale_digits: int = 2
-    color_scheme: int = 1  # 1=white BG, 2=black BG
+    color_scheme: int = 2  # 1=white BG, 2=black BG
     montage: int = 0
     blurb_disabled: int = 1
     phase_mask: int = 12  # 1/2=abrupt, 11/12=gradual (matches C++)
     plot_mascons: int = 0
-    no_gmt_plots: int = 0  # 1=skip GMT
+    no_gmt_plots: int = 1  # 1=skip GMT
     # Matplotlib-only fields:
     dpi: int = 300
     show_fig: bool = False
@@ -242,7 +242,7 @@ class PlotOptions:
     # Disabled land and ocean fill because it only seems to happen near the poles.
     # land_color: str = "#333333"  # Dark grey
     # ocean_color: str = "black"  # Matches dark_background theme
-    dark_mode: bool = True  # False = light/white background
+    dark_mode: bool = bool(1)  # False = light/white background
     show_borders: bool = False  # Political boundaries
     show_rivers: bool = False  # Major rivers
     coastline_resolution: str = "110m"  # "110m" or "50m"
@@ -488,7 +488,7 @@ def main() -> None:
     zip_script(options)
 
     # Matplotlib setup
-    plt.style.use("dark_background")
+    plt.style.use("dark_background" if options.plot_options.dark_mode else "default")
     plt.rcParams["font.size"] = 14
     plt.rcParams["axes.linewidth"] = 2
 
@@ -1091,12 +1091,7 @@ def main() -> None:
             logging.info(f"Saving {os.fspath(gmt_file)} (uint8 for GMT)...")
             gmt_da.to_netcdf(
                 gmt_file,
-                format="NETCDF4_CLASSIC",
-                encoding={
-                    "z": {"dtype": "uint8", "_FillValue": None},
-                    options.lat_key: {"_FillValue": None},
-                    options.lon_key: {"_FillValue": None},
-                },
+                encoding={"z": {"dtype": "uint8", "_FillValue": None}},
             )
         logging.info("Finished saving NetCDFs.")
 
@@ -1456,6 +1451,7 @@ def _add_map_features(
     """
     coastline_color = "darkgray" if plot_options.dark_mode else "black"
     border_color = "gray" if plot_options.dark_mode else "#666666"
+    label_color = "white" if plot_options.dark_mode else "black"
 
     # ax.add_feature(cfeature.OCEAN, facecolor=plot_options.ocean_color, zorder=0)
     # ax.add_feature(
@@ -1497,6 +1493,8 @@ def _add_map_features(
     )
     gl.top_labels = False
     gl.right_labels = False
+    gl.xlabel_style = {"color": label_color}
+    gl.ylabel_style = {"color": label_color}
 
 
 def plot_rgb_map(
@@ -1529,6 +1527,7 @@ def plot_rgb_map(
     """
     facecolor = "black" if plot_options.dark_mode else "white"
     title_color = "white" if plot_options.dark_mode else "black"
+    frame_color = "white" if plot_options.dark_mode else "black"
 
     image = np.dstack((red.values, green.values, blue.values))
     image = np.nan_to_num(image, nan=0.0)
@@ -1546,6 +1545,7 @@ def plot_rgb_map(
     fig = plt.figure(figsize=plot_options.figsize, dpi=plot_options.dpi)
     ax = fig.add_subplot(1, 1, 1, projection=projection)
     ax.set_global()
+    ax.spines["geo"].set_edgecolor(frame_color)
 
     _add_map_features(ax, plot_options)
 
@@ -1720,15 +1720,19 @@ def load_aqua_modis_files(options: Options) -> xr.Dataset:
                 }
             )
         ds[options.y_key] = ds[options.y_key].astype(np.float32, copy=False)
+        # L3m files carry the date in `time_coverage_start` attr, not a coord.
+        time = np.datetime64(ds.attrs["time_coverage_start"][:19])
+        ds = ds.assign_coords({options.time_key: time}).expand_dims(options.time_key)
         return ds
 
     input_data = xr.open_mfdataset(
         tskip_files,
         preprocess=_preprocess,
+        combine="nested",
+        concat_dim=options.time_key,
         data_vars="minimal",
         coords="minimal",
         compat="override",
-        combine="by_coords",
         parallel=options.mf_parallel,
         chunks={options.time_key: options.fake_chunk},
     )
@@ -2481,10 +2485,6 @@ def write_gmt_scripts(options: Options) -> None:
             new_fp.write(
                 b"gmt set COLOR_BACKGROUND=2/2/2 COLOR_FOREGROUND=253/253/253\n"
             )
-            if len(results.rgb) == 3 and len(results.latlon.outputs) == 3:
-                new_fp.write(
-                    b"gmt set PS_PAGE_COLOR=2/2/2\n"
-                )
             new_fp.write(f"digits={plot_options.scale_digits}\n".encode())
             new_fp.write(b"gmt set D_FORMAT=%.${digits}f\n")
 
@@ -2531,15 +2531,10 @@ def write_gmt_scripts(options: Options) -> None:
     new_fp.write(b". ./trim.sh\n")
 
     new_fp.write(b"#######################################################\n")
-    if len(results.rgb) == 3 and len(results.latlon.outputs) == 3:
-        new_fp.write(b"# Skip flip_backgrounds for RGB maps — data pixels contain\n")
-        new_fp.write(b"# true black (0,0,0) that must not be converted to white.\n")
-        new_fp.write(b"# Dark background is set via PS_PAGE_COLOR instead.\n")
-    else:
-        new_fp.write(b"if [ $color_scheme == 2 ]\n")
-        new_fp.write(b"then\n")
-        new_fp.write(b"  . ./flip_backgrounds.sh\n")
-        new_fp.write(b"fi\n")
+    new_fp.write(b"if [ $color_scheme == 2 ]\n")
+    new_fp.write(b"then\n")
+    new_fp.write(b"  . ./flip_backgrounds.sh\n")
+    new_fp.write(b"fi\n")
 
     new_fp.write(b"#######################################################\n")
     new_fp.write(b"if [ $montage != 0 ]\n")
