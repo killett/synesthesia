@@ -1030,8 +1030,6 @@ def main() -> None:
             f"TUNING chunk_size: {_chunk_bytes / 1e9:.2f} GB per chunk is large "
         )
     elif _chunk_bytes < 10e6 and _n_chunks > 50:
-        # Don't recommend more than the full time axis
-        _suggested = min(_suggested, _n_time)
         logging.warning(
             f"TUNING chunk_size: {_chunk_bytes / 1e6:.1f} MB per chunk is small and "
             f"there are {_n_chunks} chunks"
@@ -1216,26 +1214,6 @@ def main() -> None:
     cie_wavelengths = cie["wavelength"].values
     n_wl = len(cie_wavelengths)
     wavelength_targets = np.linspace(options.min_period, options.max_period, n_wl)
-
-    # Pre-compute boundary handling for map_power_spectrum (replicates original reindex+nearest)
-    periods_extended = periods_ascending.copy()
-    if options.min_period not in periods_ascending:
-        periods_extended = np.append(periods_extended, options.min_period)
-    if options.max_period not in periods_ascending:
-        periods_extended = np.append(periods_extended, options.max_period)
-    periods_extended = np.sort(periods_extended)
-
-    # For each extended period, find nearest original period index (for nearest-fill)
-    nearest_indices = np.array(
-        [np.argmin(np.abs(periods_ascending - p)) for p in periods_extended]
-    )
-
-    # Filter to [min_period, max_period]
-    period_mask = (periods_extended >= options.min_period) & (
-        periods_extended <= options.max_period
-    )
-    interp_periods = periods_extended[period_mask]
-    interp_nearest_idx = nearest_indices[period_mask]
 
     # CIE color matching functions for sd_to_XYZ
     cmfs = MSDS_CMFS_STANDARD_OBSERVER["CIE 1931 2 Degree Standard Observer"]
@@ -2730,7 +2708,6 @@ def write_rgb_colorscale(options: Options, cie: xr.Dataset) -> None:
     """
     n_steps = 256
     cie_wavelengths = cie["wavelength"].values
-    n_wl = len(cie_wavelengths)
     wl_min = cie_wavelengths[0]
     wl_range = cie_wavelengths[-1] - wl_min
 
@@ -2847,7 +2824,6 @@ def write_gmt_map_data(options: Options, new_fp: BinaryIO, title: str, i: int) -
         i:       Index of the parameter being mapped.
     """
     results = options.results
-    grid = options.grid
     plot_options = options.plot_options
 
     polar = is_polar(options)
@@ -3090,7 +3066,6 @@ def write_gmt_scripts(options: Options) -> None:
         options: Options object (plot_options, grid, results).
     """
     plot_options = options.plot_options
-    grid = options.grid
     results = options.results
 
     new_file = Path(plot_options.outputfolder) / "create_plots.sh"
