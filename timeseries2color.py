@@ -9,6 +9,7 @@ import csv
 import datetime as dt
 import logging
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -44,6 +45,109 @@ A_OLD_XYZ_TO_SRGB: Final[np.ndarray] = np.array(
         [0.055630032, -0.20397685, 1.0569714],
     ]
 )
+
+# ---------------------------------------------------------------------------
+# Coordinate auto-detection
+# ---------------------------------------------------------------------------
+
+_LATITUDE_NAMES: Final[frozenset[str]] = frozenset(
+    {"lat", "latitude", "Latitude", "LATITUDE", "nav_lat", "y"}
+)
+_LONGITUDE_NAMES: Final[frozenset[str]] = frozenset(
+    {"lon", "longitude", "Longitude", "LONGITUDE", "nav_lon", "x"}
+)
+_TIME_NAMES: Final[frozenset[str]] = frozenset({"time", "Time", "TIME", "t"})
+
+_LATITUDE_UNITS: Final[frozenset[str]] = frozenset(
+    {"degrees_north", "degree_north", "degrees_N", "degree_N"}
+)
+_LONGITUDE_UNITS: Final[frozenset[str]] = frozenset(
+    {"degrees_east", "degree_east", "degrees_E", "degree_E"}
+)
+_TIME_SINCE_PATTERN: Final[re.Pattern[str]] = re.compile(r"\bsince\b", re.IGNORECASE)
+
+
+def _detect_latitude(ds: xr.Dataset) -> str | None:
+    """Detect the latitude variable in an xarray Dataset.
+
+    Uses a CF-style priority cascade: standard_name > units > conventional
+    name > axis attribute.
+
+    Args:
+        ds: An open xarray Dataset.
+
+    Returns:
+        The name of the latitude variable, or None if no match is found.
+    """
+    for name, var in ds.variables.items():
+        if var.attrs.get("standard_name") == "latitude":
+            return str(name)
+    for name, var in ds.variables.items():
+        if str(var.attrs.get("units", "")) in _LATITUDE_UNITS:
+            return str(name)
+    for name in ds.variables:
+        if str(name) in _LATITUDE_NAMES:
+            return str(name)
+    for name, var in ds.variables.items():
+        if var.attrs.get("axis") == "Y":
+            return str(name)
+    return None
+
+
+def _detect_longitude(ds: xr.Dataset) -> str | None:
+    """Detect the longitude variable in an xarray Dataset.
+
+    Uses a CF-style priority cascade: standard_name > units > conventional
+    name > axis attribute.
+
+    Args:
+        ds: An open xarray Dataset.
+
+    Returns:
+        The name of the longitude variable, or None if no match is found.
+    """
+    for name, var in ds.variables.items():
+        if var.attrs.get("standard_name") == "longitude":
+            return str(name)
+    for name, var in ds.variables.items():
+        if str(var.attrs.get("units", "")) in _LONGITUDE_UNITS:
+            return str(name)
+    for name in ds.variables:
+        if str(name) in _LONGITUDE_NAMES:
+            return str(name)
+    for name, var in ds.variables.items():
+        if var.attrs.get("axis") == "X":
+            return str(name)
+    return None
+
+
+def _detect_time(ds: xr.Dataset) -> str | None:
+    """Detect the time variable in an xarray Dataset.
+
+    Uses a CF-style priority cascade: standard_name > "since" units pattern >
+    conventional name > axis attribute.
+
+    Args:
+        ds: An open xarray Dataset.
+
+    Returns:
+        The name of the time variable, or None if no match is found.
+    """
+    for name, var in ds.variables.items():
+        if var.attrs.get("standard_name") == "time":
+            return str(name)
+    for name, var in ds.variables.items():
+        units = var.attrs.get("units")
+        if units is not None and _TIME_SINCE_PATTERN.search(str(units)):
+            return str(name)
+    for name in ds.variables:
+        if str(name) in _TIME_NAMES:
+            return str(name)
+    for name, var in ds.variables.items():
+        if var.attrs.get("axis") == "T":
+            return str(name)
+    return None
+
 
 # ---------------------------------------------------------------------------
 # Options
@@ -139,45 +243,70 @@ class Options:
         self.lon_key: str = ""
 
 
+# Per-input-choice dispatch: (y_key, folder_attr_on_options, glob_pattern).
+# y_key stays hardcoded because it's the science variable; the lat/lon/time
+# coord names are auto-detected from the first matching file.
+_INPUT_DISPATCH: Final[dict[str, tuple[str, str, str]]] = {
+    "SSHA": ("SLA", "ssha_folder", "*.nc"),
+    "simple_grids": ("ssha", "simple_folder", "**/*.nc"),
+    "Argo": ("ohc_2d_lt_700m", "argo_folder", "*.nc"),
+    "MUR_SST": ("sst_anomaly", "mur_sst_folder", "*.nc"),
+    "AQUA_MODIS": ("chlor_a", "aqua_modis_folder", "*.nc"),
+    "GRACE": ("lwe_thickness", "grace_folder", "*.nc"),
+}
+
+
 def configure_keys_for_input(options: Options) -> None:
-    """Set data key names and per-dataset defaults based on input_choice.
+    """Set y_key from the input_choice dispatch and auto-detect lat/lon/time.
+
+    Opens the first matching file in the dataset's data folder and inspects
+    its variable attributes (CF-style cascade) to identify the coordinate
+    names. CLI overrides via --lat-var/--lon-var/--time-var take precedence.
+    Time falls back to "time" when no time coord exists (e.g. AQUA_MODIS L3m,
+    where the loader synthesises a "time" dim in its preprocess step).
 
     Args:
-        options: Options object. Mutates time_key, y_key, lat_key, lon_key,
-                 min_period, max_period, xskip.
+        options: Options object. Mutates time_key, y_key, lat_key, lon_key.
+
+    Raises:
+        KeyError: If options.input_choice is not in _INPUT_DISPATCH.
+        FileNotFoundError: If the data folder contains no matching files.
+        ValueError: If lat or lon cannot be detected and no override is given.
     """
-    if options.input_choice == "SSHA":
-        options.time_key = "Time"
-        options.y_key = "SLA"
-        options.lat_key = "Latitude"
-        options.lon_key = "Longitude"
-    elif options.input_choice == "simple_grids":
-        options.time_key = "time"
-        options.y_key = "ssha"
-        options.lat_key = "latitude"
-        options.lon_key = "longitude"
-    elif options.input_choice == "Argo":
-        options.time_key = "time"
-        options.y_key = "ohc_2d_lt_700m"
-        options.lat_key = "latitude"
-        options.lon_key = "longitude"
-    elif options.input_choice == "MUR_SST":
-        options.time_key = "time"
-        options.y_key = "sst_anomaly"
-        options.lat_key = "lat"
-        options.lon_key = "lon"
-    elif options.input_choice == "AQUA_MODIS":
-        options.time_key = "time"
-        options.y_key = "chlor_a"
-        options.lat_key = "lat"
-        options.lon_key = "lon"
-    elif options.input_choice == "GRACE":
-        options.time_key = "time"
-        options.y_key = "lwe_thickness"
-        options.lat_key = "lat"
-        options.lon_key = "lon"
-    else:
-        logging.error(f"DID NOT RECOGNIZE {options.input_choice = }")
+    y_key, folder_attr, glob_pattern = _INPUT_DISPATCH[options.input_choice]
+    options.y_key = y_key
+
+    folder: Path = getattr(options, folder_attr)
+    candidates = sorted(folder.glob(glob_pattern))
+    if not candidates:
+        raise FileNotFoundError(f"No files matching {glob_pattern!r} found in {folder}")
+    representative = candidates[0]
+
+    args = options.args
+    with xr.open_dataset(representative) as ds:
+        lat = args.lat_var or _detect_latitude(ds)
+        lon = args.lon_var or _detect_longitude(ds)
+        time = args.time_var or _detect_time(ds) or "time"
+
+    if lat is None:
+        raise ValueError(
+            f"Could not detect latitude variable in {representative}; "
+            f"specify it explicitly with --lat-var."
+        )
+    if lon is None:
+        raise ValueError(
+            f"Could not detect longitude variable in {representative}; "
+            f"specify it explicitly with --lon-var."
+        )
+
+    options.lat_key = lat
+    options.lon_key = lon
+    options.time_key = time
+
+    logging.info(
+        f"Detected coords for {options.input_choice}: "
+        f"time={time} lat={lat} lon={lon}, y={y_key}"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -325,6 +454,24 @@ def parse_arguments(options: Options) -> None:
         default=None,
         choices=options.input_choices_list,
         help=f"Data source (default: {options.input_choice}).",
+    )
+    parser.add_argument(
+        "--lat-var",
+        type=str,
+        default=None,
+        help="Override auto-detected latitude variable name.",
+    )
+    parser.add_argument(
+        "--lon-var",
+        type=str,
+        default=None,
+        help="Override auto-detected longitude variable name.",
+    )
+    parser.add_argument(
+        "--time-var",
+        type=str,
+        default=None,
+        help="Override auto-detected time variable name.",
     )
     parser.add_argument(
         "--xskip",
