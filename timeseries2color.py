@@ -38,6 +38,239 @@ xr.set_options(file_cache_maxsize=32)
 import gc
 
 __version__ = "0.2.1"
+
+# ---------------------------------------------------------------------------
+# Options
+# ---------------------------------------------------------------------------
+
+# Per-input-choice dispatch: (y_key, folder_attr_on_options, glob_pattern).
+# y_key stays hardcoded because it's the science variable; the lat/lon/time
+# coord names are auto-detected from the first matching file.
+_INPUT_DISPATCH: Final[dict[str, tuple[str, str, str]]] = {
+    "SSHA": ("SLA", "ssha_folder", "*.nc"),
+    "simple_grids": ("ssha", "simple_folder", "**/*.nc"),
+    "Argo": ("ohc_2d_lt_700m", "argo_folder", "*.nc"),
+    "MUR_SST": ("sst_anomaly", "mur_sst_folder", "*.nc"),
+    "AQUA_MODIS": ("chlor_a", "aqua_modis_folder", "*.nc"),
+    "GRACE": ("lwe_thickness", "grace_folder", "*.nc"),
+}
+
+
+class Options:
+    """All global options in one place."""
+
+    def __init__(self) -> None:
+        """Initialize Options with default values."""
+        # Identity
+        self.my_name: str = Path(sys.argv[0]).stem
+        self.cwd: Path = Path.cwd().expanduser().resolve(strict=True)
+        self.log_mode: int = logging.INFO
+        self.args: argparse.Namespace = argparse.Namespace()
+
+        # Paths
+        self.output_base: Path = self.cwd / "output"
+        # self.ssha_folder: Path = (
+        #     self.cwd / "sealevel_spectra" / "fast_202306" / "fast_netCDF4"
+        # )
+        self.ssha_folder: Path = self.cwd / "sealevel_spectra" / "SSHA_v2205"
+        self.simple_folder: Path = self.cwd / "sealevel_spectra" / "simple_grids"
+        self.argo_folder: Path = self.cwd / "sealevel_spectra" / "Argo"
+        self.mur_sst_folder: Path = (
+            self.cwd / "sealevel_spectra" / "MUR_SST" / "MUR25-JPL-L4-GLOB-v04.2"
+        )
+        self.aqua_modis_folder: Path = self.cwd / "sealevel_spectra" / "AQUA_MODIS"
+        self.grace_folder: Path = self.cwd / "sealevel_spectra" / "JPL_GRACE_mascons"
+        self.cie_file: Path = (
+            self.cwd / "sealevel_spectra" / "ciexyz31_1_trimmed_380nm_760nm.csv"
+        )
+        self.output_folder: Path = Path()  # set in main()
+
+        # Configuration
+
+        self.input_choices_list: list[str] = [
+            "SSHA",
+            "simple_grids",
+            "Argo",
+            "MUR_SST",
+            "AQUA_MODIS",
+            "GRACE",
+        ]
+        self.input_choice: str = "AQUA_MODIS"
+        self.min_period: float = 3 * 7.0  # days
+        self.max_period: float = 24 * 7.0  # days
+        # self.min_period: float = 10 * 7.0  # days
+        # self.max_period: float = 54 * 7.0  # days
+
+        self.fit_terms: list[str] = []
+        self.fit_terms += ["constant", "trend", "accel"]
+        # self.fit_terms += ["annual"]
+        # self.fit_terms += ["semiannual"]
+        # self.fit_terms += ["annual", "semiannual"]
+
+        self.xskip: int = 100  # only use every "xskip" point in each direction.
+        self.tskip: int = 1  # only use every "tskip" point in the time series
+
+        # Desired memory footprints; chunk_size and tile_side are derived from these
+        self.chunk_bytes: float = 250e6  # bytes per dask time chunk
+        self.block_bytes: float = 500e6  # bytes per loop (lat, lon) tile
+
+        # Controls xarray.open_mfdataset's parallel setting.
+        # Be careful, parallel=True can spike RAM on open
+        # (Above, not unrelated: dask.config.set(scheduler="synchronous"))
+        self.mf_parallel: bool = bool(0)
+
+        self.thepower: float = 0.8
+
+        self.dpi: int = 300
+        self.figsize: tuple[int, int] = (10, 5)
+
+        # Function selection
+        self.use_new_funcs: bool = bool(0)
+
+        # Files to copy into output
+        self.files_to_copy: list[str] = ["projections.sh", "overflow.sh", "notation.sh"]
+
+        # Not a configurable option.
+        self.fake_chunk: int = 100
+
+        # Hard cap on total dask chunks across all opened files.  Sets the
+        # upper bound on the HighLevelGraph size at ~300 bytes/task ⇒
+        # ~300 MB graph at the default. Lower if your machine is tight on
+        # RAM at open time.
+        self.max_graph_chunks: int = 1_000_000
+
+        # Spatial chunks for xr.open_mfdataset; populated by
+        # derive_spatial_chunks(options) before load_input_data().
+        self.lat_chunk: int = -1
+        self.lon_chunk: int = -1
+        self.tile_side: int = 0
+
+        # First-file shape, populated by configure_keys_for_input().
+        self.n_lat_raw: int = 0
+        self.n_lon_raw: int = 0
+        self.on_disk_chunks: tuple[int, int] | None = None
+
+        # Data structures (initialized by populate_results after hot path)
+        self.plot_options: PlotOptions = PlotOptions()
+        self.grid: GridData = GridData()
+        self.results: Results = Results()
+
+        # Data key names (set per input_choice in configure_keys_for_input)
+        self.time_key: str = ""
+        self.y_key: str = ""
+        self.lat_key: str = ""
+        self.lon_key: str = ""
+
+
+# ---------------------------------------------------------------------------
+# Data structures (mirrors C++ structs from abridged-definitions.hpp)
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class LatLonData:
+    """Equal-grid latlon data (mirrors C++ latlon_s, definitions.hpp:238-256).
+
+    Holds coordinates and output data for a 2D lat/lon grid.
+    """
+
+    lat: list[float] = field(default_factory=list)
+    lon: list[float] = field(default_factory=list)
+    outputs: list[list[list[float]]] = field(default_factory=list)  # [param][lat][lon]
+    elev: list[list[float]] = field(default_factory=list)
+    mascon_lats: list[float] = field(default_factory=list)
+    mascon_lons: list[float] = field(default_factory=list)
+    mask: float = float("nan")
+
+
+@dataclass
+class AnalysisOptions:
+    """Analysis options (subset of C++ analysis_options_s used by GMT path).
+
+    Controls which output format and parameter types are used.
+    """
+
+    output_choice: int = 5  # 1=unstructured, 5=latlon grid
+    output_type: list[int] = field(
+        default_factory=list
+    )  # per-parameter (e.g. 104=phase)
+
+
+@dataclass
+class PlotOptions:
+    """Plotting/visualization options (mirrors C++ plot_options_s, definitions.hpp:443-490).
+
+    Controls GMT script generation, projection, color scheme, and matplotlib output.
+    """
+
+    outputfolder: str = ""
+    just_the_filenames: list[str] = field(default_factory=list)
+    output_base: str = "map_parameter"
+    projection: int = 2  # 2=Winkel Tripel (matches C++ default)
+    coastlines: int = 1  # 1=coast, 2=coast+InSAR
+    symmetric_limit: float = -1.0  # <=0 disables (matches C++)
+    scale_digits: int = 2
+    color_scheme: int = 2  # 1=white BG, 2=black BG
+    montage: int = 0
+    blurb_disabled: int = 1
+    phase_mask: int = 12  # 1/2=abrupt, 11/12=gradual (matches C++)
+    plot_mascons: int = 0
+    no_gmt_plots: int = 1  # 1=skip GMT
+    # Matplotlib-only fields:
+    dpi: int = 300
+    show_fig: bool = False
+    save_fig: bool = True
+    figsize: tuple[int, int] = (14, 7)
+    # Disabled land and ocean fill because it only seems to happen near the poles.
+    # land_color: str = "#333333"  # Dark grey
+    # ocean_color: str = "black"  # Matches dark_background theme
+    dark_mode: bool = bool(1)  # False = light/white background
+    show_borders: bool = False  # Political boundaries
+    show_rivers: bool = False  # Major rivers
+    coastline_resolution: str = "110m"  # "110m" or "50m"
+
+
+@dataclass
+class GridData:
+    """Grid point data (simplified from C++ grid_s, definitions.hpp:258-319).
+
+    Holds grid coordinates and boundaries.
+    """
+
+    lat: list[float] = field(default_factory=list)
+    lon: list[float] = field(default_factory=list)
+    maxlat: float = 90.0
+    minlat: float = -90.0
+    maxlon: float = 360.0
+    minlon: float = 0.0
+    latlon: LatLonData | None = None
+
+
+@dataclass
+class Results:
+    """Computation results (mirrors C++ results_s, definitions.hpp:338-441).
+
+    Holds output data, metadata, spatial extent, and RGB color mapping state.
+    """
+
+    titles: list[str] = field(default_factory=list)
+    units: list[str] = field(default_factory=list)
+    base_unit: str = "cm"
+    latlon: LatLonData = field(default_factory=LatLonData)
+    error_bars: list[float] = field(default_factory=list)
+    marker_lats: list[list[float]] = field(default_factory=list)
+    marker_lons: list[list[float]] = field(default_factory=list)
+    minlat: float = -90.0
+    maxlat: float = 90.0
+    minlon: float = 0.0
+    maxlon: float = 360.0
+    rgb: list[float] = field(default_factory=list)
+    rgb_choice: int = 2  # C++ default: 0=non-uniform, 1=uniform, 2=multi-width
+    max_labels: int = 10  # C++ default
+    max_widths: int = 1
+    options: AnalysisOptions = field(default_factory=AnalysisOptions)
+
+
 DAYS_IN_YEAR: Final[float] = 365.25
 
 # XYZ-to-linear-sRGB matrix (Hughes & Williams 2010, no gamma correction)
@@ -150,130 +383,6 @@ def _detect_time(ds: xr.Dataset) -> str | None:
         if var.attrs.get("axis") == "T":
             return str(name)
     return None
-
-
-# ---------------------------------------------------------------------------
-# Options
-# ---------------------------------------------------------------------------
-
-
-class Options:
-    """All global options in one place."""
-
-    def __init__(self) -> None:
-        """Initialize Options with default values."""
-        # Identity
-        self.my_name: str = Path(sys.argv[0]).stem
-        self.cwd: Path = Path.cwd().expanduser().resolve(strict=True)
-        self.log_mode: int = logging.INFO
-        self.args: argparse.Namespace = argparse.Namespace()
-
-        # Paths
-        self.output_base: Path = self.cwd / "output"
-        # self.ssha_folder: Path = (
-        #     self.cwd / "sealevel_spectra" / "fast_202306" / "fast_netCDF4"
-        # )
-        self.ssha_folder: Path = self.cwd / "sealevel_spectra" / "SSHA_v2205"
-        self.simple_folder: Path = self.cwd / "sealevel_spectra" / "simple_grids"
-        self.argo_folder: Path = self.cwd / "sealevel_spectra" / "Argo"
-        self.mur_sst_folder: Path = (
-            self.cwd / "sealevel_spectra" / "MUR_SST" / "MUR25-JPL-L4-GLOB-v04.2"
-        )
-        self.aqua_modis_folder: Path = self.cwd / "sealevel_spectra" / "AQUA_MODIS"
-        self.grace_folder: Path = self.cwd / "sealevel_spectra" / "JPL_GRACE_mascons"
-        self.cie_file: Path = (
-            self.cwd / "sealevel_spectra" / "ciexyz31_1_trimmed_380nm_760nm.csv"
-        )
-        self.output_folder: Path = Path()  # set in main()
-
-        # Configuration
-
-        self.input_choices_list: list[str] = [
-            "SSHA",
-            "simple_grids",
-            "Argo",
-            "MUR_SST",
-            "AQUA_MODIS",
-            "GRACE",
-        ]
-        self.input_choice: str = "AQUA_MODIS"
-        self.min_period: float = 3 * 7.0  # days
-        self.max_period: float = 24 * 7.0  # days
-        # self.min_period: float = 10 * 7.0  # days
-        # self.max_period: float = 54 * 7.0  # days
-
-        self.fit_terms: list[str] = []
-        self.fit_terms += ["constant", "trend", "accel"]
-        # self.fit_terms += ["annual"]
-        # self.fit_terms += ["semiannual"]
-        # self.fit_terms += ["annual", "semiannual"]
-
-        self.xskip: int = 100  # only use every "xskip" point in each direction.
-        self.tskip: int = 1  # only use every "tskip" point in the time series
-
-        # Desired memory footprints; chunk_size and tile_side are derived from these
-        self.chunk_bytes: float = 250e6  # bytes per dask time chunk
-        self.block_bytes: float = 500e6  # bytes per loop (lat, lon) tile
-
-        # Controls xarray.open_mfdataset's parallel setting.
-        # Be careful, parallel=True can spike RAM on open
-        # (Above, not unrelated: dask.config.set(scheduler="synchronous"))
-        self.mf_parallel: bool = bool(0)
-
-        self.thepower: float = 0.8
-
-        self.dpi: int = 300
-        self.figsize: tuple[int, int] = (10, 5)
-
-        # Function selection
-        self.use_new_funcs: bool = bool(0)
-
-        # Files to copy into output
-        self.files_to_copy: list[str] = ["projections.sh", "overflow.sh", "notation.sh"]
-
-        # Not a configurable option.
-        self.fake_chunk: int = 100
-
-        # Hard cap on total dask chunks across all opened files.  Sets the
-        # upper bound on the HighLevelGraph size at ~300 bytes/task ⇒
-        # ~300 MB graph at the default. Lower if your machine is tight on
-        # RAM at open time.
-        self.max_graph_chunks: int = 1_000_000
-
-        # Spatial chunks for xr.open_mfdataset; populated by
-        # derive_spatial_chunks(options) before load_input_data().
-        self.lat_chunk: int = -1
-        self.lon_chunk: int = -1
-        self.tile_side: int = 0
-
-        # First-file shape, populated by configure_keys_for_input().
-        self.n_lat_raw: int = 0
-        self.n_lon_raw: int = 0
-        self.on_disk_chunks: tuple[int, int] | None = None
-
-        # Data structures (initialized by populate_results after hot path)
-        self.plot_options: PlotOptions = PlotOptions()
-        self.grid: GridData = GridData()
-        self.results: Results = Results()
-
-        # Data key names (set per input_choice in configure_keys_for_input)
-        self.time_key: str = ""
-        self.y_key: str = ""
-        self.lat_key: str = ""
-        self.lon_key: str = ""
-
-
-# Per-input-choice dispatch: (y_key, folder_attr_on_options, glob_pattern).
-# y_key stays hardcoded because it's the science variable; the lat/lon/time
-# coord names are auto-detected from the first matching file.
-_INPUT_DISPATCH: Final[dict[str, tuple[str, str, str]]] = {
-    "SSHA": ("SLA", "ssha_folder", "*.nc"),
-    "simple_grids": ("ssha", "simple_folder", "**/*.nc"),
-    "Argo": ("ohc_2d_lt_700m", "argo_folder", "*.nc"),
-    "MUR_SST": ("sst_anomaly", "mur_sst_folder", "*.nc"),
-    "AQUA_MODIS": ("chlor_a", "aqua_modis_folder", "*.nc"),
-    "GRACE": ("lwe_thickness", "grace_folder", "*.nc"),
-}
 
 
 def configure_keys_for_input(options: Options) -> None:
@@ -537,115 +646,6 @@ def derive_spatial_chunks(options: "Options") -> None:
             f"max_graph_chunks={options.max_graph_chunks}; consider raising "
             f"--max-graph-chunks or increasing --tskip."
         )
-
-
-# ---------------------------------------------------------------------------
-# Data structures (mirrors C++ structs from abridged-definitions.hpp)
-# ---------------------------------------------------------------------------
-
-
-@dataclass
-class LatLonData:
-    """Equal-grid latlon data (mirrors C++ latlon_s, definitions.hpp:238-256).
-
-    Holds coordinates and output data for a 2D lat/lon grid.
-    """
-
-    lat: list[float] = field(default_factory=list)
-    lon: list[float] = field(default_factory=list)
-    outputs: list[list[list[float]]] = field(default_factory=list)  # [param][lat][lon]
-    elev: list[list[float]] = field(default_factory=list)
-    mascon_lats: list[float] = field(default_factory=list)
-    mascon_lons: list[float] = field(default_factory=list)
-    mask: float = float("nan")
-
-
-@dataclass
-class AnalysisOptions:
-    """Analysis options (subset of C++ analysis_options_s used by GMT path).
-
-    Controls which output format and parameter types are used.
-    """
-
-    output_choice: int = 5  # 1=unstructured, 5=latlon grid
-    output_type: list[int] = field(
-        default_factory=list
-    )  # per-parameter (e.g. 104=phase)
-
-
-@dataclass
-class PlotOptions:
-    """Plotting/visualization options (mirrors C++ plot_options_s, definitions.hpp:443-490).
-
-    Controls GMT script generation, projection, color scheme, and matplotlib output.
-    """
-
-    outputfolder: str = ""
-    just_the_filenames: list[str] = field(default_factory=list)
-    output_base: str = "map_parameter"
-    projection: int = 2  # 2=Winkel Tripel (matches C++ default)
-    coastlines: int = 1  # 1=coast, 2=coast+InSAR
-    symmetric_limit: float = -1.0  # <=0 disables (matches C++)
-    scale_digits: int = 2
-    color_scheme: int = 2  # 1=white BG, 2=black BG
-    montage: int = 0
-    blurb_disabled: int = 1
-    phase_mask: int = 12  # 1/2=abrupt, 11/12=gradual (matches C++)
-    plot_mascons: int = 0
-    no_gmt_plots: int = 1  # 1=skip GMT
-    # Matplotlib-only fields:
-    dpi: int = 300
-    show_fig: bool = False
-    save_fig: bool = True
-    figsize: tuple[int, int] = (14, 7)
-    # Disabled land and ocean fill because it only seems to happen near the poles.
-    # land_color: str = "#333333"  # Dark grey
-    # ocean_color: str = "black"  # Matches dark_background theme
-    dark_mode: bool = bool(1)  # False = light/white background
-    show_borders: bool = False  # Political boundaries
-    show_rivers: bool = False  # Major rivers
-    coastline_resolution: str = "110m"  # "110m" or "50m"
-
-
-@dataclass
-class GridData:
-    """Grid point data (simplified from C++ grid_s, definitions.hpp:258-319).
-
-    Holds grid coordinates and boundaries.
-    """
-
-    lat: list[float] = field(default_factory=list)
-    lon: list[float] = field(default_factory=list)
-    maxlat: float = 90.0
-    minlat: float = -90.0
-    maxlon: float = 360.0
-    minlon: float = 0.0
-    latlon: LatLonData | None = None
-
-
-@dataclass
-class Results:
-    """Computation results (mirrors C++ results_s, definitions.hpp:338-441).
-
-    Holds output data, metadata, spatial extent, and RGB color mapping state.
-    """
-
-    titles: list[str] = field(default_factory=list)
-    units: list[str] = field(default_factory=list)
-    base_unit: str = "cm"
-    latlon: LatLonData = field(default_factory=LatLonData)
-    error_bars: list[float] = field(default_factory=list)
-    marker_lats: list[list[float]] = field(default_factory=list)
-    marker_lons: list[list[float]] = field(default_factory=list)
-    minlat: float = -90.0
-    maxlat: float = 90.0
-    minlon: float = 0.0
-    maxlon: float = 360.0
-    rgb: list[float] = field(default_factory=list)
-    rgb_choice: int = 2  # C++ default: 0=non-uniform, 1=uniform, 2=multi-width
-    max_labels: int = 10  # C++ default
-    max_widths: int = 1
-    options: AnalysisOptions = field(default_factory=AnalysisOptions)
 
 
 # ---------------------------------------------------------------------------
