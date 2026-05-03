@@ -208,7 +208,7 @@ class Options:
         # self.fit_terms += ["semiannual"]
         # self.fit_terms += ["annual", "semiannual"]
 
-        self.xskip: int = 1  # only use every "xskip" point in each direction.
+        self.xskip: int = 100  # only use every "xskip" point in each direction.
         self.tskip: int = 1  # only use every "tskip" point in the time series
 
         # Desired memory footprints; chunk_size and tile_side are derived from these
@@ -1801,7 +1801,11 @@ def load_ssha_files(options: Options) -> xr.Dataset:
         compat="override",
         combine="by_coords",
         parallel=options.mf_parallel,
-        chunks={options.time_key: options.fake_chunk},
+        chunks={
+            options.time_key: options.fake_chunk,
+            options.lat_key: -1,
+            options.lon_key: -1,
+        },
     )
     return input_data
 
@@ -1886,7 +1890,11 @@ def load_mur_sst_files(options: Options) -> xr.Dataset:
         compat="override",
         combine="by_coords",
         parallel=options.mf_parallel,
-        chunks={options.time_key: options.fake_chunk},
+        chunks={
+            options.time_key: options.fake_chunk,
+            options.lat_key: -1,
+            options.lon_key: -1,
+        },
     )
     return input_data
 
@@ -1928,7 +1936,11 @@ def load_aqua_modis_files(options: Options) -> xr.Dataset:
         coords="minimal",
         compat="override",
         parallel=options.mf_parallel,
-        chunks={options.time_key: options.fake_chunk},
+        chunks={
+            options.time_key: options.fake_chunk,
+            options.lat_key: -1,
+            options.lon_key: -1,
+        },
     )
 
     return input_data
@@ -1987,7 +1999,11 @@ def load_simple_grid_files(options: Options) -> xr.Dataset:
         coords="minimal",
         compat="override",
         parallel=options.mf_parallel,
-        chunks={options.time_key: options.fake_chunk},
+        chunks={
+            options.time_key: options.fake_chunk,
+            options.lat_key: -1,
+            options.lon_key: -1,
+        },
     )
     return input_data
 
