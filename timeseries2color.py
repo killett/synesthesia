@@ -234,6 +234,23 @@ class Options:
         # Not a configurable option.
         self.fake_chunk: int = 100
 
+        # Hard cap on total dask chunks across all opened files.  Sets the
+        # upper bound on the HighLevelGraph size at ~300 bytes/task ⇒
+        # ~300 MB graph at the default. Lower if your machine is tight on
+        # RAM at open time.
+        self.max_graph_chunks: int = 1_000_000
+
+        # Spatial chunks for xr.open_mfdataset; populated by
+        # derive_spatial_chunks(options) before load_input_data().
+        self.lat_chunk: int = -1
+        self.lon_chunk: int = -1
+        self.tile_side: int = 0
+
+        # First-file shape, populated by configure_keys_for_input().
+        self.n_lat_raw: int = 0
+        self.n_lon_raw: int = 0
+        self.on_disk_chunks: tuple[int, int] | None = None
+
         # Data structures (initialized by populate_results after hot path)
         self.plot_options: PlotOptions = PlotOptions()
         self.grid: GridData = GridData()
@@ -306,10 +323,220 @@ def configure_keys_for_input(options: Options) -> None:
     options.lon_key = lon
     options.time_key = time
 
+    # Capture the inputs derive_spatial_chunks needs while the file is open.
+    # Tolerate bogus overrides — leave defaults so callers still see a value
+    # even if the resolved lat/lon name doesn't exist in the file.
+    with xr.open_dataset(representative) as ds:
+        try:
+            options.n_lat_raw = int(ds.sizes[lat])
+            options.n_lon_raw = int(ds.sizes[lon])
+            options.on_disk_chunks = _extract_lat_lon_disk_chunks(
+                ds[y_key], lat_key=lat, lon_key=lon
+            )
+        except KeyError:
+            options.n_lat_raw = 0
+            options.n_lon_raw = 0
+            options.on_disk_chunks = None
+
     logging.info(
         f"Detected coords for {options.input_choice}: "
         f"time={time} lat={lat} lon={lon}, y={y_key}"
     )
+    logging.info(
+        f"First-file shape: {options.n_lat_raw} × {options.n_lon_raw}, "
+        f"on-disk chunks: {options.on_disk_chunks}"
+    )
+
+
+def _extract_lat_lon_disk_chunks(
+    da: xr.DataArray, *, lat_key: str, lon_key: str
+) -> tuple[int, int] | None:
+    """Pull the (lat, lon) entries out of a DataArray's HDF5 chunksizes.
+
+    Args:
+        da: The data variable, with .encoding["chunksizes"] possibly set.
+        lat_key: Name of the latitude dim.
+        lon_key: Name of the longitude dim.
+
+    Returns:
+        (cy, cx) — chunk size along (lat, lon) — or None if the encoding
+        doesn't expose chunksizes, the dims don't include both axes, or the
+        chunk along that axis equals the full dim (no useful chunking).
+    """
+    chunksizes = da.encoding.get("chunksizes")
+    if chunksizes is None:
+        return None
+    if lat_key not in da.dims or lon_key not in da.dims:
+        return None
+    try:
+        cy = int(chunksizes[da.dims.index(lat_key)])
+        cx = int(chunksizes[da.dims.index(lon_key)])
+    except (IndexError, TypeError):
+        return None
+    if cy >= int(da.sizes[lat_key]) and cx >= int(da.sizes[lon_key]):
+        return None
+    return (cy, cx)
+
+
+def _calculate_spatial_chunks(
+    n_files: int,
+    n_lat_raw: int,
+    n_lon_raw: int,
+    xskip: int,
+    on_disk_chunks: tuple[int, int] | None,
+    block_bytes: float,
+    max_graph_chunks: int,
+    itemsize: int = 4,
+    manual_lat: int | None = None,
+    manual_lon: int | None = None,
+) -> tuple[int, int, int]:
+    """Pure spatial-chunk derivation for ``xr.open_mfdataset``.
+
+    Implements the algorithm in
+    /home/claudeuser/.claude/plans/you-just-modified-timeseries2color-py-ethereal-sunset.md
+
+    Args:
+        n_files: Number of files in the multi-file dataset.
+        n_lat_raw: Latitude dim of one file before xskip.
+        n_lon_raw: Longitude dim of one file before xskip.
+        xskip: Stride used in the loader's preprocess isel.
+        on_disk_chunks: HDF5 chunk shape (cy, cx) along (lat, lon), or None.
+        block_bytes: Target per-tile RAM (the same as the existing option).
+        max_graph_chunks: Hard cap on total dask chunks across all files.
+        itemsize: Bytes per element after preprocess (float32 → 4).
+        manual_lat: User override; takes precedence when both are given.
+        manual_lon: User override; takes precedence when both are given.
+
+    Returns:
+        (lat_chunk, lon_chunk, tile_side).  When n_files <= 1 the chunks are
+        -1 (let xarray fall back to one chunk per file, no graph hazard).
+    """
+    # Step 0 — single-file short-circuit.
+    if n_files <= 1:
+        return -1, -1, 1
+
+    # Step 1 — post-xskip dims.
+    n_lat = -(-n_lat_raw // xskip)
+    n_lon = -(-n_lon_raw // xskip)
+
+    # Step 2 — pre-load tile_side estimate.
+    tile_side = max(
+        1,
+        min(
+            n_lat,
+            n_lon,
+            int(np.sqrt(block_bytes / (n_files * itemsize))),
+        ),
+    )
+
+    # Step 8 — manual override wins over derivation.
+    if manual_lat is not None and manual_lon is not None:
+        return (
+            max(1, min(manual_lat, n_lat)),
+            max(1, min(manual_lon, n_lon)),
+            tile_side,
+        )
+
+    # Step 3 — graph-budget lower bound. Start at the continuous
+    # approximation and bump up until ceiling effects no longer push the
+    # exact chunk count over the budget.
+    c_budget = int(np.ceil(np.sqrt(n_files * n_lat * n_lon / max_graph_chunks)))
+    cap = min(n_lat, n_lon)
+    while (
+        c_budget < cap
+        and n_files * -(-n_lat // c_budget) * -(-n_lon // c_budget)
+        > max_graph_chunks
+    ):
+        c_budget += 1
+
+    # Step 4 — combine bounds.
+    c_lo = max(c_budget, tile_side)
+
+    # Step 5 — apply per-axis cap.
+    lat_chunk = min(c_lo, n_lat)
+    lon_chunk = min(c_lo, n_lon)
+
+    # Step 6 — disk alignment (only when xskip == 1 and on-disk chunks known).
+    if xskip == 1 and on_disk_chunks is not None:
+        cy, cx = on_disk_chunks
+        lat_chunk = min(n_lat, cy * -(-lat_chunk // cy))
+        lon_chunk = min(n_lon, cx * -(-lon_chunk // cx))
+
+    # Step 7 — exact verify, fall back to one chunk per file if over budget.
+    # (After Step 3's iteration this only fires when n_files alone > B.)
+    n_total = n_files * -(-n_lat // lat_chunk) * -(-n_lon // lon_chunk)
+    if n_total > max_graph_chunks:
+        lat_chunk = n_lat
+        lon_chunk = n_lon
+
+    return lat_chunk, lon_chunk, tile_side
+
+
+def derive_spatial_chunks(options: "Options") -> None:
+    """Set ``options.lat_chunk`` / ``lon_chunk`` / ``tile_side`` from the
+    actual dataset. Logs the rationale at INFO level.
+
+    Must run after ``configure_keys_for_input`` (which populates
+    ``n_lat_raw``, ``n_lon_raw``, ``on_disk_chunks``) and after the CLI
+    backfill (which sets the final ``xskip``), but before
+    ``load_input_data``.
+
+    Args:
+        options: Options object. Mutates ``lat_chunk``, ``lon_chunk``,
+                 ``tile_side``.
+    """
+    # Recover n_files from the dispatch table without re-opening any file.
+    _y_key, folder_attr, glob_pattern = _INPUT_DISPATCH[options.input_choice]
+    folder: Path = getattr(options, folder_attr)
+    candidates = sorted(folder.glob(glob_pattern))
+    n_files = len(candidates[:: options.tskip])
+
+    manual_lat = getattr(options.args, "lat_chunk", None)
+    manual_lon = getattr(options.args, "lon_chunk", None)
+
+    lat_chunk, lon_chunk, tile_side = _calculate_spatial_chunks(
+        n_files=n_files,
+        n_lat_raw=options.n_lat_raw,
+        n_lon_raw=options.n_lon_raw,
+        xskip=options.xskip,
+        on_disk_chunks=options.on_disk_chunks,
+        block_bytes=options.block_bytes,
+        max_graph_chunks=options.max_graph_chunks,
+        itemsize=4,
+        manual_lat=manual_lat,
+        manual_lon=manual_lon,
+    )
+
+    options.lat_chunk = lat_chunk
+    options.lon_chunk = lon_chunk
+    options.tile_side = tile_side
+
+    n_lat_post = -(-options.n_lat_raw // options.xskip)
+    n_lon_post = -(-options.n_lon_raw // options.xskip)
+    if lat_chunk > 0 and lon_chunk > 0:
+        n_total = (
+            n_files
+            * -(-n_lat_post // lat_chunk)
+            * -(-n_lon_post // lon_chunk)
+        )
+    else:
+        n_total = n_files  # single-file or sentinel
+    logging.info(
+        f"CHUNK INPUTS: n_files={n_files}, "
+        f"n_lat_raw={options.n_lat_raw}, n_lon_raw={options.n_lon_raw}, "
+        f"xskip={options.xskip}, on_disk={options.on_disk_chunks}"
+    )
+    logging.info(
+        f"CHUNK FINAL: lat_chunk={lat_chunk}, lon_chunk={lon_chunk}, "
+        f"tile_side={tile_side}; total dask chunks ≈ {n_total:,} "
+        f"(budget {options.max_graph_chunks:,})"
+    )
+    if n_total > options.max_graph_chunks:
+        logging.warning(
+            f"CHUNK BUDGET: n_files={n_files} alone exceeds "
+            f"max_graph_chunks={options.max_graph_chunks}; consider raising "
+            f"--max-graph-chunks or increasing --tskip."
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -507,6 +734,34 @@ def parse_arguments(options: Options) -> None:
         help=f"Target bytes per loop block (default: {options.block_bytes:.0e}).",
     )
     parser.add_argument(
+        "--max-graph-chunks",
+        type=int,
+        default=None,
+        help=(
+            "Hard cap on total dask chunks across all opened files "
+            f"(default: {options.max_graph_chunks:,}). Lower if open_mfdataset "
+            "OOMs; raise for finer-grained spatial chunks."
+        ),
+    )
+    parser.add_argument(
+        "--lat-chunk",
+        type=int,
+        default=None,
+        help=(
+            "Override auto-derived lat chunk size for open_mfdataset. "
+            "Must be paired with --lon-chunk."
+        ),
+    )
+    parser.add_argument(
+        "--lon-chunk",
+        type=int,
+        default=None,
+        help=(
+            "Override auto-derived lon chunk size for open_mfdataset. "
+            "Must be paired with --lat-chunk."
+        ),
+    )
+    parser.add_argument(
         "--dpi",
         type=int,
         default=options.dpi,
@@ -595,6 +850,8 @@ def parse_arguments(options: Options) -> None:
         options.chunk_bytes = options.args.chunk_bytes
     if options.args.block_bytes is not None:
         options.block_bytes = options.args.block_bytes
+    if options.args.max_graph_chunks is not None:
+        options.max_graph_chunks = options.args.max_graph_chunks
     if options.args.fit_terms is not None:
         options.fit_terms = options.args.fit_terms
     options.dpi = options.args.dpi
@@ -653,6 +910,11 @@ def main() -> None:
             setattr(options.args, attr, getattr(options, attr))
         else:
             setattr(options, attr, getattr(options.args, attr))
+
+    # Derive (lat_chunk, lon_chunk) from dataset properties before the loader
+    # is called.  This sets options.lat_chunk and options.lon_chunk, which the
+    # multi-file loaders pass to xr.open_mfdataset.
+    derive_spatial_chunks(options)
 
     # Coarse initial chunk_size for the initial open_mfdataset call.
     # Actual value is derived from options.chunk_bytes after we know grid dimensions.
@@ -1803,8 +2065,8 @@ def load_ssha_files(options: Options) -> xr.Dataset:
         parallel=options.mf_parallel,
         chunks={
             options.time_key: options.fake_chunk,
-            options.lat_key: -1,
-            options.lon_key: -1,
+            options.lat_key: options.lat_chunk,
+            options.lon_key: options.lon_chunk,
         },
     )
     return input_data
@@ -1892,8 +2154,8 @@ def load_mur_sst_files(options: Options) -> xr.Dataset:
         parallel=options.mf_parallel,
         chunks={
             options.time_key: options.fake_chunk,
-            options.lat_key: -1,
-            options.lon_key: -1,
+            options.lat_key: options.lat_chunk,
+            options.lon_key: options.lon_chunk,
         },
     )
     return input_data
@@ -1938,8 +2200,8 @@ def load_aqua_modis_files(options: Options) -> xr.Dataset:
         parallel=options.mf_parallel,
         chunks={
             options.time_key: options.fake_chunk,
-            options.lat_key: -1,
-            options.lon_key: -1,
+            options.lat_key: options.lat_chunk,
+            options.lon_key: options.lon_chunk,
         },
     )
 
@@ -2001,8 +2263,8 @@ def load_simple_grid_files(options: Options) -> xr.Dataset:
         parallel=options.mf_parallel,
         chunks={
             options.time_key: options.fake_chunk,
-            options.lat_key: -1,
-            options.lon_key: -1,
+            options.lat_key: options.lat_chunk,
+            options.lon_key: options.lon_chunk,
         },
     )
     return input_data
