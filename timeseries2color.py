@@ -32,6 +32,9 @@ from colour.colorimetry import MSDS_CMFS_STANDARD_OBSERVER
 from tqdm import tqdm
 
 dask.config.set(scheduler="synchronous")
+# Cap xarray's open-file cache.  With thousands of AQUA_MODIS L3m files,
+# the default of 128 + repeated tile reads thrashes HDF5/libnetcdf metadata.
+xr.set_options(file_cache_maxsize=32)
 import gc
 
 __version__ = "0.2.1"
@@ -208,9 +211,9 @@ class Options:
         self.xskip: int = 1  # only use every "xskip" point in each direction.
         self.tskip: int = 1  # only use every "tskip" point in the time series
 
-        # Desired memory footprints; chunk_size and block_size are derived from these
+        # Desired memory footprints; chunk_size and tile_side are derived from these
         self.chunk_bytes: float = 250e6  # bytes per dask time chunk
-        self.block_bytes: float = 500e6  # bytes per loop lat/lon block
+        self.block_bytes: float = 500e6  # bytes per loop (lat, lon) tile
 
         # Controls xarray.open_mfdataset's parallel setting.
         # Be careful, parallel=True can spike RAM on open
@@ -657,7 +660,7 @@ def main() -> None:
     logging.info(f"Loading {options.input_choice}")
     input_data = load_input_data(options)
 
-    # Derive final chunk_size and block_size from target byte budgets
+    # Derive final chunk_size and tile_side from target byte budgets
     _da = input_data[options.y_key]
     _itemsize = _da.dtype.itemsize
     _n_lat = _da.sizes[options.lat_key]
@@ -672,11 +675,14 @@ def main() -> None:
             int(options.chunk_bytes / (_n_lat * _n_lon * _itemsize)),
         ),
     )
-    options.block_size = max(
+    # Square-ish (lat, lon) tile so each per-block read intersects only a
+    # bounded set of on-disk chunks.  Cap by the smaller spatial dim.
+    options.tile_side = max(
         1,
         min(
-            _n_points,
-            int(options.block_bytes / (_n_time * _itemsize)),
+            _n_lat,
+            _n_lon,
+            int(np.sqrt(options.block_bytes / (_n_time * _itemsize))),
         ),
     )
 
@@ -686,15 +692,21 @@ def main() -> None:
         f"actual ≈ {options.chunk_size * _n_lat * _n_lon * _itemsize / 1e6:.0f} MB)"
     )
     logging.info(
-        f"DERIVED block_size = {options.block_size} "
-        f"(target {options.block_bytes / 1e6:.0f} MB per block, "
-        f"actual ≈ {_n_time * options.block_size * _itemsize / 1e6:.0f} MB)"
+        f"DERIVED tile_side = {options.tile_side} "
+        f"(target {options.block_bytes / 1e6:.0f} MB per tile, "
+        f"actual ≈ {_n_time * options.tile_side * options.tile_side * _itemsize / 1e6:.0f} MB)"
     )
     del _da
 
+    # Rechunk along time only.  Spatial rechunking would produce a
+    # dask graph with one task per (time_chunk × lat_tile × lon_tile),
+    # which on a multi-thousand-file archive at 4320×8640 would itself
+    # consume gigabytes of graph state.  Keeping lat/lon as one chunk
+    # per timestep means each tile.values still streams chunk-by-chunk
+    # under the synchronous scheduler, with peak working set ≈ one chunk.
     input_data = input_data.chunk({options.time_key: options.chunk_size})
 
-    # --- DIAGNOSTIC: Tuning chunk_size and block_size ---
+    # --- DIAGNOSTIC: Tuning chunk_size and tile_side ---
     _da = input_data[options.y_key]
     _itemsize = _da.dtype.itemsize  # 4 for float32
     _n_time = _da.sizes[options.time_key]
@@ -733,34 +745,37 @@ def main() -> None:
             f"there are {_n_chunks} chunks"
         )
 
-    # Per-block memory footprint in the main loop
-    _block_bytes = _n_time * options.block_size * _itemsize
-    _n_blocks = (_n_points + options.block_size - 1) // options.block_size
+    # Per-tile memory footprint in the main loop
+    _tile_pts = options.tile_side * options.tile_side
+    _tile_bytes = _n_time * _tile_pts * _itemsize
+    _n_lat_tiles = (_n_lat + options.tile_side - 1) // options.tile_side
+    _n_lon_tiles = (_n_lon + options.tile_side - 1) // options.tile_side
+    _n_tiles = _n_lat_tiles * _n_lon_tiles
     logging.info(
-        f"TUNING block_size: {_n_blocks} blocks of up to {options.block_size} points each"
+        f"TUNING tile_side: {_n_tiles} tiles "
+        f"({_n_lat_tiles} × {_n_lon_tiles}) of up to "
+        f"{options.tile_side} × {options.tile_side} pixels each"
     )
     logging.info(
-        f"TUNING block_size: peak per-block RAM ≈ "
-        f"{_n_time} × {options.block_size} × {_itemsize} B = "
-        f"{_block_bytes / 1e9:.3f} GB"
+        f"TUNING tile_side: peak per-tile RAM ≈ "
+        f"{_n_time} × {options.tile_side}² × {_itemsize} B = "
+        f"{_tile_bytes / 1e9:.3f} GB"
     )
-    if _block_bytes > 1e9:
+    if _tile_bytes > 1e9:
         logging.warning(
-            f"TUNING block_size: {_block_bytes / 1e9:.2f} GB per block is large "
+            f"TUNING tile_side: {_tile_bytes / 1e9:.2f} GB per tile is large "
         )
-    elif _block_bytes < 20e6 and _n_blocks > 20:
-        # Don't recommend more than the total number of points
-        _suggested = min(_suggested, _n_points)
+    elif _tile_bytes < 20e6 and _n_tiles > 20:
         logging.warning(
-            f"TUNING block_size: {_block_bytes / 1e6:.1f} MB per block is small and "
-            f"there are {_n_blocks} blocks"
+            f"TUNING tile_side: {_tile_bytes / 1e6:.1f} MB per tile is small and "
+            f"there are {_n_tiles} tiles"
         )
 
-    # Combined peak estimate (block being built + one chunk live in dask's hands)
-    _peak = _block_bytes + _chunk_bytes
+    # Combined peak estimate (tile being built + one chunk live in dask's hands)
+    _peak = _tile_bytes + _chunk_bytes
     logging.info(
         f"TUNING combined: rough peak RAM during loop ≈ "
-        f"{_peak / 1e9:.3f} GB (block + one chunk)"
+        f"{_peak / 1e9:.3f} GB (tile + one chunk)"
     )
     del _da
 
@@ -853,18 +868,21 @@ def main() -> None:
     hot_start = timeit.default_timer()
 
     # === PRE-COMPUTATION (outside loop) ===
-    stacked = input_data.stack(latlon=[options.lat_key, options.lon_key])
-    latlon_coord = stacked["latlon"]
-
-    # Extract time coord (small) and keep data lazy
-    times = stacked[options.time_key].values
-    data_lazy = stacked[options.y_key]  # dask-backed DataArray
+    # No .stack here: stacking lat × lon eagerly builds a pandas.MultiIndex
+    # of size n_lat × n_lon (~37M entries on AQUA_MODIS 4km), which costs
+    # multiple GB of RAM by itself.  Iterate tiles in (lat, lon) directly.
+    times = input_data[options.time_key].values
+    lat_coord = input_data[options.lat_key]
+    lon_coord = input_data[options.lon_key]
+    data_lazy = input_data[options.y_key]  # dask-backed DataArray
     n_times = len(times)
-    n_points = stacked.sizes["latlon"]
+    n_lat = data_lazy.sizes[options.lat_key]
+    n_lon = data_lazy.sizes[options.lon_key]
+    n_points = n_lat * n_lon
 
     logging.info(
         f"Full data_2d would be {n_times} × {n_points} × 4 bytes = "
-        f"{n_times * n_points * 4 / 1e9:.2f} GB — loading in blocks."
+        f"{n_times * n_points * 4 / 1e9:.2f} GB — loading in tiles."
     )
 
     # Time axis in days (shared across all grid points)
@@ -938,114 +956,143 @@ def main() -> None:
 
     A_old = A_OLD_XYZ_TO_SRGB
 
-    # === MAIN LOOP — block-wise to keep memory bounded ===
-    xyz_results = np.full((n_points, 3), np.nan)
+    # === MAIN LOOP — tile-wise (lat × lon) to keep memory bounded ===
+    # Shape (n_lat, n_lon, 3) so per-pixel writes are local within a tile.
+    # Reshaped to flat (n_points, 3) after the loop for the existing
+    # post-processing.
+    xyz_results = np.full((n_lat, n_lon, 3), np.nan)
+    tile_side = options.tile_side
 
     with tqdm(total=n_points, desc="Grid points") as pbar:
-        for block_start in range(0, n_points, options.block_size):
-            block_end = min(block_start + options.block_size, n_points)
-            # Materialize just this block (triggers dask read for the needed chunks only)
-            block = data_lazy.isel(latlon=slice(block_start, block_end)).values
-            if N < block.shape[0]:  # handle the even-length trim
-                block = block[:N, :]
+        for lat0 in range(0, n_lat, tile_side):
+            lat1 = min(lat0 + tile_side, n_lat)
+            for lon0 in range(0, n_lon, tile_side):
+                lon1 = min(lon0 + tile_side, n_lon)
+                # Materialize just this tile (each .values triggers a fresh
+                # dask compute that reads only the chunks intersecting the tile).
+                tile = data_lazy.isel(
+                    {
+                        options.lat_key: slice(lat0, lat1),
+                        options.lon_key: slice(lon0, lon1),
+                    }
+                ).values
+                if N < tile.shape[0]:  # handle the even-length trim
+                    tile = tile[:N, :, :]
 
-            for j in range(block.shape[1]):
-                i = block_start + j
-                pbar.update(1)
+                lat_t = tile.shape[1]
+                lon_t = tile.shape[2]
+                for jl in range(lat_t):
+                    ilat = lat0 + jl
+                    for jo in range(lon_t):
+                        ilon = lon0 + jo
+                        pbar.update(1)
 
-                y = block[:, j]
+                        y = tile[:, jl, jo]
 
-                # Skip all-NaN columns (land)
-                if np.all(np.isnan(y)):
-                    continue
+                        # Skip all-NaN columns (land)
+                        if np.all(np.isnan(y)):
+                            continue
 
-                # Drop NaN samples — use only real data points
-                nan_idx = np.isnan(y)
-                if np.any(nan_idx):
-                    valid_idx = ~nan_idx
-                    n_valid_pts = int(valid_idx.sum())
-                    # The nfft library's kernel window half-width m is estimated as 9 for the default tolerance, and
-                    # the internal assertion m <= n // 2 (where n = N * 3) fails when N < 6.
-                    if n_valid_pts < 6:
-                        continue
-                    y = y[valid_idx]
-                    y_time_days = time_days[valid_idx]
-                    # Recompute per-point NFFT parameters for the reduced series
-                    y_N = n_valid_pts
-                    if y_N % 2:
-                        y = y[:-1]
-                        y_time_days = y_time_days[:-1]
-                        y_N -= 1
-                    y_x_min = y_time_days.min()
-                    y_x_range = y_time_days.max() - y_x_min
-                    y_x_norm = (y_time_days - y_x_min) / y_x_range - 0.5
-                    y_design = build_design_matrix(y_time_days, options.fit_terms)
-                    y_k = -(y_N // 2) + np.arange(y_N)
-                    y_xf_half = (y_k / y_x_range)[y_N // 2 + 1 :]
-                    y_periods_asc = (1.0 / y_xf_half)[::-1]
-                    y_freq_sq_asc = (1.0 / y_periods_asc) ** 2
-                else:
-                    y_N = N
-                    y_x_norm = x_norm
-                    y_design = design_matrix
-                    y_periods_asc = periods_ascending
-                    y_freq_sq_asc = freq_sq_ascending
+                        # Drop NaN samples — use only real data points
+                        nan_idx = np.isnan(y)
+                        if np.any(nan_idx):
+                            valid_idx = ~nan_idx
+                            n_valid_pts = int(valid_idx.sum())
+                            # The nfft library's kernel window half-width m is
+                            # estimated as 9 for the default tolerance, and
+                            # the internal assertion m <= n // 2 (n = N * 3)
+                            # fails when N < 6.
+                            if n_valid_pts < 6:
+                                continue
+                            y = y[valid_idx]
+                            y_time_days = time_days[valid_idx]
+                            y_N = n_valid_pts
+                            if y_N % 2:
+                                y = y[:-1]
+                                y_time_days = y_time_days[:-1]
+                                y_N -= 1
+                            y_x_min = y_time_days.min()
+                            y_x_range = y_time_days.max() - y_x_min
+                            y_x_norm = (y_time_days - y_x_min) / y_x_range - 0.5
+                            y_design = build_design_matrix(
+                                y_time_days, options.fit_terms
+                            )
+                            y_k = -(y_N // 2) + np.arange(y_N)
+                            y_xf_half = (y_k / y_x_range)[y_N // 2 + 1 :]
+                            y_periods_asc = (1.0 / y_xf_half)[::-1]
+                            y_freq_sq_asc = (1.0 / y_periods_asc) ** 2
+                        else:
+                            y_N = N
+                            y_x_norm = x_norm
+                            y_design = design_matrix
+                            y_periods_asc = periods_ascending
+                            y_freq_sq_asc = freq_sq_ascending
 
-                # 1. Detrend with numpy lstsq (replaces statsmodels OLS)
-                params, _, _, _ = np.linalg.lstsq(y_design, y, rcond=None)
-                detrended = y - y_design @ params
+                        # 1. Detrend with numpy lstsq
+                        params, _, _, _ = np.linalg.lstsq(y_design, y, rcond=None)
+                        detrended = y - y_design @ params
 
-                # 2. NFFT
-                f_k = nfft.nfft(y_x_norm, detrended)
-                power = np.abs(f_k) ** 2
+                        # 2. NFFT
+                        f_k = nfft.nfft(y_x_norm, detrended)
+                        power = np.abs(f_k) ** 2
 
-                # 3. Take positive frequencies, reverse to ascending period order
-                power_half = power[y_N // 2 + 1 :]
-                power_ascending = power_half[::-1]
+                        # 3. Positive frequencies, reverse to ascending period
+                        power_half = power[y_N // 2 + 1 :]
+                        power_ascending = power_half[::-1]
 
-                # 3b. Convert PSD to SPD by multiplying by sigma^2 (Hughes & Williams 2010, eq. A11)
-                power_ascending = power_ascending * y_freq_sq_asc
+                        # 3b. PSD -> SPD via sigma^2
+                        # (Hughes & Williams 2010, eq. A11)
+                        power_ascending = power_ascending * y_freq_sq_asc
 
-                # 4. Map power spectrum to wavelength grid
-                # Recompute boundary handling for this point's period range
-                pt_periods_ext = y_periods_asc.copy()
-                if options.min_period not in y_periods_asc:
-                    pt_periods_ext = np.append(pt_periods_ext, options.min_period)
-                if options.max_period not in y_periods_asc:
-                    pt_periods_ext = np.append(pt_periods_ext, options.max_period)
-                pt_periods_ext = np.sort(pt_periods_ext)
-                pt_nearest_idx = np.array(
-                    [np.argmin(np.abs(y_periods_asc - p)) for p in pt_periods_ext]
-                )
-                pt_mask = (pt_periods_ext >= options.min_period) & (
-                    pt_periods_ext <= options.max_period
-                )
-                pt_interp_periods = pt_periods_ext[pt_mask]
-                pt_interp_nearest = pt_nearest_idx[pt_mask]
-                power_interp_src = power_ascending[pt_interp_nearest]
-                mapped_power = np.interp(
-                    wavelength_targets, pt_interp_periods, power_interp_src
-                )
+                        # 4. Map power spectrum to wavelength grid
+                        pt_periods_ext = y_periods_asc.copy()
+                        if options.min_period not in y_periods_asc:
+                            pt_periods_ext = np.append(
+                                pt_periods_ext, options.min_period
+                            )
+                        if options.max_period not in y_periods_asc:
+                            pt_periods_ext = np.append(
+                                pt_periods_ext, options.max_period
+                            )
+                        pt_periods_ext = np.sort(pt_periods_ext)
+                        pt_nearest_idx = np.array(
+                            [
+                                np.argmin(np.abs(y_periods_asc - p))
+                                for p in pt_periods_ext
+                            ]
+                        )
+                        pt_mask = (pt_periods_ext >= options.min_period) & (
+                            pt_periods_ext <= options.max_period
+                        )
+                        pt_interp_periods = pt_periods_ext[pt_mask]
+                        pt_interp_nearest = pt_nearest_idx[pt_mask]
+                        power_interp_src = power_ascending[pt_interp_nearest]
+                        mapped_power = np.interp(
+                            wavelength_targets,
+                            pt_interp_periods,
+                            power_interp_src,
+                        )
 
-                # 5. Spectrum to XYZ
-                if options.use_new_funcs:
-                    spd = SpectralDistribution(mapped_power, cie_wavelengths)
-                    xyz_results[i] = sd_to_XYZ(spd, cmfs)
-                else:
-                    # Riemann sum integration (Hughes & Williams 2010)
-                    xyz_results[i, 0] = (
-                        mapped_power * cie_x_vals
-                    ).sum() * wavelength_step
-                    xyz_results[i, 1] = (
-                        mapped_power * cie_y_vals
-                    ).sum() * wavelength_step
-                    xyz_results[i, 2] = (
-                        mapped_power * cie_z_vals
-                    ).sum() * wavelength_step
+                        # 5. Spectrum to XYZ
+                        if options.use_new_funcs:
+                            spd = SpectralDistribution(mapped_power, cie_wavelengths)
+                            xyz_results[ilat, ilon, :] = sd_to_XYZ(spd, cmfs)
+                        else:
+                            # Riemann sum (Hughes & Williams 2010)
+                            xyz_results[ilat, ilon, 0] = (
+                                mapped_power * cie_x_vals
+                            ).sum() * wavelength_step
+                            xyz_results[ilat, ilon, 1] = (
+                                mapped_power * cie_y_vals
+                            ).sum() * wavelength_step
+                            xyz_results[ilat, ilon, 2] = (
+                                mapped_power * cie_z_vals
+                            ).sum() * wavelength_step
 
-    # Cleanup
-    del stacked, input_data
+    # Cleanup — flatten for the existing post-loop code
+    del input_data, data_lazy
     gc.collect()
+    xyz_results = xyz_results.reshape(n_points, 3)
 
     logging.info("Main loop complete.")
 
@@ -1131,21 +1178,21 @@ def main() -> None:
             vals[low] = vals[low] * h
             vals[high] = f_coeff * np.power(vals[high], gamma_inv) + g_coeff
 
-    # === Assemble xarray Dataset and unstack ===
-    rgb_ds = xr.Dataset(
-        {
-            "x": ("latlon", xyz_results[:, 0]),
-            "y": ("latlon", xyz_results[:, 1]),
-            "z": ("latlon", xyz_results[:, 2]),
-            "red": ("latlon", rgb_arr[0]),
-            "green": ("latlon", rgb_arr[1]),
-            "blue": ("latlon", rgb_arr[2]),
-        },
-        coords={"latlon": latlon_coord},
-    )
-
+    # === Assemble xarray Dataset directly on (lat, lon) — no unstack ===
+    xyz_3d = xyz_results.reshape(n_lat, n_lon, 3)
+    rgb_3d = rgb_arr.reshape(3, n_lat, n_lon)
+    dims2d = (options.lat_key, options.lon_key)
+    coords2d = {options.lat_key: lat_coord, options.lon_key: lon_coord}
     spectral_color_maps = xr.Dataset(
-        {key: rgb_ds[key].unstack("latlon") for key in rgb_ds.data_vars}
+        {
+            "x": (dims2d, xyz_3d[:, :, 0]),
+            "y": (dims2d, xyz_3d[:, :, 1]),
+            "z": (dims2d, xyz_3d[:, :, 2]),
+            "red": (dims2d, rgb_3d[0]),
+            "green": (dims2d, rgb_3d[1]),
+            "blue": (dims2d, rgb_3d[2]),
+        },
+        coords=coords2d,
     )
 
     # Stop the timer
