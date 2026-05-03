@@ -150,6 +150,13 @@ class Options:
         self.n_lon_raw: int = 0
         self.on_disk_chunks: tuple[int, int] | None = None
 
+        # Kerchunk virtual-zarr loader (opt-in).  When use_kerchunk is True,
+        # multi-file datasets are read through an fsspec reference filesystem
+        # over a sidecar JSON, which lets strided isel translate to chunk-
+        # aware reads (real I/O reduction when xskip >= disk-chunk-size).
+        self.use_kerchunk: bool = False
+        self.kerchunk_path: Path | None = None
+
         # Data structures (initialized by populate_results after hot path)
         self.plot_options: PlotOptions = PlotOptions()
         self.grid: GridData = GridData()
@@ -725,13 +732,13 @@ def parse_arguments(options: Options) -> None:
         "--chunk-bytes",
         type=float,
         default=None,
-        help=f"Target bytes per dask chunk (default: {options.chunk_bytes:.0e}).",
+        help=f"Target bytes per dask time chunk (default: {options.chunk_bytes:.0e}).",
     )
     parser.add_argument(
         "--block-bytes",
         type=float,
         default=None,
-        help=f"Target bytes per loop block (default: {options.block_bytes:.0e}).",
+        help=f"Target bytes per loop lat/lon block (default: {options.block_bytes:.0e}).",
     )
     parser.add_argument(
         "--max-graph-chunks",
@@ -759,6 +766,25 @@ def parse_arguments(options: Options) -> None:
         help=(
             "Override auto-derived lon chunk size for open_mfdataset. "
             "Must be paired with --lat-chunk."
+        ),
+    )
+    parser.add_argument(
+        "--use-kerchunk",
+        action="store_true",
+        help=(
+            "Load multi-file datasets through a kerchunk virtual-zarr "
+            "reference. Faster for large xskip values because zarr's "
+            "chunk-aware indexing skips disk chunks that contain no "
+            "target indices. Builds a sidecar .kerchunk.json on first run."
+        ),
+    )
+    parser.add_argument(
+        "--kerchunk-path",
+        type=Path,
+        default=None,
+        help=(
+            "Override the kerchunk reference file path "
+            "(default: <data folder>/.kerchunk.json)."
         ),
     )
     parser.add_argument(
@@ -854,6 +880,10 @@ def parse_arguments(options: Options) -> None:
         options.max_graph_chunks = options.args.max_graph_chunks
     if options.args.fit_terms is not None:
         options.fit_terms = options.args.fit_terms
+    if options.args.use_kerchunk:
+        options.use_kerchunk = True
+    if options.args.kerchunk_path is not None:
+        options.kerchunk_path = options.args.kerchunk_path
     options.dpi = options.args.dpi
 
 
@@ -2208,6 +2238,169 @@ def load_aqua_modis_files(options: Options) -> xr.Dataset:
     return input_data
 
 
+# Kerchunk per-dataset configuration.  Keys are the dispatch names used by
+# _INPUT_DISPATCH; values are MultiZarrToZarr kwargs describing how the
+# per-file references should be combined.  Datasets absent from this mapping
+# don't have a kerchunk path (single-file datasets, or formats kerchunk
+# doesn't yet handle here).
+_KERCHUNK_CONFIG: Final[dict[str, dict[str, Any]]] = {
+    "AQUA_MODIS": {
+        "concat_dim": "time",
+        "coo_map": {"time": "attr:time_coverage_start"},
+        "coo_dtypes": {"time": "datetime64[ns]"},
+        "identical_dims": ["lat", "lon"],
+    },
+    "SSHA": {"concat_dim": "time"},
+    "MUR_SST": {"concat_dim": "time"},
+}
+
+
+def build_kerchunk_reference(
+    files: list[Path],
+    output_path: Path,
+    *,
+    concat_dim: str,
+    coo_map: dict[str, Any] | None = None,
+    coo_dtypes: dict[str, str] | None = None,
+    identical_dims: list[str] | None = None,
+    inline_threshold: int = 300,
+) -> Path:
+    """Build a kerchunk reference JSON describing a multi-file NetCDF dataset.
+
+    The reference is a tiny JSON sidecar that lets fsspec's reference
+    filesystem expose the on-disk HDF5 chunks as a single virtual Zarr store.
+    Once written, ``xr.open_dataset(..., engine="zarr")`` over the reference
+    can do chunk-aware random access — which is what allows strided ``isel``
+    to reduce real I/O when ``xskip >= disk-chunk-size``.
+
+    Args:
+        files: Input NetCDF files in the order they should be concatenated.
+        output_path: Destination JSON path.
+        concat_dim: Dim along which to concatenate (typically ``"time"``).
+        coo_map: kerchunk coo_map for synthesising coords from attrs/data.
+        coo_dtypes: kerchunk coo_dtypes for the synthesised coords.
+        identical_dims: Dims that must match exactly across files (e.g. lat/lon).
+        inline_threshold: Embed array data smaller than this many bytes.
+
+    Returns:
+        ``output_path``.
+    """
+    import json
+
+    # Imported lazily so the regular loader path doesn't pay an import cost.
+    from kerchunk.combine import MultiZarrToZarr
+    from kerchunk.hdf import SingleHdf5ToZarr
+
+    single_refs = []
+    for f in files:
+        ref = SingleHdf5ToZarr(str(f), inline_threshold=inline_threshold).translate()
+        single_refs.append(ref)
+
+    mzz_kwargs: dict[str, Any] = {"concat_dims": [concat_dim]}
+    if coo_map is not None:
+        mzz_kwargs["coo_map"] = coo_map
+    if coo_dtypes is not None:
+        mzz_kwargs["coo_dtypes"] = coo_dtypes
+    if identical_dims is not None:
+        mzz_kwargs["identical_dims"] = identical_dims
+
+    combined = MultiZarrToZarr(single_refs, **mzz_kwargs).translate()
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path.write_text(json.dumps(combined))
+    return output_path
+
+
+def _kerchunk_reference_path(options: Options) -> Path:
+    """Resolve the kerchunk reference file path for the current dataset."""
+    if options.kerchunk_path is not None:
+        return options.kerchunk_path
+    _y_key, folder_attr, _glob = _INPUT_DISPATCH[options.input_choice]
+    folder: Path = getattr(options, folder_attr)
+    return folder / ".kerchunk.json"
+
+
+def _kerchunk_reference_is_stale(ref_path: Path, files: list[Path]) -> bool:
+    """True iff the reference is missing or older than any input file."""
+    if not ref_path.exists():
+        return True
+    ref_mtime = ref_path.stat().st_mtime_ns
+    return any(f.stat().st_mtime_ns > ref_mtime for f in files)
+
+
+def load_via_kerchunk(options: Options) -> xr.Dataset:
+    """Load multi-file NetCDF data via a kerchunk virtual-zarr reference.
+
+    Builds the reference on first call (or when source files are newer) and
+    opens the combined dataset through fsspec's reference filesystem.
+    The on-disk NetCDF files are not modified; only a small JSON sidecar is
+    written next to the data.
+
+    Args:
+        options: Options object. Reads ``input_choice``, the matching
+                 ``*_folder``, ``kerchunk_path``, ``time_key``, ``lat_key``,
+                 ``lon_key``, ``y_key``, ``xskip``, ``lat_chunk``,
+                 ``lon_chunk``, ``fake_chunk``, ``tskip``.
+
+    Returns:
+        Combined dataset shaped like the matching non-kerchunk loader would
+        have produced (after preprocess select / xskip / cast).
+
+    Raises:
+        ValueError: If ``input_choice`` has no kerchunk configuration.
+        FileNotFoundError: If no input files match the dispatch glob.
+    """
+    import fsspec
+
+    if options.input_choice not in _KERCHUNK_CONFIG:
+        raise ValueError(
+            f"input_choice {options.input_choice!r} has no kerchunk config; "
+            f"use the regular loader."
+        )
+
+    _y_key, folder_attr, glob_pattern = _INPUT_DISPATCH[options.input_choice]
+    folder: Path = getattr(options, folder_attr)
+    all_files = sorted(folder.glob(glob_pattern))
+    if not all_files:
+        raise FileNotFoundError(f"No files matching {glob_pattern!r} in {folder}")
+    tskip_files = all_files[:: options.tskip]
+
+    ref_path = _kerchunk_reference_path(options)
+    if _kerchunk_reference_is_stale(ref_path, tskip_files):
+        cfg = _KERCHUNK_CONFIG[options.input_choice]
+        logging.info(
+            f"Building kerchunk reference for {len(tskip_files)} "
+            f"{options.input_choice} files → {os.fspath(ref_path)}"
+        )
+        build_kerchunk_reference(tskip_files, ref_path, **cfg)
+    else:
+        logging.info(f"Reusing kerchunk reference at {os.fspath(ref_path)}")
+
+    fs = fsspec.filesystem("reference", fo=str(ref_path))
+    mapper = fs.get_mapper("")
+    ds = xr.open_dataset(
+        mapper,
+        engine="zarr",
+        consolidated=False,
+        chunks={
+            options.time_key: options.fake_chunk,
+            options.lat_key: options.lat_chunk,
+            options.lon_key: options.lon_chunk,
+        },
+    )
+
+    ds = ds[[options.y_key]]
+    if options.xskip > 1:
+        ds = ds.isel(
+            {
+                options.lat_key: slice(None, None, options.xskip),
+                options.lon_key: slice(None, None, options.xskip),
+            }
+        )
+    ds[options.y_key] = ds[options.y_key].astype(np.float32, copy=False)
+    return ds
+
+
 def load_simple_grid_files(options: Options) -> xr.Dataset:
     """Load simple_grids weekly NetCDF files and concatenate along time.
 
@@ -3115,6 +3308,9 @@ def load_input_data(options: Options) -> xr.Dataset:
     Returns:
         Loaded xarray Dataset.
     """
+    if options.use_kerchunk and options.input_choice in _KERCHUNK_CONFIG:
+        return load_via_kerchunk(options)
+
     if options.input_choice == "SSHA":
         input_data = load_ssha_files(options)
     elif options.input_choice == "Argo":
