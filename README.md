@@ -49,9 +49,6 @@ end, with no external datasets. It assumes you have completed
 [Installation](#installation) first (the venv at `.venv`, `nfft` installed).
 All commands below are run from the repo root.
 
-Every `timeseries2color.py` invocation is prefixed with `PYTHONSAFEPATH=1`
-— this is mandatory (see [Troubleshooting](#troubleshooting)).
-
 **1. Create the demo-data generator.** Save the following as
 `make_demo_data.py` in the repo root. It writes 105 weekly 45×90 sea-surface
 grids in which two rectangular regions oscillate at 60-day and 120-day
@@ -126,7 +123,7 @@ cp sealevel_spectra/ciexyz31_1_trimmed.csv \
 **4. Render the map:**
 
 ```bash
-PYTHONSAFEPATH=1 .venv/bin/python timeseries2color.py "quickstart demo" \
+.venv/bin/python timeseries2color.py "quickstart demo" \
     --input-choice simple_grids --xskip 1 --no-gmt \
     --min-period 30 --max-period 160
 ```
@@ -177,7 +174,7 @@ uv pip install --python .venv/bin/python nfft
 **4. Verify** the tool imports and reports its version:
 
 ```bash
-PYTHONSAFEPATH=1 .venv/bin/python timeseries2color.py --version
+.venv/bin/python timeseries2color.py --version
 ```
 
 This prints `timeseries2color.py 0.2.1`.
@@ -254,8 +251,6 @@ Every flag below comes straight from `timeseries2color.py --help` (version
 
 - `timeseries2color.py` — the tool (~3300 lines); everything the quickstart
   and cheatsheet describe.
-- `colour.py` — a small standalone experiment mapping an image's RGB back to
-  a spectral distribution (see [Troubleshooting](#troubleshooting)).
 - `notation.sh`, `overflow.sh`, `projections.sh` — GMT plotting helpers
   consumed by the generated GMT scripts.
 - `setup_environment.sh` — a standalone environment installer; it predates the
@@ -264,20 +259,6 @@ Every flag below comes straight from `timeseries2color.py --help` (version
   directory name), plus the demo data once you generate it.
 
 ## Troubleshooting
-
-**`FileNotFoundError: [Errno 2] No such file or directory: 'image.png'`**
-(raised from `colour.py` when you run `python timeseries2color.py ...`).
-*Cause:* the repo root contains a tracked legacy script, `colour.py`, and when
-Python runs a script by path it puts that script's own directory first on
-`sys.path`. So `from colour import ...` inside `timeseries2color.py` resolves
-to the repo's `colour.py` instead of the installed `colour-science` package,
-and `colour.py`'s top-level code runs and fails on the missing `image.png`.
-*Fix:* run with `PYTHONSAFEPATH=1` in front of the command (or use
-`python -P timeseries2color.py ...`), which disables the automatic
-script-directory `sys.path` entry. Prefer the per-command form over
-`export PYTHONSAFEPATH=1`, which affects every Python invocation in the shell.
-The durable fix, for a maintainer, is to rename or remove the legacy
-`colour.py`, which removes the shadowing and makes the workaround unnecessary.
 
 **The CIE file "failed to open" / the map is blank or garbled, with a log
 line about the CIE file.** *Cause:* `timeseries2color.py` reads its CIE table
