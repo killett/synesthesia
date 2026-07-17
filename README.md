@@ -35,7 +35,7 @@ different colour from one that wobbles with a 120-day period. The core is
    you will see a log line reporting this.
 3. **Map the spectrum to colour.** Each pixel's power spectrum is projected
    onto the CIE 1931 colour-matching functions (the CSV tables in
-   `sealevel_spectra/`), exactly as if the temporal spectrum were a spectrum of
+   `CIE_1931/`), exactly as if the temporal spectrum were a spectrum of
    light. This yields CIE XYZ, which is converted to sRGB.
 4. **Render the map.** The sRGB field is drawn as a world map with
    matplotlib and cartopy (with a configurable projection, colours, coastlines
@@ -92,7 +92,7 @@ for i, t in enumerate(weeks):
         coords={"latitude": lat, "longitude": lon},
     )
     out = (
-        Path("sealevel_spectra/simple_grids")
+        Path("input_timeseries/simple_grids")
         / str(t.astype("datetime64[Y]"))
         / f"week_{i:03d}.nc"
     )
@@ -108,19 +108,9 @@ print(f"wrote {len(weeks)} files")
 .venv/bin/python make_demo_data.py
 ```
 
-It prints `wrote 105 files`, written under `sealevel_spectra/simple_grids/`.
+It prints `wrote 105 files`, written under `input_timeseries/simple_grids/`.
 
-**3. Provide the CIE colour-matching file.** The tool reads its CIE table
-from a hardcoded filename that the repo does not ship under that name, so copy
-the shipped equivalent into place — required for every run (see
-[Troubleshooting](#troubleshooting)):
-
-```bash
-cp sealevel_spectra/ciexyz31_1_trimmed.csv \
-   sealevel_spectra/ciexyz31_1_trimmed_380nm_760nm.csv
-```
-
-**4. Render the map:**
+**3. Render the map:**
 
 ```bash
 .venv/bin/python timeseries2color.py "quickstart demo" \
@@ -253,19 +243,12 @@ Every flag below comes straight from `timeseries2color.py --help` (version
   and cheatsheet describe.
 - `notation.sh`, `overflow.sh`, `projections.sh` — GMT plotting helpers
   consumed by the generated GMT scripts.
-- `sealevel_spectra/` — the CIE 1931 colour-matching tables (despite the
-  directory name), plus the demo data once you generate it.
+- `CIE_1931/` — the CIE 1931 colour-matching tables.
+- `input_timeseries/` — root for input data; created on first use, nothing
+  in it is tracked. The quickstart's generated demo data lands in
+  `input_timeseries/simple_grids/`.
 
 ## Troubleshooting
-
-**The CIE file "failed to open" / the map is blank or garbled, with a log
-line about the CIE file.** *Cause:* `timeseries2color.py` reads its CIE table
-from a hardcoded path, `sealevel_spectra/ciexyz31_1_trimmed_380nm_760nm.csv`,
-which is not shipped under that name and has no override flag. When missing,
-the loader logs that the CIE file failed to open and returns empty tables,
-which corrupts the run far downstream. *Fix:* copy the equivalent shipped file
-(which spans exactly 380–760 nm) into the expected name:
-`cp sealevel_spectra/ciexyz31_1_trimmed.csv sealevel_spectra/ciexyz31_1_trimmed_380nm_760nm.csv`.
 
 **My map is almost blank / only a point or two of colour.** *Cause:*
 `--xskip` defaults to a per-dataset value (100 for the generic path), which

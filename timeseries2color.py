@@ -70,19 +70,17 @@ class Options:
         # Paths
         self.output_base: Path = self.cwd / "output"
         # self.ssha_folder: Path = (
-        #     self.cwd / "sealevel_spectra" / "fast_202306" / "fast_netCDF4"
+        #     self.cwd / "input_timeseries" / "fast_202306" / "fast_netCDF4"
         # )
-        self.ssha_folder: Path = self.cwd / "sealevel_spectra" / "SSHA_v2205"
-        self.simple_folder: Path = self.cwd / "sealevel_spectra" / "simple_grids"
-        self.argo_folder: Path = self.cwd / "sealevel_spectra" / "Argo"
+        self.ssha_folder: Path = self.cwd / "input_timeseries" / "SSHA_v2205"
+        self.simple_folder: Path = self.cwd / "input_timeseries" / "simple_grids"
+        self.argo_folder: Path = self.cwd / "input_timeseries" / "Argo"
         self.mur_sst_folder: Path = (
-            self.cwd / "sealevel_spectra" / "MUR_SST" / "MUR25-JPL-L4-GLOB-v04.2"
+            self.cwd / "input_timeseries" / "MUR_SST" / "MUR25-JPL-L4-GLOB-v04.2"
         )
-        self.aqua_modis_folder: Path = self.cwd / "sealevel_spectra" / "AQUA_MODIS"
-        self.grace_folder: Path = self.cwd / "sealevel_spectra" / "JPL_GRACE_mascons"
-        self.cie_file: Path = (
-            self.cwd / "sealevel_spectra" / "ciexyz31_1_trimmed_380nm_760nm.csv"
-        )
+        self.aqua_modis_folder: Path = self.cwd / "input_timeseries" / "AQUA_MODIS"
+        self.grace_folder: Path = self.cwd / "input_timeseries" / "JPL_GRACE_mascons"
+        self.cie_file: Path = self.cwd / "CIE_1931" / "ciexyz31_1_trimmed.csv"
         self.output_folder: Path = Path()  # set in main()
 
         # Configuration
