@@ -253,8 +253,6 @@ Every flag below comes straight from `timeseries2color.py --help` (version
   and cheatsheet describe.
 - `notation.sh`, `overflow.sh`, `projections.sh` — GMT plotting helpers
   consumed by the generated GMT scripts.
-- `setup_environment.sh` — a standalone environment installer; it predates the
-  uv-based instructions in this README.
 - `sealevel_spectra/` — the CIE 1931 colour-matching tables (despite the
   directory name), plus the demo data once you generate it.
 
