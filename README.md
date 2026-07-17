@@ -254,8 +254,6 @@ Every flag below comes straight from `timeseries2color.py --help` (version
 
 - `timeseries2color.py` — the tool (~3300 lines); everything the quickstart
   and cheatsheet describe.
-- `GMT.py` — a legacy predecessor of the GMT writers that are now embedded
-  inside `timeseries2color.py`.
 - `colour.py` — a small standalone experiment mapping an image's RGB back to
   a spectral distribution (see [Troubleshooting](#troubleshooting)).
 - `notation.sh`, `overflow.sh`, `projections.sh` — GMT plotting helpers
