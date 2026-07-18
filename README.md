@@ -49,60 +49,9 @@ end, with no external datasets. It assumes you have completed
 [Installation](#installation) first (the venv at `.venv`, `nfft` installed).
 All commands below are run from the repo root.
 
-**1. Create the demo-data generator.** Save the following as
-`make_demo_data.py` in the repo root. It writes 105 weekly 45×90 sea-surface
-grids in which two rectangular regions oscillate at 60-day and 120-day
-periods:
-
-```python
-"""Generate synthetic weekly sea-surface grids for the quickstart.
-
-Two regions oscillate at different periods (60 and 120 days), so the
-output map shows them as two distinct hues.
-Run from the repo root: .venv/bin/python make_demo_data.py
-"""
-from pathlib import Path
-
-import numpy as np
-import xarray as xr
-
-rng = np.random.default_rng(42)
-lat = np.arange(-88.0, 90.0, 4.0)
-lon = np.arange(0.0, 360.0, 4.0)
-weeks = np.arange(
-    np.datetime64("2024-01-03"),
-    np.datetime64("2026-01-01"),
-    np.timedelta64(7, "D"),
-)
-
-la, lo = np.meshgrid(lat, lon, indexing="ij")
-box_60d = (la > 20) & (la < 60) & (lo > 120) & (lo < 200)
-box_120d = (la < -10) & (la > -50) & (lo > 240) & (lo < 320)
-
-for i, t in enumerate(weeks):
-    days = float((t - weeks[0]) / np.timedelta64(1, "D"))
-    field = 0.02 * rng.standard_normal(la.shape)
-    field += np.where(box_60d, 0.5 * np.sin(2 * np.pi * days / 60.0), 0.0)
-    field += np.where(box_120d, 0.5 * np.sin(2 * np.pi * days / 120.0), 0.0)
-    ds = xr.Dataset(
-        {
-            "ssha": (("latitude", "longitude"), field.astype(np.float32)),
-            "time": ((), t),  # scalar variable, not a coord — the loader promotes it
-        },
-        coords={"latitude": lat, "longitude": lon},
-    )
-    out = (
-        Path("input_timeseries/simple_grids")
-        / str(t.astype("datetime64[Y]"))
-        / f"week_{i:03d}.nc"
-    )
-    out.parent.mkdir(parents=True, exist_ok=True)
-    ds.to_netcdf(out)
-
-print(f"wrote {len(weeks)} files")
-```
-
-**2. Generate the data:**
+**1. Generate the demo data.** The repo ships `make_demo_data.py`, which
+writes 105 weekly 45×90 sea-surface grids in which two rectangular regions
+oscillate at 60-day and 120-day periods:
 
 ```bash
 .venv/bin/python make_demo_data.py
@@ -110,7 +59,7 @@ print(f"wrote {len(weeks)} files")
 
 It prints `wrote 105 files`, written under `input_timeseries/simple_grids/`.
 
-**3. Render the map:**
+**2. Render the map:**
 
 ```bash
 .venv/bin/python timeseries2color.py "quickstart demo" \
@@ -241,6 +190,7 @@ Every flag below comes straight from `timeseries2color.py --help` (version
 
 - `timeseries2color.py` — the tool (~3300 lines); everything the quickstart
   and cheatsheet describe.
+- `make_demo_data.py` — generates the quickstart's synthetic demo data.
 - `notation.sh`, `overflow.sh`, `projections.sh` — GMT plotting helpers
   consumed by the generated GMT scripts.
 - `CIE_1931/` — the CIE 1931 colour-matching tables.
